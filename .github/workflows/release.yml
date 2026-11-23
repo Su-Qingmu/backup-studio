@@ -1,11 +1,9 @@
 name: Release
 
 on:
-  # ==== 临时停用自动触发（PR #16 审查期间）====
-  # 恢复方式：删除本段注释，并还原下面三行触发器配置。
-  # push:
-  #   tags:
-  #     - 'v*.*.*'
+  push:
+    tags:
+      - 'v*.*.*'
   workflow_dispatch:
 
 permissions:

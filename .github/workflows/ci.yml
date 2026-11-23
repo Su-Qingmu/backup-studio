@@ -1,11 +1,9 @@
 name: CI
 
 on:
-  # ==== 临时停用 CI 自动触发（PR #16 审查期间）====
-  # 恢复方式：删除本段注释，并还原下面两行触发器配置。
-  # push:
-  #   branches: [main, master]
-  # pull_request:
+  push:
+    branches: [main, master]
+  pull_request:
   workflow_dispatch:
 
 permissions:
