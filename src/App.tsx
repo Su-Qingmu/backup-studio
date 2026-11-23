@@ -417,7 +417,7 @@ export default function App() {
         <div style={{ flex: '1 1 auto' }} />
 
         <button
-          className="btn btn-icon no-drag"
+          className="btn btn-icon no-drag theme-toggle"
           type="button"
           title={theme === 'dark' ? '切换到浅色' : '切换到深色'}
           aria-label="切换主题"

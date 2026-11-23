@@ -725,7 +725,8 @@
 
 .dup-drawer {
   position: fixed;
-  top: 0;
+  /* 抽屉位于应用标题栏下方，避免关闭按钮被原生窗口操作按钮覆盖。 */
+  top: var(--titlebar-height);
   right: 0;
   bottom: 0;
   width: min(420px, 100%);

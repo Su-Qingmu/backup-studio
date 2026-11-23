@@ -10,6 +10,7 @@
 }
 
 .titlebar {
+  position: relative;
   -webkit-app-region: drag;
   display: flex;
   align-items: center;
@@ -23,6 +24,13 @@
 
 .titlebar .no-drag {
   -webkit-app-region: no-drag;
+}
+
+/* 固定在原生窗口按钮左侧，不参与标题栏 flex 收缩，避免最大化再还原后被挤出。 */
+.titlebar .theme-toggle {
+  position: absolute;
+  right: 148px;
+  flex: 0 0 auto;
 }
 
 .brand {
