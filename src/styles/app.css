@@ -56,6 +56,8 @@
 
 /* 顶部工作区切换：手动备份 / 自动备份并列，重复文件检测留待后续接入 */
 .workspace-nav {
+  /* 标题栏整体是 Electron 拖拽区；交互导航必须显式排除，否则点击会被窗口拖拽吞掉。 */
+  -webkit-app-region: no-drag;
   display: flex;
   align-items: center;
   gap: 2px;
