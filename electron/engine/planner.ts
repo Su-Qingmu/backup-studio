@@ -88,6 +88,14 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
   const sameSize: { src: ScannedFile; dst: ScannedFile }[] = [];
   const sizeChanged: { src: ScannedFile; dst: ScannedFile }[] = [];
 
+  // 大小写不敏感的文件系统上，"Report.txt" 与 "report.txt" 是同一个文件。
+  // 目标端存在仅大小写不同的同名文件时，源端这一项**不是**新增：
+  // 它在文件系统意义上就落在目标端那个位置上。按新增规划会让执行期的
+  // 新增提交撞上已占用的目标（要么报错、要么覆盖用户内容）。
+  const dstLowerMap = CASE_INSENSITIVE_FS
+    ? new Map([...dstFiles.keys()].map((k) => [k.toLowerCase(), k]))
+    : null;
+
   // ---- 第一轮：零 I/O 的元数据快判 ----
   report('分类', 0, srcFiles.size);
   for (const src of srcFiles.values()) {
@@ -230,6 +238,24 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
         });
         continue;
       }
+    }
+    // 目标端存在仅大小写不同的同名文件：规划期就认出来，按「更新」处理。
+    // 这类文件不是「目标不存在」的新增，按更新走覆盖语义才是对的。
+    const aliasKey = dstLowerMap?.get(src.relPath.toLowerCase());
+    if (aliasKey && aliasKey !== src.relPath) {
+      update++;
+      bytes += src.size;
+      actions.push({
+        id: `update:${src.relPath}`,
+        type: 'update',
+        relPath: src.relPath,
+        srcPath: path.join(sourceRoot, src.relPath),
+        dstPath: path.join(targetRoot, src.relPath),
+        size: src.size,
+        status: 'pending',
+        note: `目标端存在仅大小写不同的同名文件（${aliasKey}），按更新处理`,
+      });
+      continue;
     }
     copy++;
     bytes += src.size;

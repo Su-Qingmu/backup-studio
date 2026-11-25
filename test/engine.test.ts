@@ -1301,11 +1301,12 @@ async function main(): Promise<void> {
     // 目标被占用：那份文件的原字节必须原样保留，不得被覆盖。
     assert.equal(await fs.readFile(path.join(target, 'report.txt'), 'utf8'), 'only-copy',
       '预览之后出现的同名文件不得被覆盖');
-    // 任务不得报完成。
-    assert.notEqual(service.getState().phase, 'completed', '发生冲突时不得报完成');
+    // 任务不得报完成，也不得被当成取消或中断蒙混过去。
+    assert.equal(service.getState().phase, 'failed', '发生冲突时必须报失败');
     // 必须如实报告计划已过期并要求重扫。
     const logs = service.getState().logs.map((entry) => entry.text).join('\n');
-    assert.match(logs, /计划已过期/, '必须报告计划已过期并要求重扫');
+    assert.match(logs, /计划已过期/, '必须报告计划已过期');
+    assert.match(logs, /重新扫描/, '必须要求重新扫描');
   });
 
   await test('可靠性：目标保持为空时新增照常完成', async () => {
@@ -1326,6 +1327,39 @@ async function main(): Promise<void> {
     assert.equal(service.getState().phase, 'completed');
     assert.equal(await fs.readFile(path.join(target, 'report.txt'), 'utf8'), 'source-content',
       '目标保持为空时新增照常完成');
+  });
+
+  await test('可靠性：介质不支持硬链接时仍不覆盖预览之后出现的同名文件', async () => {
+    const source = await makeTemp('bs-stale2-src-');
+    const target = await makeTemp('bs-stale2-dst-');
+    const userData = await makeTemp('bs-stale2-ud-');
+    await writeFile(source, 'report.txt', 'source-content');
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'copy');
+    await writeFile(target, 'report.txt', 'only-copy');
+
+    // 模拟 exFAT / FAT32：硬链接不可用，提交要走独占复制分支。
+    const originalLink = fs.link;
+    const patched = fs as unknown as { link: typeof fs.link };
+    patched.link = (async () => {
+      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    }) as typeof fs.link;
+    try {
+      await service.start({
+        sourceRoot: source,
+        targetRoot: target,
+        syncMode: 'copy',
+        allowMassDelete: true,
+        resume: true,
+      });
+    } finally {
+      patched.link = originalLink;
+    }
+
+    assert.equal(await fs.readFile(path.join(target, 'report.txt'), 'utf8'), 'only-copy',
+      '降级到独占复制时也不得覆盖');
+    assert.equal(service.getState().phase, 'failed', '降级分支同样必须报失败');
   });
 
   if (process.platform === 'win32') {

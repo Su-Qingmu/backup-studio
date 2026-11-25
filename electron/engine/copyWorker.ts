@@ -77,7 +77,17 @@ async function readRange(handle: FileHandle, buf: Buffer, length: number, offset
 async function openPart(partPath: string, resume: boolean): Promise<FileHandle> {
   if (!resume) return fs.open(partPath, 'w+');
   try {
-    return await fs.open(partPath, 'r+');
+    const handle = await fs.open(partPath, 'r+');
+    const stat = await handle.stat();
+    if (stat.nlink > 1) {
+      // 暂存件还有别的硬链接：上一次提交已经把同一份内容发布到目标路径，
+      // 只是没来得及删掉暂存件。继续往这里写会连带改掉已发布的目标文件，
+      // 把「已备份好的内容」写成半截。
+      await handle.close();
+      await fs.unlink(partPath);
+      return fs.open(partPath, 'wx+');
+    }
+    return handle;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     return fs.open(partPath, 'wx+');

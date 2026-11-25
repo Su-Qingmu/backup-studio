@@ -1449,7 +1449,7 @@ export class BackupService extends EventEmitter {
     try {
       if (action.type === 'copy') {
         // 计划为「源端新增」：提交条件是「目标仍然不存在」。
-        await this.commitNewTarget(task.partPath, finalPath, relPath);
+        await this.commitNewTarget(task.partPath, finalPath, relPath, sha256);
       } else {
         await this.transaction!.preserveTarget(finalPath);
         await this.commitToTarget(task.partPath, finalPath);
@@ -1521,27 +1521,23 @@ export class BackupService extends EventEmitter {
    * 覆盖；所以这里优先用 `fs.link`（原子的，目标已存在就 EEXIST），
    * 硬链接不可用时退化为 `fs.copyFile(..., COPYFILE_EXCL)`——同样不覆盖。
    */
-  private async commitNewTarget(srcPath: string, destPath: string, relPath: string): Promise<void> {
+  private async commitNewTarget(srcPath: string, destPath: string, relPath: string, expectedHash?: string): Promise<void> {
     await this.assertTargetWritable();
     await createDurableDirectory(path.dirname(destPath), path.resolve(this.state.targetRoot));
     await this.assertTargetWritable();
-    const occupied = await this.commitWithoutReplace(srcPath, destPath);
-    if (!occupied) {
-      // 目标原本不存在：提交完成，暂存件随提交一起落地。
-      await fs.unlink(srcPath);
-      await syncDirectory(path.dirname(destPath));
-      if (path.dirname(srcPath) !== path.dirname(destPath)) await syncDirectory(path.dirname(srcPath));
-      return;
-    }
-    // 目标路径已被占用。只有一种例外：盘上是同一路径的另一种大小写写法，
-    // 那在文件系统意义上就是同一个文件，按既有语义照常更新。
-    if (await this.hasExactEntry(path.dirname(destPath), path.basename(destPath))) {
+    const occupied = await this.commitWithoutReplace(srcPath, destPath, expectedHash);
+    if (occupied) {
       // 计划所依据的「目标不存在」已被打破：保留那份文件的原字节，
       // 报计划已过期并要求重新扫描。
+      //
+      // 这里没有例外。大小写不敏感卷上的同名别名由规划期认成「更新」
+      // 动作（它本来就该覆盖），不会走到新增提交这条路上来。
       throw stalePlanError(relPath);
     }
-    await this.transaction!.preserveTarget(destPath);
-    await this.commitToTarget(srcPath, destPath);
+    // 目标原本不存在：提交完成，暂存件随提交一起落地。
+    await fs.unlink(srcPath);
+    await syncDirectory(path.dirname(destPath));
+    if (path.dirname(srcPath) !== path.dirname(destPath)) await syncDirectory(path.dirname(srcPath));
   }
 
   /**
@@ -1550,7 +1546,7 @@ export class BackupService extends EventEmitter {
    * 返回 true 表示目标路径已被占用（暂存件原封不动留在盘上），
    * 返回 false 表示提交成功。其他错误照常抛出。
    */
-  private async commitWithoutReplace(srcPath: string, destPath: string): Promise<boolean> {
+  private async commitWithoutReplace(srcPath: string, destPath: string, expectedHash?: string): Promise<boolean> {
     try {
       await fs.link(srcPath, destPath);
       return false;
@@ -1561,29 +1557,22 @@ export class BackupService extends EventEmitter {
       // 降级：硬链接不可用（exFAT / FAT32 等）→ 独占复制（同样不覆盖）。
       try {
         await fs.copyFile(srcPath, destPath, fs.constants.COPYFILE_EXCL);
-        return false;
       } catch (copyErr) {
         if (errorCode(copyErr) === 'EEXIST') return true;
         throw copyErr;
       }
+      // 独占复制不是原子发布：内容是边拷边落的，落盘之前目标路径上
+      // 已经是一份可能不完整的数据。必须落盘并回读校验，否则「已发布」
+      // 可能只是一份没写完的内容。
+      const handle = await fs.open(destPath, 'r+');
+      try { await handle.sync(); } finally { await handle.close(); }
+      await syncDirectory(path.dirname(destPath));
+      if (expectedHash && await hashFile(destPath) !== expectedHash) {
+        await fs.unlink(destPath).catch(() => undefined);
+        throw Object.assign(new Error('提交内容校验失败，已撤销未完成的目标文件'), { code: 'VERIFY_FAILED' });
+      }
+      return false;
     }
-  }
-
-  /**
-   * 目标目录里是否有一个**名字完全一致**的条目。
-   *
-   * 大小写不敏感的文件系统上，"Report.txt" 与 "report.txt" 是同一个文件：
-   * 计划里的新增动作在盘上遇到同一条目的另一种写法时，那是既有语义里的
-   * 「同名不同写法」，照常更新即可。但名字完全一致时，它就是「预览之后
-   * 才出现的同名文件」，绝不能覆盖。
-   *
-   * 读不到目录时按「已被占用」处理：拿不准就不覆盖。
-   */
-  private async hasExactEntry(dir: string, name: string): Promise<boolean> {
-    let entries: string[];
-    try { entries = await fs.readdir(dir); }
-    catch { return true; }
-    return entries.includes(name);
   }
 
   private async onCopyError(relPath: string, message: string, code?: string): Promise<void> {
