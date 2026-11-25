@@ -573,7 +573,15 @@ export class AutoSync implements AutoSyncApi {
     const stat = await statMaybe(source);
     if (!stat?.isFile() || stat.size !== entry.size) throw new Error('回收项内容已不可用');
     const dest = await safePath(st.pair.targetRoot, entry.relPath);
-    const verifyDest = async () => { if (await statMaybe(dest)) throw new Error('备份端已有同名项，未覆盖'); };
+    // 发布前核对：复制所得字节必须与所选版本的登记哈希一致。
+    // 临时件回读只能证明「复制忠实于当前对象」——对象本身损坏时它照样通过，
+    // 损坏内容会被当成正常还原写回目标。
+    const verifyDest = async (computed?: string) => {
+      if (computed !== undefined && entry.hash && computed !== entry.hash) {
+        throw fault('CONFLICT', '回收项内容与登记哈希不符，已保留现有目标与历史证据');
+      }
+      if (await statMaybe(dest)) throw new Error('备份端已有同名项，未覆盖');
+    };
     await verifyDest();
     await gate(); await fs.mkdir(path.dirname(dest), { recursive: true });
     const part = await safePath(st.pair.targetRoot, path.posix.join(path.posix.dirname(entry.relPath), `.aut-part-restore-${entry.id}`));
@@ -610,7 +618,12 @@ export class AutoSync implements AutoSyncApi {
     }
     const parent = path.posix.dirname(version.relPath);
     const part = await safePath(st.pair.targetRoot, `${parent === '.' ? '' : `${parent}/`}.aut-part-restore-${version.id}`);
-    const verifyDest = async () => {
+    const verifyDest = async (computed?: string) => {
+      // 发布前核对：必须与所选版本的登记哈希一致，否则不得覆盖目标。
+      // 对象库里的对象可能事后损坏，仅靠临时件回读挡不住。
+      if (computed !== undefined && computed !== version.hash) {
+        throw fault('CONFLICT', '历史版本内容与登记哈希不符，已保留现有目标与历史证据');
+      }
       const fresh = await statMaybe(dest);
       if ((fresh && stamp(fresh)) !== (live && stamp(live))) throw fault('CONFLICT', '备份文件在对账后被修改');
     };

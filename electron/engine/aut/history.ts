@@ -2,6 +2,7 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import type { AutoChange, AutoCommit, AutoPair, AutoRecycleEntry, AutoVersion } from '../../../shared/aut-types';
 import { writeJsonAtomic } from '../manifest';
+import { hashFile } from '../hash';
 import { code, safePath, statMaybe } from './config';
 import { copyAtomic, fault, type Gate } from './copy';
 
@@ -109,14 +110,24 @@ export class PairLedger {
 
   /**
    * 把旧内容存入对象库。写入前必须过闸门（删除/替换属写操作）。
-   * 已存在同哈希对象时直接复用（内容寻址天然去重）。
+   *
+   * 内容寻址对象的**文件名就是它的哈希**：复用既有对象前必须核对它的实际内容。
+   * 介质上的对象可能事后损坏（掉电、介质故障、外部改写），而文件名仍是旧哈希。
+   * 只看「是不是普通文件」就复用，等于把一份损坏内容当成完好副本——调用方随后
+   * 会据此删掉备份目录里那份仍然完好的文件，最后一份好副本就此消失。
+   *
+   * 既有对象内容不符时：用源文件修复它并回读验证；修不成就让调用方停下，
+   * 绝不放行删除。
    */
   async storeObject(hash: string, src: string, gate: Gate): Promise<boolean> {
     const dest = this.objectPath(hash);
     const existing = await statMaybe(dest);
     if (existing) {
       if (!existing.isFile()) throw fault('CONFLICT', '历史对象库条目类型异常');
-      return false;
+      // 内容与文件名一致：正常去重，直接复用。
+      if (await hashFile(dest) === hash) return false;
+      await this.repairObject(hash, src, dest, gate);
+      return true;
     }
     const dir = await safePath(this.pair.targetRoot, `.backup-studio/aut-history/${this.pair.id}/objects`);
     await gate();
@@ -126,6 +137,21 @@ export class PairLedger {
       if (computed !== hash) throw fault('CONFLICT', '内容与历史哈希不一致');
     });
     return true;
+  }
+
+  /**
+   * 修复内容与文件名不符的既有对象：用源文件重写，并回读验证。
+   *
+   * 源文件是调用方即将删除/替换的那一份完好内容，哈希由它算出，
+   * 因此修复后对象的内容必然与对象名一致。修复不成时抛错：
+   * 调用方据此中止同步，备份目录里的完好文件不会被删掉。
+   */
+  private async repairObject(hash: string, src: string, dest: string, gate: Gate): Promise<void> {
+    const part = path.join(path.dirname(dest), `.aut-part-${hash}`);
+    await copyAtomic(src, dest, part, 0, gate, async computed => {
+      if (computed !== hash) throw fault('CONFLICT', '内容与历史哈希不一致');
+    });
+    if (await hashFile(dest) !== hash) throw fault('CONFLICT', '历史对象修复后校验失败');
   }
 
   async removeObject(hash: string, gate: Gate): Promise<void> {

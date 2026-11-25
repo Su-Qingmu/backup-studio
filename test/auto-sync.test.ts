@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
@@ -28,6 +29,7 @@ async function until(aut: AutoSync, predicate: (s: AutoStatus) => boolean) {
 }
 const put = (root: string, file: string, text: string) => fs.writeFile(path.join(root, file), text);
 const get = (root: string, file: string) => fs.readFile(path.join(root, file), 'utf8');
+const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
 const pairOf = (status: AutoStatus, id: string) => {
   const found = status.pairs.find(p => p.pair.id === id);
   if (!found) throw new Error(`配对不存在：${id}`);
@@ -178,6 +180,83 @@ async function main() {
     assert.equal(await get(input.targetRoot, 'file'), 'v1');
     const after = await aut.history(id);
     assert.ok(after.versions.some(v => v.kind === 'restore'), '撤回也记入历史');
+  }));
+
+  // —— 历史对象损坏：损坏对象不得换走最后一份完好副本，也不得被当成还原来源 ——
+  await test('历史对象损坏时先修复对象，完好副本不丢失且还原内容正确', () => fixture({ syncDeletes: true }, async (aut, input) => {
+    await put(input.sourceRoot, 'report.txt', 'AAAA');
+    // 另配三个参照文件：删除闸门按比例拦截，单文件目录会被判成批量删除而阻断。
+    for (const name of ['k1', 'k2', 'k3']) await put(input.sourceRoot, name, name);
+    const id = await enable(aut, input); await idle(aut, id);
+    await put(input.sourceRoot, 'report.txt', 'BBBB');
+    await aut.resume(id); await idle(aut, id);
+    await put(input.sourceRoot, 'report.txt', 'AAAA');
+    await aut.resume(id); await idle(aut, id);
+
+    const objects = path.join(input.targetRoot, '.backup-studio', 'aut-history', id, 'objects');
+    const aaaaHash = sha256('AAAA');
+    const objectFile = path.join(objects, aaaaHash);
+    assert.ok((await fs.readdir(objects)).includes(aaaaHash), '归档对象按内容哈希命名');
+    // 模拟等长的存储损坏：文件名字里的哈希还是旧的，内容已经不是。
+    await fs.writeFile(objectFile, 'AXAA', 'utf8');
+
+    // 源端删除 report.txt：受管删除会把备份目录里那份完好文件移走。
+    await fs.unlink(path.join(input.sourceRoot, 'report.txt'));
+    await aut.resume(id);
+    const { recycle } = pairOf(await idle(aut, id), id);
+    assert.ok(recycle.length >= 1, '受管删除应产生回收项');
+    assert.equal(recycle[0].hash, aaaaHash, '回收项登记的仍是完好内容的哈希');
+    // 复用损坏对象前必须先修复：备份目录里那份完好文件才不会被白白丢掉。
+    assert.equal(await fs.readFile(objectFile, 'utf8'), 'AAAA', '损坏对象已用完好内容修复并回读验证');
+    await assert.rejects(get(input.targetRoot, 'report.txt'), { code: 'ENOENT' });
+
+    // 还原必须还原出完好内容，而不是损坏内容。
+    await aut.setEnabled(id, false);
+    await aut.restore(id, recycle[0].id);
+    assert.equal(await get(input.targetRoot, 'report.txt'), 'AAAA', '还原出的是完好内容');
+  }));
+
+  await test('历史版本撤回时对象已损坏：报错且目标不被写坏', () => fixture({}, async (aut, input) => {
+    await put(input.sourceRoot, 'file', 'AAAA');
+    const id = await enable(aut, input); await idle(aut, id);
+    await put(input.sourceRoot, 'file', 'BBBB');
+    await aut.resume(id); await idle(aut, id);
+    const objects = path.join(input.targetRoot, '.backup-studio', 'aut-history', id, 'objects');
+    const aaaaHash = sha256('AAAA');
+    await fs.writeFile(path.join(objects, aaaaHash), 'AXAA', 'utf8');
+    await put(input.sourceRoot, 'file', 'CCCC');
+    await aut.resume(id); await idle(aut, id);
+    assert.equal(await get(input.targetRoot, 'file'), 'CCCC');
+
+    const history = await aut.history(id);
+    const archived = history.versions.find(v => v.relPath === 'file' && v.kind === 'replace' && v.hash === aaaaHash);
+    assert.ok(archived, '存在归档的 AAAA 版本');
+    await assert.rejects(aut.restoreVersion(id, archived.id), /登记哈希/);
+    // 目标不得被写坏：仍是最后一次同步进去的内容。
+    assert.equal(await get(input.targetRoot, 'file'), 'CCCC');
+    // 历史证据保留：损坏对象既没被改写，也没被删掉。
+    assert.equal(await fs.readFile(path.join(objects, aaaaHash), 'utf8'), 'AXAA');
+  }));
+
+  await test('回收站还原时对象已损坏：报错且不写回损坏内容', () => fixture({ syncDeletes: true }, async (aut, input) => {
+    await put(input.sourceRoot, 'file', 'AAAA');
+    // 另配三个参照文件：删除闸门按比例拦截，单文件目录会被判成批量删除而阻断。
+    for (const name of ['k1', 'k2', 'k3']) await put(input.sourceRoot, name, name);
+    const id = await enable(aut, input); await idle(aut, id);
+    await put(input.sourceRoot, 'file', 'BBBB');
+    await aut.resume(id); await idle(aut, id);
+    await put(input.sourceRoot, 'file', 'AAAA');
+    await aut.resume(id); await idle(aut, id);
+    const objects = path.join(input.targetRoot, '.backup-studio', 'aut-history', id, 'objects');
+    const aaaaHash = sha256('AAAA');
+    // 删除之后介质上的对象才损坏：此时备份目录里已经没有那份完好副本了。
+    await fs.unlink(path.join(input.sourceRoot, 'file'));
+    await aut.resume(id);
+    const { recycle } = pairOf(await idle(aut, id), id);
+    await fs.writeFile(path.join(objects, aaaaHash), 'AXAA', 'utf8');
+    await aut.setEnabled(id, false);
+    await assert.rejects(aut.restore(id, recycle[0].id), /登记哈希/);
+    await assert.rejects(get(input.targetRoot, 'file'), { code: 'ENOENT' }, '损坏内容不得被写回目标');
   }));
 
   // —— 多配对隔离 ——
