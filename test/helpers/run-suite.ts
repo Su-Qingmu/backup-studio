@@ -100,7 +100,17 @@ async function main(): Promise<void> {
   // - 退出码 0 → 本次运行没有失败用例，目录可以删
   // - 退出码非 0 → 保留现场（失败的用例目录在下面各自标记）
   if (code === 0) {
-    await fs.rm(runDir, { recursive: true, force: true }).catch(() => undefined);
+    // 不静默吞掉删除失败：运行目录里通常还压着 tsx 的转译缓存，
+    // Windows 上文件句柄释放有延迟，删除可能撞上 EBUSY/EPERM。
+    // 删不掉就如实报出来，让人知道目录还在——而不是假装清理过了。
+    try {
+      await fs.rm(runDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      console.log(`[run-suite] 本次运行目录已清理：${runDir}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[run-suite] 本次运行目录清理失败，已保留：${runDir}（${message}）`);
+      console.error('[run-suite] 可用 npm run test:temp:clean -- --all 手动回收');
+    }
   } else {
     console.error(`[run-suite] 测试未全部通过，本次运行目录已保留：${runDir}`);
   }

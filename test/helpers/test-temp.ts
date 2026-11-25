@@ -163,6 +163,24 @@ export async function createCaseDir(suite: string, label: string): Promise<strin
 }
 
 /**
+ * 跨用例共享资源的落点。
+ *
+ * 优先放在启动器建的**本次运行目录**（`BS_TEST_TEMP_ROOT`）里：
+ * 启动器在整轮退出码为 0 时删掉该目录 → 共享资源随之清理；
+ * 退出码非 0 时保留该目录 → 共享资源与失败现场一起留存。
+ *
+ * 早先这些目录直接放在套件根（`<suite>/`）下，而启动器只删运行目录，
+ * 于是每次成功跑完都留下一个没人回收的目录（实测泄漏
+ * `bs-big-src-*` / `bs-gate-journal-*` / `bs-perm-state-*`）。
+ * 没有启动器接管时（例如直接 `node --import tsx test/xxx.test.ts`）退回套件根目录。
+ */
+async function sharedBase(suite: string): Promise<string> {
+  const managed = managedTempRoot();
+  if (managed) return managed;
+  return suiteRoot(suite);
+}
+
+/**
  * 在**当前用例目录**内创建一个临时子目录。
  *
  * 这是测试体里创建夹具的标准入口。语义：
@@ -171,7 +189,7 @@ export async function createCaseDir(suite: string, label: string): Promise<strin
  */
 export async function caseTempDir(prefix = 'tmp'): Promise<string> {
   const ctx = currentCase();
-  const base = ctx ? ctx.dir : await suiteRoot(process.env.BS_TEST_SUITE ?? 'adhoc');
+  const base = ctx ? ctx.dir : await sharedBase(process.env.BS_TEST_SUITE ?? 'adhoc');
   const dir = path.join(base, `${sanitizeName(prefix)}-${randomSuffix()}`);
   await fs.mkdir(dir, { recursive: true });
   return dir;
@@ -181,10 +199,11 @@ export async function caseTempDir(prefix = 'tmp'): Promise<string> {
  * 套件级临时目录：`<repo>/temp/test-runs/<suite>/shared-`
  *
  * 用于**跨用例共享**的资源（例如 engine 测试里那份 128 MB 大文件源）。
- * 它不在任何单个用例目录下，因此用例成功时不会被删——由启动器在整轮结束后统一处置。
+ * 它不在任何单个用例目录下，因此用例成功时不会被删——由启动器在整轮结束后统一处置：
+ * 落在本次运行目录里，整轮退出码 0 就随运行目录一起清掉。
  */
 export async function suiteTempDir(prefix = 'shared'): Promise<string> {
-  const base = await suiteRoot(process.env.BS_TEST_SUITE ?? 'adhoc');
+  const base = await sharedBase(process.env.BS_TEST_SUITE ?? 'adhoc');
   const dir = path.join(base, `${sanitizeName(prefix)}-${randomSuffix()}`);
   await fs.mkdir(dir, { recursive: true });
   return dir;
@@ -247,6 +266,18 @@ export async function removeCaseDir(dir: string): Promise<{ removed: boolean; er
 }
 
 /**
+ * 判断异常是否是「显式跳过」。
+ *
+ * 约定：各测试文件里的 `TestSkip` 类都把 `name` 设成 `'TestSkip'`。
+ * 跳过不是失败——没有失败现场要保留，目录应当按「已通过」处置。
+ * 否则每个按平台跳过的用例都会永久留下一个 failed 目录，
+ * 既污染清理清单，也让「failed = 真实失败现场」这条约定失真。
+ */
+function isSkipSignal(err: unknown): boolean {
+  return err instanceof Error && err.name === 'TestSkip';
+}
+
+/**
  * 执行一个用例：**成功删除其临时目录，失败保留现场**。
  *
  * 失败时把异常原样抛出（由调用方的计数逻辑处理），并把现场路径写进
@@ -267,6 +298,15 @@ export async function runCase<T>(suite: string, label: string, fn: () => Promise
     }
     return value;
   } catch (err) {
+    // 显式跳过：不是失败，没有现场要保留。目录按「已通过」处置，
+    // 异常原样抛回，由调用方的跳过分支计数。
+    if (isSkipSignal(err)) {
+      const cleanup = await removeCaseDir(dir);
+      if (!cleanup.removed) {
+        console.warn(`[test-temp] 跳过用例的临时目录清理失败，已标记 cleanup-pending：${dir}（${cleanup.error}）`);
+      }
+      throw err;
+    }
     // 失败：完整保留现场（源、目标、journal、索引、中间件都在里面）
     const message = err instanceof Error ? err.message : String(err);
     await markResult(dir, 'failed', {

@@ -85,6 +85,34 @@ async function collect(): Promise<Candidate[]> {
       // 目录本身也可能是用例目录（套件目录下直接放用例目录）
       const state = marker?.state ?? 'unknown';
       out.push({ dir, relative: path.relative(repoRoot, dir), state, marker });
+      // 运行目录（run-*）里还套着一层用例目录：继续下钻。
+      // 否则失败运行留下的现场只会以「一个未知目录」的形式出现，
+      // 里面的 passed 用例目录永远没机会被回收，失败现场也看不到具体路径。
+      if (!marker && entry.startsWith('run-')) {
+        let children: string[];
+        try {
+          children = await fs.readdir(dir);
+        } catch {
+          continue;
+        }
+        for (const child of children) {
+          const childDir = path.join(dir, child);
+          let cst;
+          try {
+            cst = await fs.stat(childDir);
+          } catch {
+            continue;
+          }
+          if (!cst.isDirectory()) continue;
+          const childMarker = await readMarker(childDir);
+          out.push({
+            dir: childDir,
+            relative: path.relative(repoRoot, childDir),
+            state: childMarker?.state ?? 'unknown',
+            marker: childMarker,
+          });
+        }
+      }
     }
   }
   return out;
@@ -133,7 +161,10 @@ async function main(): Promise<void> {
 
   let removed = 0;
   const failures: { dir: string; error: string }[] = [];
-  for (const c of safe) {
+  // 先删深的再删浅的：运行目录和它里面的用例目录可能同时在清单里，
+  // 顺序反了会因为父目录先被删掉而统计不准。
+  const ordered = [...safe].sort((a, b) => b.dir.length - a.dir.length);
+  for (const c of ordered) {
     try {
       await fs.rm(c.dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
       removed += 1;
