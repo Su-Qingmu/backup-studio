@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import type { Dirent } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { DuplicateFinder, MAX_PREVIEW_GROUPS } from '../electron/engine/dup';
 import { createDuplicateFinder } from '../electron/engine/dup/wiring';
@@ -14,6 +13,7 @@ import {
   formatFsCapabilities,
   type FsCapabilities,
 } from './fs-capabilities';
+import { caseTempDir, runCase } from './helpers/test-temp';
 import type { ActRegistryEntry, QuarantineEntry, QuarantineErrorCode } from '../electron/engine/dup/act';
 import { BackupService, decideWriteGate, evaluateWriteGate } from '../electron/engine/service';
 import type {
@@ -70,7 +70,10 @@ function skip(reason: string): never {
 
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
   try {
-    await fn();
+    // runCase：**成功删除本用例的临时目录，失败完整保留现场**。
+    await runCase('duplicate', name, async () => {
+      await fn();
+    });
     passed += 1;
     console.log(`PASS ${name}`);
   } catch (err) {
@@ -90,7 +93,7 @@ async function test(name: string, fn: () => Promise<void>): Promise<void> {
 let capabilitiesCache: FsCapabilities | undefined;
 async function capabilities(): Promise<FsCapabilities> {
   if (!capabilitiesCache) {
-    capabilitiesCache = await probeFsCapabilities(FIXTURE_ROOT);
+    capabilitiesCache = await probeFsCapabilities();
     console.log(formatFsCapabilities(capabilitiesCache));
   }
   return capabilitiesCache;
@@ -105,8 +108,6 @@ const BLOB_SIZE = 2048;
  * 夹具临时目录：落在 `test/.dup-unit-*`（已被 .gitignore 忽略）。
  * 以脚本所在目录为基准，避免从任意工作目录启动时落到仓库之外。
  */
-const FIXTURE_ROOT = typeof __dirname === 'string' ? __dirname : path.resolve('test');
-
 /** 确定性内容：同一 seed 必得同一串字节，不同 seed 必得不同内容 */
 function blob(seed: string, size = BLOB_SIZE): Buffer {
   const unit = `${seed}-`;
@@ -176,7 +177,8 @@ interface Fixture {
 }
 
 async function fixture(options: FixtureOptions, fn: (fx: Fixture) => Promise<void>): Promise<void> {
-  const base = await fs.mkdtemp(path.join(FIXTURE_ROOT, '.dup-unit-'));
+  // 用例夹具根：落在当前用例目录下，随用例成败一起处置。
+  const base = await caseTempDir('dup-unit');
   const root = path.join(base, 'scan');
   const local = path.join(base, 'local');
   await fs.mkdir(root, { recursive: true });
@@ -207,11 +209,8 @@ async function fixture(options: FixtureOptions, fn: (fx: Fixture) => Promise<voi
     onSuppressionsChanged: (changedRoot, reason) => changes.push(`${changedRoot}|${reason}`),
   });
 
-  try {
-    await fn({ base, root, local, finder, trashCalls, revealCalls, changes, busy });
-  } finally {
-    await fs.rm(base, { recursive: true, force: true });
-  }
+  // 不在这里删目录：用例失败时现场必须保留（由 runCase 统一处置）。
+  await fn({ base, root, local, finder, trashCalls, revealCalls, changes, busy });
 }
 
 // ------------------------------------------------------------ 结果读取工具
@@ -471,13 +470,14 @@ async function writeQuarantineIndex(dir: string, content: unknown): Promise<stri
 }
 
 /** 临时目录：落在系统临时目录，用完即清理 */
+/**
+ * 用例临时目录：落在**当前用例目录**下。
+ *
+ * 失败时不再由 `finally` 抹掉——现场是排查问题的唯一证据。
+ */
 async function withTempDir(prefix: string, fn: (dir: string) => Promise<void>): Promise<void> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  try {
-    await fn(dir);
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true });
-  }
+  const dir = await caseTempDir(prefix);
+  await fn(dir);
 }
 
 /** 断言某个 Promise 以指定的隔离区错误码失败（可顺带校验消息） */

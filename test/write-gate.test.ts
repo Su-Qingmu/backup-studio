@@ -1,12 +1,11 @@
 import assert from 'node:assert/strict';
-import { promises as fs } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { BackupService } from '../electron/engine/service';
 import { createWritePermit } from '../electron/engine/aut/bridge';
 import type { WriteDecision } from '../electron/engine/aut/permit';
 import type { AutoPair } from '../shared/aut-types';
 import type { HealthReport, WriteGate } from '../shared/types';
+import { caseTempDir, runCase, suiteTempDir } from './helpers/test-temp';
 
 let passed = 0;
 let failed = 0;
@@ -32,7 +31,10 @@ function skip(reason: string): never {
 
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
   try {
-    await fn();
+    // runCase：**成功删除本用例的临时目录，失败完整保留现场**。
+    await runCase('write-gate', name, async () => {
+      await fn();
+    });
     passed += 1;
     console.log(`  PASS  ${name}`);
   } catch (err) {
@@ -93,10 +95,12 @@ const healthyGate = (): WriteGate => ({
 });
 
 async function main() {
-  const service = new BackupService(await fs.mkdtemp(path.join(os.tmpdir(), 'bs-gate-')));
+  // 套件级共享服务实例：它的账本目录放在套件根下（不是某个用例目录），
+  // 否则第一个用例成功后目录被删，后续用例拿到的是失效路径。
+  const service = new BackupService(await suiteTempDir('bs-gate-journal'));
 
   await test('写入闸门：目标不可达时禁止写入', async () => {
-    const gate = await service.writeGate(path.join(os.tmpdir(), 'bs-not-exists-' + Date.now()));
+    const gate = await service.writeGate(path.join(await caseTempDir('bs-not-exists'), 'nope'));
     assert.equal(gate.reachable, false);
     assert.equal(gate.allowed, false);
     assert.equal(gate.volumeHealth, 'unknown');
@@ -105,7 +109,7 @@ async function main() {
   });
 
   await test('写入闸门：可达目标按卷级事实决定是否放行', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bs-gate-ok-'));
+    const dir = await caseTempDir('bs-gate-ok');
     try {
       const gate = await service.writeGate(dir);
       assert.equal(gate.reachable, true);
@@ -121,7 +125,7 @@ async function main() {
         assert.ok((gate.reason ?? '').includes('默认只读'));
       }
     } finally {
-      await fs.rm(dir, { recursive: true, force: true });
+      // 不在这里删目录：用例失败时现场必须保留（由 runCase 统一处置）。
     }
   });
 
@@ -168,7 +172,7 @@ async function main() {
   });
 
   await test('写入闸门：隔离观察时禁止写入', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bs-gate-quar-'));
+    const dir = await caseTempDir('bs-gate-quar');
     try {
       await service.quarantine(dir, '测试隔离');
       const gate = await service.writeGate(dir);
@@ -177,7 +181,7 @@ async function main() {
       await service.releaseQuarantine();
     } finally {
       await service.releaseQuarantine();
-      await fs.rm(dir, { recursive: true, force: true });
+      // 不删目录：用例失败时现场必须保留（由 runCase 统一处置）。
     }
   });
 

@@ -1,10 +1,8 @@
 import assert from 'node:assert/strict';
-import { promises as fs } from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { BackupService } from '../electron/engine/service';
 import { resolveWritePermission } from '../src/lib/write-permission';
 import type { MediaAssessment } from '../shared/types';
+import { caseTempDir, runCase, suiteTempDir } from './helpers/test-temp';
 
 /**
  * 写入许可契约的回归套件（Issue #9）。
@@ -36,7 +34,10 @@ function skip(reason: string): never {
 
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
   try {
-    await fn();
+    // runCase：**成功删除本用例的临时目录，失败完整保留现场**。
+    await runCase('permissions', name, async () => {
+      await fn();
+    });
     passed += 1;
     console.log('PASS ' + name);
   } catch (err) {
@@ -64,13 +65,10 @@ const assessmentOf = (patch: Partial<MediaAssessment> & { targetRoot?: string })
   ...patch,
 });
 
+/** 用例临时目录：落在当前用例目录下；失败时现场保留。 */
 async function withTempDir(prefix: string, fn: (dir: string) => Promise<void>): Promise<void> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  try {
-    await fn(dir);
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true });
-  }
+  const dir = await caseTempDir(prefix);
+  await fn(dir);
 }
 
 async function main() {
@@ -131,7 +129,8 @@ async function main() {
 
   await test('WP-8 体检报告同时给出许可与阻断原因，且与 assessment 同源', () =>
     withTempDir('bs-perm-', async (dir) => {
-      const service = new BackupService(await fs.mkdtemp(path.join(os.tmpdir(), 'bs-perm-state-')));
+      // 服务实例的账本目录放套件级：跨用例共享的实例不能落在单个用例目录下
+      const service = new BackupService(await suiteTempDir('bs-perm-state'));
       const report = await service.health(dir);
       assert.ok(report.assessment.blockers, '经过闸门的判定必须带 blockers');
       assert.equal(report.assessment.targetRoot, dir, '判定必须绑定目标目录');
@@ -144,7 +143,8 @@ async function main() {
 
   await test('WP-9 放行时文案不得宣称「保持只读」（与行为冲突的两句话）', () =>
     withTempDir('bs-perm-', async (dir) => {
-      const service = new BackupService(await fs.mkdtemp(path.join(os.tmpdir(), 'bs-perm-state-')));
+      // 服务实例的账本目录放套件级：跨用例共享的实例不能落在单个用例目录下
+      const service = new BackupService(await suiteTempDir('bs-perm-state'));
       const report = await service.health(dir);
       if ((report.assessment.blockers ?? []).length > 0) {
         skip('本机目标被判定为强制阻断（' + (report.assessment.blockers ?? []).join(',') + '），该断言只在放行场景下有意义');
@@ -156,7 +156,8 @@ async function main() {
 
   await test('WP-10 同一目标重复判定结论稳定（不存在随调用次数漂移）', () =>
     withTempDir('bs-perm-', async (dir) => {
-      const service = new BackupService(await fs.mkdtemp(path.join(os.tmpdir(), 'bs-perm-state-')));
+      // 服务实例的账本目录放套件级：跨用例共享的实例不能落在单个用例目录下
+      const service = new BackupService(await suiteTempDir('bs-perm-state'));
       const first = await service.writeGate(dir, { mode: 'user-directed' });
       const second = await service.writeGate(dir, { mode: 'user-directed' });
       assert.equal(first.allowed, second.allowed);
@@ -166,7 +167,8 @@ async function main() {
 
   await test('WP-11 隔离观察：blockers 必须含 isolated，撤销后清空', () =>
     withTempDir('bs-perm-', async (dir) => {
-      const service = new BackupService(await fs.mkdtemp(path.join(os.tmpdir(), 'bs-perm-state-')));
+      // 服务实例的账本目录放套件级：跨用例共享的实例不能落在单个用例目录下
+      const service = new BackupService(await suiteTempDir('bs-perm-state'));
       try {
         await service.quarantine(dir, '回归用例：模拟隔离');
         const blocked = await service.health(dir);

@@ -2,14 +2,15 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { test, type TestContext } from 'node:test';
+import { type TestContext } from 'node:test';
 import type { CopyResult } from '../electron/engine/pool';
 // 事务清理是纯逻辑，不依赖编译产物：直接引入源码，避免与并发改动互相阻塞。
 import { BackupTransaction } from '../electron/engine/transaction';
 import { CASE_INSENSITIVE_PATHS } from '../electron/engine/path-identity';
 import type { AppState, SyncMode } from '../shared/types';
+import { caseTest } from './helpers/case-test';
+import { caseTempDir } from './helpers/test-temp';
 
 // The service launches copyWorker.js alongside itself. Use the existing Electron build.
 const { BackupService } = require('../dist-electron/electron/engine/service.js') as typeof import('../electron/engine/service');
@@ -21,9 +22,17 @@ const relPath = 'payload.bin';
 const oldPayload = Buffer.from('last complete version');
 const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 
+/**
+ * 用例夹具。
+ *
+ * 原来用 `t.after(() => fs.rm(root, ...))`：node:test 的 after 钩子**无条件执行**，
+ * 断言失败后现场也被删掉，失败用例就查不出原因。
+ * 现在改用 `caseTempDir`：目录落在当前用例目录内，
+ * 由 `caseTest` 统一处置——成功删、失败留。
+ */
 async function fixture(t: TestContext) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'bs-transaction-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  void t;
+  const root = await caseTempDir('bs-transaction');
   const source = path.join(root, 'source');
   const target = path.join(root, 'target');
   const userData = path.join(root, 'user-data');
@@ -83,7 +92,7 @@ async function assertRecovered(f: Fixture, service: Service, expected: Buffer) {
   assert.equal(await f.store.getActive(), null);
 }
 
-test('文件提交失败保留上一副本和断点，新服务只重传损坏、截断和缺失的块', async (t) => {
+caseTest('transaction', '文件提交失败保留上一副本和断点，新服务只重传损坏、截断和缺失的块', undefined, async (t) => {
   const f = await fixture(t);
   await seedBackup(f, 'mirror');
   const chunk = 1 << 20;
@@ -141,7 +150,7 @@ test('文件提交失败保留上一副本和断点，新服务只重传损坏�
   await assert.rejects(fs.stat(f.partFile), { code: 'ENOENT' });
 });
 
-test('目标文件提交后，manifest 原子替换失败不报完成', async (t) => {
+caseTest('transaction', '目标文件提交后，manifest 原子替换失败不报完成', undefined, async (t) => {
   const f = await fixture(t);
   await seedBackup(f, 'mirror-archive');
   const payload = Buffer.from('next complete version with a different size');
@@ -188,7 +197,7 @@ test('目标文件提交后，manifest 原子替换失败不报完成', async (t
   });
 });
 
-test('目标文件提交后，本机账本原子替换失败不报完成', async (t) => {
+caseTest('transaction', '目标文件提交后，本机账本原子替换失败不报完成', undefined, async (t) => {
   const f = await fixture(t);
   await seedBackup(f, 'mirror');
   const payload = Buffer.from('next version, data written before journal fails');
@@ -221,7 +230,7 @@ test('目标文件提交后，本机账本原子替换失败不报完成', async
   });
 });
 
-test('复制失败后不得执行计划里的后续删除', async (t) => {
+caseTest('transaction', '复制失败后不得执行计划里的后续删除', undefined, async (t) => {
   const f = await fixture(t);
   const orphan = path.join(f.target, 'orphan.txt');
   const retained = Buffer.from('previous backup data that must survive');
@@ -348,7 +357,7 @@ async function assertArchivedPayload(f: Fixture) {
   assert.deepEqual(versions, [oldPayload], '旧清单尚未替换时应保有一份完整的旧副本，且恢复不得重复归档');
 }
 
-test('清单替换前进程退出，恢复再次退出仍可补齐索引且不重复提交数据', async (t) => {
+caseTest('transaction', '清单替换前进程退出，恢复再次退出仍可补齐索引且不重复提交数据', undefined, async (t) => {
   const f = await fixture(t);
   const syncMode = 'mirror-archive';
   await seedBackup(f, syncMode);
@@ -387,7 +396,7 @@ test('清单替换前进程退出，恢复再次退出仍可补齐索引且不�
   await assert.rejects(fs.stat(f.partFile), { code: 'ENOENT' });
 });
 
-test('首次删除实际成功后进程退出，恢复不重删且保留重新出现在源端的文件', async (t) => {
+caseTest('transaction', '首次删除实际成功后进程退出，恢复不重删且保留重新出现在源端的文件', undefined, async (t) => {
   const f = await fixture(t);
   const syncMode = 'mirror';
   const candidates = ['orphan-a.txt', 'orphan-b.txt'];
@@ -460,8 +469,9 @@ interface ArchiveFixture {
 }
 
 async function archiveFixture(t: TestContext): Promise<ArchiveFixture> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'bs-archive-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  void t;
+  // 同样不再用 t.after 无条件删除：失败现场必须保留
+  const root = await caseTempDir('bs-archive');
   const transaction = new BackupTransaction(root, randomUUID(), async () => {});
   const source = path.join(root, 'source');
   await fs.mkdir(source, { recursive: true });
@@ -478,7 +488,7 @@ async function archiveFixture(t: TestContext): Promise<ArchiveFixture> {
   };
 }
 
-test('220 字符文件名归档成功且临时名独立于原 basename', async (t) => {
+caseTest('transaction', '220 字符文件名归档成功且临时名独立于原 basename', undefined, async (t) => {
   const f = await archiveFixture(t);
   const basename = 'a'.repeat(220);
   const bytes = Buffer.from('long filename archive payload');
@@ -503,7 +513,7 @@ test('220 字符文件名归档成功且临时名独立于原 basename', async (
   assert.deepEqual(await fs.readdir(path.dirname(archived.archivePath)), [basename], '归档目录不得残留临时文件');
 });
 
-test('归档临时名撞占用文件时重新选择且不覆盖原内容', async (t) => {
+caseTest('transaction', '归档临时名撞占用文件时重新选择且不覆盖原内容', undefined, async (t) => {
   const f = await archiveFixture(t);
   const file = path.join(f.transaction.root, 'source', 'collision.bin');
   await fs.writeFile(file, 'archive payload');
@@ -527,7 +537,7 @@ test('归档临时名撞占用文件时重新选择且不覆盖原内容', async
     [path.basename(occupied), path.basename(archived.archivePath)].sort());
 });
 
-test('清理事务历史：受保护目录与文件跨大小写都必须保留，未受保护的照常清理', async (t) => {
+caseTest('transaction', '清理事务历史：受保护目录与文件跨大小写都必须保留，未受保护的照常清理', undefined, async (t) => {
   await t.test('受保护目录用磁盘实际大小写传入，子文件保留', async (t) => {
     const f = await archiveFixture(t);
     const keep = await f.archive('Protected/keep.bin', 'keep');

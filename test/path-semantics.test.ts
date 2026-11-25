@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { normalizeDirectoryRoot } from '../src/lib/format';
+import { caseTempDir, runCase } from './helpers/test-temp';
 
 /**
  * 目录路径显示语义专项（Issue #12）。
@@ -38,7 +38,10 @@ function skip(reason: string): never {
 
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
   try {
-    await fn();
+    // runCase：**成功删除本用例的临时目录，失败完整保留现场**。
+    await runCase('path', name, async () => {
+      await fn();
+    });
     passed += 1;
     console.log('PASS ' + name);
   } catch (err) {
@@ -146,7 +149,7 @@ async function main() {
     if (process.platform !== 'win32') {
       skip('该用例验证真实 Windows 文件系统解析（fs.realpath），本机 platform=' + process.platform);
     }
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bs-path-'));
+    const dir = await caseTempDir('bs-path');
     try {
       const canonical = await fs.realpath(dir);
       const shown = normalizeDirectoryRoot(canonical + path.sep, true);

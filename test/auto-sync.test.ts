@@ -6,6 +6,7 @@ import { AutoSync, type WriteDecision, type WritePermit } from '../electron/engi
 import { Debounce, retryDelay } from '../electron/engine/aut/queue';
 import { ensureRoom, recyclePath } from '../electron/engine/aut/recycle';
 import type { AutoPairInput, AutoRecycleEntry, AutoStatus } from '../shared/aut-types';
+import { caseTempDir, runCase } from './helpers/test-temp';
 
 let passed = 0, failed = 0, skipped = 0;
 /**
@@ -22,7 +23,11 @@ function skip(reason: string): never {
 // 本套件当前没有「环境不适用」用例；保留显式信号供后续用例调用，避免变成死代码。
 void skip;
 async function test(name: string, fn: () => Promise<void>) {
-  try { await fn(); passed++; console.log(`PASS ${name}`); }
+  try {
+    // runCase：**成功删除本用例的临时目录，失败完整保留现场**。
+    await runCase('auto-sync', name, async () => { await fn(); });
+    passed++; console.log(`PASS ${name}`);
+  }
   catch (error) {
     // SKIP 先于 FAIL 判定：跳过不计入通过，也不影响退出码。
     if (error instanceof TestSkip) { skipped++; console.log(`SKIP ${name}`); console.log(`     原因：${error.message}`); return; }
@@ -31,12 +36,13 @@ async function test(name: string, fn: () => Promise<void>) {
 }
 const decision = (): WriteDecision => ({ allowed: true, reachable: true, isolated: false, level: 'L0', volumeHealth: 'healthy', epoch: 'test-medium', evidence: [] });
 async function fixture(options: Partial<AutoPairInput>, fn: (aut: AutoSync, input: AutoPairInput, decision: WriteDecision, local: string) => Promise<void>) {
-  const base = await fs.mkdtemp(path.resolve('test', '.aut-fixture-'));
+  // 用例临时目录：落在项目 temp/ 下的当前用例目录，不再写进仓库的 test/。
+  const base = await caseTempDir('aut-fixture');
   const sourceRoot = path.join(base, 'source'), targetRoot = path.join(base, 'target'), local = path.join(base, 'local');
   const d = decision();
   const aut = new AutoSync(local, { canWrite: () => d });
   try { await fs.mkdir(sourceRoot); await fs.mkdir(targetRoot); await fn(aut, { sourceRoot, targetRoot, stableMs: 500, ...options }, d, local); }
-  finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
+  finally { await aut.suspend(); }
 }
 async function until(aut: AutoSync, predicate: (s: AutoStatus) => boolean) {
   const deadline = Date.now() + 12_000;
@@ -199,7 +205,7 @@ async function main() {
 
   // —— 多配对隔离 ——
   await test('多配对的索引、回收站、历史与开关互相隔离', async () => {
-    const base = await fs.mkdtemp(path.resolve('test', '.aut-multi-'));
+    const base = await caseTempDir('aut-multi');
     const srcA = path.join(base, 'a'), srcB = path.join(base, 'b');
     const dstA = path.join(base, 'backupA'), dstB = path.join(base, 'backupB');
     const local = path.join(base, 'local');
@@ -233,7 +239,7 @@ async function main() {
       await aut.setEnabled(idB, false);
       assert.equal(pairOf(await aut.status(), idB).pair.enabled, false);
       assert.equal(pairOf(await aut.status(), idA).pair.enabled, true);
-    } finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
+    } finally { await aut.suspend(); }
   });
 
   // —— 拔盘重插后从介质重建 ——
@@ -302,7 +308,7 @@ async function main() {
 
   // —— 状态迁移 ——
   await test('v1 单配对状态迁移为 v2 多配对格式', async () => {
-    const base = await fs.mkdtemp(path.resolve('test', '.aut-migrate-'));
+    const base = await caseTempDir('aut-migrate');
     const local = path.join(base, 'local');
     const sourceRoot = path.join(base, 'source'), targetRoot = path.join(base, 'target');
     await fs.mkdir(local); await fs.mkdir(sourceRoot); await fs.mkdir(targetRoot);
@@ -322,10 +328,10 @@ async function main() {
       const saved = JSON.parse(await fs.readFile(path.join(local, 'auto-sync.json'), 'utf8'));
       assert.equal(saved.version, 2);
       assert.equal(saved.pairs.length, 1);
-    } finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
+    } finally { await aut.suspend(); }
   });
   await test('v1 状态损坏时迁移明确报错，不静默丢状态', async () => {
-    const base = await fs.mkdtemp(path.resolve('test', '.aut-migrate-'));
+    const base = await caseTempDir('aut-migrate');
     const local = path.join(base, 'local');
     await fs.mkdir(local);
     await fs.writeFile(path.join(local, 'auto-sync.json'), JSON.stringify({ version: 1, pair: null, recent: [], recycle: [] }));
@@ -334,7 +340,7 @@ async function main() {
     try {
       await assert.rejects(aut.status(), /迁移失败/);
       await assert.rejects(aut.addPair({ sourceRoot: path.join(base, 's'), targetRoot: path.join(base, 't') }), /迁移失败/);
-    } finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
+    } finally { await aut.suspend(); }
   });
 
   // —— 历史容量上限 ——

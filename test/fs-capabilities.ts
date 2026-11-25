@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { caseTempDir, suiteTempDir } from './helpers/test-temp';
 
 /**
  * 文件系统能力探测。
@@ -62,6 +62,12 @@ function verdict(state: CapabilityState, detail: string, error?: unknown): Capab
   return { state, detail };
 }
 
+/**
+ * 单项能力探测目录。
+ *
+ * 落在**当前用例目录**下（由调用方通过 base 指定），探测完即删——
+ * 探测目录只是一次性现场，不含需要保留的证据。
+ */
 async function withProbeDir<T>(base: string, tag: string, fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await fs.mkdtemp(path.join(base, `.probe-${tag}-`));
   try {
@@ -237,7 +243,9 @@ async function probeInode(base: string): Promise<CapabilityVerdict> {
  * 也不会把「探测出错」写成「不支持」。
  */
 export async function probeFsCapabilities(base?: string): Promise<FsCapabilities> {
-  const root = await fs.mkdtemp(path.join(base ?? os.tmpdir(), 'bs-fsprobe-'));
+  // 探测根目录：优先用调用方指定的（当前用例目录），否则用套件级目录。
+  // 绝不使用系统临时目录。
+  const root = base ? await caseTempDir('bs-fsprobe') : await suiteTempDir('bs-fsprobe');
   try {
     const [caseInsensitive, caseDistinct, unicode, chmodBlocksWrite, readDirAsFileFails, inodeIdentity] = await Promise.all([
       probeCaseInsensitive(root),

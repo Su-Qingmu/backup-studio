@@ -7,6 +7,7 @@ import type { RevealFileSystem } from '../electron/engine/reveal-authority';
 import { historyDir } from '../electron/engine/manifest';
 import type { PlanAction } from '../shared/types';
 import type { BackupRevealErrorCode, BackupRevealResult } from '../shared/reveal-types';
+import { caseTempDir, repoRoot, runCase } from './helpers/test-temp';
 
 /**
  * 「定位文件」的服务端路径授权回归用例。
@@ -43,7 +44,10 @@ void skip;
 
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
   try {
-    await fn();
+    // runCase：**成功删除本用例的临时目录，失败完整保留现场**。
+    await runCase('reveal-authority', name, async () => {
+      await fn();
+    });
     passed += 1;
     console.log(`PASS ${name}`);
   } catch (err) {
@@ -62,9 +66,6 @@ async function test(name: string, fn: () => Promise<void>): Promise<void> {
 
 // ---------------------------------------------------------------- 夹具工具
 
-/** 夹具根目录：落在仓库 `test/` 下（与其它测试套件一致），避免写到仓库之外。 */
-const FIXTURE_ROOT = typeof __dirname === 'string' ? __dirname : path.resolve('test');
-
 const nativeRealpath = promisify(realpath.native);
 
 interface Roots {
@@ -73,17 +74,18 @@ interface Roots {
   target: string;
 }
 
+/**
+ * 用例夹具根目录：落在**当前用例目录**下。
+ *
+ * 不再用 `finally` 无条件删除——断言失败后现场必须保留。
+ */
 async function withRoots(fn: (roots: Roots) => Promise<void>): Promise<void> {
-  const base = await fs.mkdtemp(path.join(FIXTURE_ROOT, 'bs-reveal-'));
+  const base = await caseTempDir('bs-reveal');
   const source = path.join(base, 'source');
   const target = path.join(base, 'target');
   await fs.mkdir(source, { recursive: true });
   await fs.mkdir(target, { recursive: true });
-  try {
-    await fn({ base, source, target });
-  } finally {
-    await fs.rm(base, { recursive: true, force: true });
-  }
+  await fn({ base, source, target });
 }
 
 async function put(root: string, rel: string, content: string): Promise<string> {
@@ -884,7 +886,8 @@ async function main(): Promise<void> {
   });
 
   await test('接线守卫：会改目标内容的入口必须先撤销定位作用域', async () => {
-    const text = await fs.readFile(path.join(FIXTURE_ROOT, '..', 'electron', 'main.ts'), 'utf8');
+    // 源码定位必须基于仓库根（不依赖 cwd，也不依赖测试夹具目录的位置）
+    const text = await fs.readFile(path.join(repoRoot, 'electron', 'main.ts'), 'utf8');
     const handler = (channel: string): string => {
       const start = text.indexOf(`ipcMain.handle('${channel}'`);
       assert.ok(start >= 0, `electron/main.ts 里找不到 ${channel} 处理器`);

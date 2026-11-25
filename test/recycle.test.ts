@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { BackupService } from '../electron/engine/service';
 import { archivePath, initializeRecycle, listRecycle, recycleIndexPath } from '../electron/engine/recycle';
@@ -11,6 +10,7 @@ import { readManifest } from '../electron/engine/manifest';
 import { scanTree } from '../electron/engine/scan';
 import { buildPlan } from '../electron/engine/planner';
 import type { SyncMode } from '../shared/types';
+import { caseTempDir, runCase } from './helpers/test-temp';
 
 let passed = 0;
 let failed = 0;
@@ -36,7 +36,10 @@ function skip(reason: string): never {
 
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
   try {
-    await fn();
+    // runCase：**成功删除本用例的临时目录，失败完整保留现场**。
+    await runCase('recycle', name, async () => {
+      await fn();
+    });
     passed += 1;
     console.log(`  PASS  ${name}`);
   } catch (err) {
@@ -53,8 +56,14 @@ async function test(name: string, fn: () => void | Promise<void>): Promise<void>
   }
 }
 
+/**
+ * 用例临时目录：落在**当前用例目录**下，随用例成败一起处置。
+ *
+ * 不再使用 `os.tmpdir()`：系统临时目录是全机器共享的，
+ * 测试往那里写东西既无法安全清理，也会和别的软件的临时文件混在一起。
+ */
 async function makeTemp(prefix: string): Promise<string> {
-  return fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  return caseTempDir(prefix);
 }
 
 async function writeFile(root: string, rel: string, content: string): Promise<void> {

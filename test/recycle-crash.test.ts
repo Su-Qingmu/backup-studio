@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { test, type TestContext } from 'node:test';
+import { type TestContext } from 'node:test';
 import type { RecycleBin } from '../shared/types';
+import { caseTest } from './helpers/case-test';
+import { caseTempDir } from './helpers/test-temp';
 
 // The service spawns copyWorker.js next to itself, so the crash tests must use
 // the Electron build (dist-electron), exactly like test/transaction-recovery.test.ts.
@@ -19,9 +20,19 @@ const syncMode = 'mirror-archive' as const;
 const crashExitCode = 86;
 const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 
+/**
+ * 用例夹具。
+ *
+ * 原来用 t.after(() => fs.rm(root, ...))：node:test 的 after 钩子**无条件执行**，
+ * 断言失败后现场也被删掉，失败用例就查不出原因。
+ * 现在改用 caseTempDir：目录落在当前用例目录内，
+ * 由 caseTest 统一处置——成功删、失败留。
+ *
+ * 崩溃子进程也在这个目录里工作：父进程失败时，崩溃现场（源、目标、账本）一并保留。
+ */
 async function fixture(t: TestContext) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'bs-recycle-crash-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  void t;
+  const root = await caseTempDir('bs-recycle-crash');
   const source = path.join(root, 'source');
   const target = path.join(root, 'target');
   const userData = path.join(root, 'user-data');
@@ -346,7 +357,7 @@ function archiveOf(f: Fixture, jobId: string, rel: string): string {
   return path.join(historyDir(f.target), jobId, ...rel.split('/'));
 }
 
-test('归档完成后删除前崩溃：原文件与归档都在，恢复不重复归档', async (t) => {
+caseTest('recycle-crash', '归档完成后删除前崩溃：原文件与归档都在，恢复不重复归档', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const target = path.join(f.target, 'a.txt');
@@ -379,7 +390,7 @@ test('归档完成后删除前崩溃：原文件与归档都在，恢复不重�
   assert.equal(bin.entries[0].entityState, 'present');
 });
 
-test('删除意图落盘后崩溃：账本为 intent-persisted，恢复只执行一次 unlink', async (t) => {
+caseTest('recycle-crash', '删除意图落盘后崩溃：账本为 intent-persisted，恢复只执行一次 unlink', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const target = path.join(f.target, 'a.txt');
@@ -405,7 +416,7 @@ test('删除意图落盘后崩溃：账本为 intent-persisted，恢复只执行
     '待删临时名必须是随机名');
 });
 
-test('原文件删除后索引提交前崩溃：账本 original-deleted，重启补写唯一索引条目', async (t) => {
+caseTest('recycle-crash', '原文件删除后索引提交前崩溃：账本 original-deleted，重启补写唯一索引条目', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const target = path.join(f.target, 'a.txt');
@@ -430,7 +441,7 @@ test('原文件删除后索引提交前崩溃：账本 original-deleted，重启
   assert.equal(bin.entries[0].entityState, 'present');
 });
 
-test('批量登记期间崩溃：每条删除都有账本记录，重启补齐全部索引且不依赖 50 条阈值', async (t) => {
+caseTest('recycle-crash', '批量登记期间崩溃：每条删除都有账本记录，重启补齐全部索引且不依赖 50 条阈值', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'a', 'b.txt': 'b', 'c.txt': 'c' });
   const crashed = await runChild(f, { mode: 'start', fault: 'after-original-deleted', faultCount: 2 });
@@ -453,7 +464,7 @@ test('批量登记期间崩溃：每条删除都有账本记录，重启补齐�
   }
 });
 
-test('索引写入失败：任务不进入 completed，状态可重试', async (t) => {
+caseTest('recycle-crash', '索引写入失败：任务不进入 completed，状态可重试', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const target = path.join(f.target, 'a.txt');
@@ -474,7 +485,7 @@ test('索引写入失败：任务不进入 completed，状态可重试', async (
   assert.equal(bin.entries.length, 1, '重试后应补写唯一索引条目');
 });
 
-test('部分删除后崩溃：已完成项不重删，未完成项不沿用过期计划误删', async (t) => {
+caseTest('recycle-crash', '部分删除后崩溃：已完成项不重删，未完成项不沿用过期计划误删', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'a', 'b.txt': 'b', 'c.txt': 'c' });
   const crashed = await runChild(f, { mode: 'start', fault: 'after-original-deleted', faultCount: 2 });
@@ -495,7 +506,7 @@ test('部分删除后崩溃：已完成项不重删，未完成项不沿用过�
   assert.equal(bin.entries.filter((entry) => entry.state === 'indexed').length, 2);
 });
 
-test('连续恢复两次：第二次无重复归档、无重复索引条目、无额外 unlink', async (t) => {
+caseTest('recycle-crash', '连续恢复两次：第二次无重复归档、无重复索引条目、无额外 unlink', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const target = path.join(f.target, 'a.txt');
@@ -516,7 +527,7 @@ test('连续恢复两次：第二次无重复归档、无重复索引条目、�
   assert.equal(bin.entries[0].entityState, 'present');
 });
 
-test('恢复完成后再重启：无活跃账本，索引条目实体与哈希大小匹配', async (t) => {
+caseTest('recycle-crash', '恢复完成后再重启：无活跃账本，索引条目实体与哈希大小匹配', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a', 'b.txt': 'payload-b' });
   const crashed = await runChild(f, { mode: 'start', fault: 'after-original-deleted' });
@@ -536,7 +547,7 @@ test('恢复完成后再重启：无活跃账本，索引条目实体与哈希�
   }
 });
 
-test('还原后索引提交失败：目标文件与归档都保留，重试幂等且不误报占用', async (t) => {
+caseTest('recycle-crash', '还原后索引提交失败：目标文件与归档都保留，重试幂等且不误报占用', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   await runChild(f, { mode: 'start' });
@@ -557,7 +568,7 @@ test('还原后索引提交失败：目标文件与归档都保留，重试幂�
   assert.equal(bin.entries.length, 0, '重试成功后条目应被移除');
 });
 
-test('彻底删除后索引提交失败：条目落入待核对状态，不静默丢证据', async (t) => {
+caseTest('recycle-crash', '彻底删除后索引提交失败：条目落入待核对状态，不静默丢证据', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   await runChild(f, { mode: 'start' });
@@ -570,7 +581,7 @@ test('彻底删除后索引提交失败：条目落入待核对状态，不静�
   assert.ok((bin.uncertainCount ?? 0) + bin.entries.filter((e) => e.state === 'pending').length >= 1, '条目必须进入待核对状态');
 });
 
-test('还原索引提交失败后收尾，归档删除且原位内容不变，重复收尾幂等', async (t) => {
+caseTest('recycle-crash', '还原索引提交失败后收尾，归档删除且原位内容不变，重复收尾幂等', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   assert.equal((await runChild(f, { mode: 'start' })).code, 0);
@@ -588,7 +599,7 @@ test('还原索引提交失败后收尾，归档删除且原位内容不变，�
   assert.equal(second.code, 0, second.stderr);
 });
 
-test('收尾时归档删除故障保留索引证据并允许重试', async (t) => {
+caseTest('recycle-crash', '收尾时归档删除故障保留索引证据并允许重试', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   assert.equal((await runChild(f, { mode: 'start' })).code, 0);
@@ -602,7 +613,7 @@ test('收尾时归档删除故障保留索引证据并允许重试', async (t) =
   assert.equal(retried.code, 0, retried.stderr);
 });
 
-test('彻底删除索引提交失败后收尾只移除残留行', async (t) => {
+caseTest('recycle-crash', '彻底删除索引提交失败后收尾只移除残留行', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   assert.equal((await runChild(f, { mode: 'start' })).code, 0);
@@ -615,7 +626,7 @@ test('彻底删除索引提交失败后收尾只移除残留行', async (t) => {
   assert.equal(JSON.parse(await fs.readFile(recycleIndexOf(f), 'utf8')).entries.length, 0);
 });
 
-test('未结案回收项不得走收尾入口', async (t) => {
+caseTest('recycle-crash', '未结案回收项不得走收尾入口', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   assert.equal((await runChild(f, { mode: 'start' })).code, 0);
@@ -626,7 +637,7 @@ test('未结案回收项不得走收尾入口', async (t) => {
   assert.equal(await exists(archiveOf(f, tx.jobId, 'a.txt')), true);
 });
 
-test('已还原但原位内容变化时收尾不得删除归档', async (t) => {
+caseTest('recycle-crash', '已还原但原位内容变化时收尾不得删除归档', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   assert.equal((await runChild(f, { mode: 'start' })).code, 0);
@@ -639,7 +650,7 @@ test('已还原但原位内容变化时收尾不得删除归档', async (t) => {
   assert.equal(await exists(archiveOf(f, tx.jobId, 'a.txt')), true);
 });
 
-test('容量超限时删除被阻断：原文件仍在、归档未生成、旧数据未被淘汰', async (t) => {
+caseTest('recycle-crash', '容量超限时删除被阻断：原文件仍在、归档未生成、旧数据未被淘汰', undefined, async (t) => {
   const f = await fixture(t);
   const small = 64;
   const service = new BackupService(f.userData, { recycleMaxBytes: small });
@@ -660,7 +671,7 @@ test('容量超限时删除被阻断：原文件仍在、归档未生成、旧�
   assert.equal(bin.entries.length, 0, '没有删除就不该有回收条目');
 });
 
-test('索引缺失但存在活跃删除账本：不得显示空回收站', async (t) => {
+caseTest('recycle-crash', '索引缺失但存在活跃删除账本：不得显示空回收站', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const crashed = await runChild(f, { mode: 'start', fault: 'after-original-deleted' });
@@ -680,7 +691,7 @@ test('索引缺失但存在活跃删除账本：不得显示空回收站', async
   assert.equal(bin.entries[0].state, 'indexed', '条目应恢复为已登记');
 });
 
-test('索引丢失后：已提交的删除事务必须重建回收条目，不得变成看不见的孤儿归档', async (t) => {
+caseTest('recycle-crash', '索引丢失后：已提交的删除事务必须重建回收条目，不得变成看不见的孤儿归档', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   // 正常跑完一次删除：索引里有一条，账本状态是 committed。
@@ -707,7 +718,7 @@ test('索引丢失后：已提交的删除事务必须重建回收条目，不�
   assert.equal(await exists(archiveOf(f, txs[0].jobId, 'a.txt')), true, '归档实体不得丢失');
 });
 
-test('删除已作废的账本条目不得被重建进回收索引', async (t) => {
+caseTest('recycle-crash', '删除已作废的账本条目不得被重建进回收索引', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const done = await runChild(f, { mode: 'start' });
@@ -724,7 +735,7 @@ test('删除已作废的账本条目不得被重建进回收索引', async (t) =
   assert.equal(await exists(archiveOf(f, txs[0].jobId, 'a.txt')), true, '归档实体必须保留待人工处理');
 });
 
-test('归档内容被同大小替换：对账必须转人工核对，不得继续标成可还原', async (t) => {  const f = await fixture(t);
+caseTest('recycle-crash', '归档内容被同大小替换：对账必须转人工核对，不得继续标成可还原', undefined, async (t) => {  const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   // 崩溃在索引提交前：账本停在 original-deleted，归档已生成。
   const crashed = await runChild(f, { mode: 'start', fault: 'after-original-deleted' });
@@ -750,7 +761,7 @@ test('归档内容被同大小替换：对账必须转人工核对，不得继�
   assert.equal(await exists(archive), true, '归档实体必须保留作为证据');
 });
 
-test('归档在登记后被同大小替换：恢复后列表必须转人工核对，不得显示为可还原', async (t) => {
+caseTest('recycle-crash', '归档在登记后被同大小替换：恢复后列表必须转人工核对，不得显示为可还原', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'abcdefgh' });
   // 崩溃在索引已提交、账本标记 indexed 之后：此时索引里已经有一条「正常」条目。
@@ -776,7 +787,7 @@ test('归档在登记后被同大小替换：恢复后列表必须转人工核�
   assert.ok(bin.blockedReason, '必须给出人工核对原因');
 });
 
-test('恢复时路径上的内容换过一版：不得删除未被归档的那一版', async (t) => {
+caseTest('recycle-crash', '恢复时路径上的内容换过一版：不得删除未被归档的那一版', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'abcdefgh' });
   // 崩溃在删除意图落盘之后、原文件 unlink 之前：归档已生成，原文件还在。
@@ -799,7 +810,7 @@ test('恢复时路径上的内容换过一版：不得删除未被归档的那�
   assert.equal(await fs.readFile(archiveOf(f, txs[0].jobId, 'a.txt'), 'utf8'), 'abcdefgh', '归档必须仍是原始内容');
 });
 
-test('校验通过之后、原子移走之前目标被换版：新版本必须被留下', async (t) => {
+caseTest('recycle-crash', '校验通过之后、原子移走之前目标被换版：新版本必须被留下', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'abcdefgh' });
   const target = path.join(f.target, 'a.txt');
@@ -822,7 +833,7 @@ test('校验通过之后、原子移走之前目标被换版：新版本必须�
   assert.equal(await fs.readFile(archiveOf(f, txs[0].jobId, 'a.txt'), 'utf8'), 'abcdefgh', '归档必须仍是原始内容');
 });
 
-test('还原已发布但归档清理失败：条目不得在索引丢失后复活', async (t) => {
+caseTest('recycle-crash', '还原已发布但归档清理失败：条目不得在索引丢失后复活', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const done = await runChild(f, { mode: 'start' });
@@ -844,7 +855,7 @@ test('还原已发布但归档清理失败：条目不得在索引丢失后复�
   assert.equal(bin.entries.length, 0, '已还原的条目不得复活');
 });
 
-test('已还原的条目在索引丢失后不得复活', async (t) => {  const f = await fixture(t);
+caseTest('recycle-crash', '已还原的条目在索引丢失后不得复活', undefined, async (t) => {  const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const done = await runChild(f, { mode: 'start' });
   assert.equal(done.code, 0, done.stderr);
@@ -866,7 +877,7 @@ test('已还原的条目在索引丢失后不得复活', async (t) => {  const f
   assert.equal(after.indexState, 'ok', '索引应按账本重建');
 });
 
-test('索引缺失重建时归档内容损坏：必须转人工核对，不得静默降级为孤儿', async (t) => {
+caseTest('recycle-crash', '索引缺失重建时归档内容损坏：必须转人工核对，不得静默降级为孤儿', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'abcdefgh' });
   const done = await runChild(f, { mode: 'start' });
@@ -890,7 +901,7 @@ test('索引缺失重建时归档内容损坏：必须转人工核对，不得�
   assert.equal(after[0].state, 'uncertain', '账本必须记录需人工核对');
 });
 
-test('目标端路径换大小写后仍能找到自己的账本', { skip: process.platform !== 'win32' }, async (t) => {
+caseTest('recycle-crash', '目标端路径换大小写后仍能找到自己的账本', { skip: process.platform !== 'win32' }, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'abcdefgh' });
   const done = await runChild(f, { mode: 'start' });
@@ -905,7 +916,7 @@ test('目标端路径换大小写后仍能找到自己的账本', { skip: proces
   assert.equal(bin.entries[0].relPath, 'a.txt');
 });
 
-test('删除事务需人工核对时，任务不得报完成', async (t) => {  const f = await fixture(t);
+caseTest('recycle-crash', '删除事务需人工核对时，任务不得报完成', undefined, async (t) => {  const f = await fixture(t);
   await seed(f, { 'a.txt': 'abcdefgh' });
   const crashed = await runChild(f, { mode: 'start', fault: 'after-intent-persisted' });
   assert.equal(crashed.code, crashExitCode, crashed.stderr);
@@ -927,7 +938,7 @@ test('删除事务需人工核对时，任务不得报完成', async (t) => {  c
   assert.equal(after[0].state, 'uncertain', '账本必须仍是需人工核对');
 });
 
-test('临时名路径在第二段校验之后被写入新内容：新内容不得被删除，必须转人工核对', async (t) => {
+caseTest('recycle-crash', '临时名路径在第二段校验之后被写入新内容：新内容不得被删除，必须转人工核对', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'abcdefgh' });
   const target = path.join(f.target, 'a.txt');
@@ -947,7 +958,7 @@ test('临时名路径在第二段校验之后被写入新内容：新内容不�
     '归档必须仍是原始内容');
 });
 
-test('待删临时名位置预先存在无关文件：该文件不得被覆盖销毁', async (t) => {
+caseTest('recycle-crash', '待删临时名位置预先存在无关文件：该文件不得被覆盖销毁', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'abcdefgh' });
   const target = path.join(f.target, 'a.txt');
@@ -970,7 +981,7 @@ test('待删临时名位置预先存在无关文件：该文件不得被覆盖�
     '待删临时名必须是随机名');
 });
 
-test('回滚时原路径被重新创建：新文件不得被覆盖，两个实体都要保留，账本记需人工核对', async (t) => {
+caseTest('recycle-crash', '回滚时原路径被重新创建：新文件不得被覆盖，两个实体都要保留，账本记需人工核对', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'abcdefgh' });
   const target = path.join(f.target, 'a.txt');
@@ -997,7 +1008,7 @@ test('回滚时原路径被重新创建：新文件不得被覆盖，两个实�
     '归档必须仍是原始内容');
 });
 
-test('待删实体删除失败（文件被占用）：账本不得推进到 indexed，lastError 必须写明原因', async (t) => {
+caseTest('recycle-crash', '待删实体删除失败（文件被占用）：账本不得推进到 indexed，lastError 必须写明原因', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'abcdefgh' });
 
@@ -1023,7 +1034,7 @@ test('待删实体删除失败（文件被占用）：账本不得推进到 inde
   assert.equal(await exists(trashPath), true, '待删实体必须保留，不得被当成已删除');
 });
 
-test('崩溃落在移走之后、删除之前：恢复必须按账本里的 trashPath 找回待删内容', async (t) => {
+caseTest('recycle-crash', '崩溃落在移走之后、删除之前：恢复必须按账本里的 trashPath 找回待删内容', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const target = path.join(f.target, 'a.txt');
@@ -1051,7 +1062,7 @@ test('崩溃落在移走之后、删除之前：恢复必须按账本里的 tras
   assert.equal(bin.entries[0].entityState, 'present');
 });
 
-test('随机临时名缺失时不得删除旧式同内容诱饵', async (t) => {
+caseTest('recycle-crash', '随机临时名缺失时不得删除旧式同内容诱饵', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const crashed = await runChild(f, { mode: 'start', fault: 'after-trash-rename' });
@@ -1069,7 +1080,7 @@ test('随机临时名缺失时不得删除旧式同内容诱饵', async (t) => {
   assert.equal(after.state, 'uncertain');
 });
 
-test('临时名 lstat EIO 时保留实体、路径和错误码', async (t) => {
+caseTest('recycle-crash', '临时名 lstat EIO 时保留实体、路径和错误码', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const result = await runChild(f, { mode: 'start', fault: 'trash-lstat-eio' });
@@ -1081,7 +1092,7 @@ test('临时名 lstat EIO 时保留实体、路径和错误码', async (t) => {
   assert.match(tx.lastError ?? '', /EIO/);
 });
 
-test('持续 EBUSY 的待删事务阻止恢复完成并保留活动指针', async (t) => {
+caseTest('recycle-crash', '持续 EBUSY 的待删事务阻止恢复完成并保留活动指针', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   assert.equal((await runChild(f, { mode: 'start', fault: 'after-trash-rename' })).code, crashExitCode);
@@ -1093,7 +1104,7 @@ test('持续 EBUSY 的待删事务阻止恢复完成并保留活动指针', asyn
   assert.match(tx.lastError ?? '', /EBUSY/);
 });
 
-test('回滚后临时名清理失败仍在账本记录完整残留路径', async (t) => {
+caseTest('recycle-crash', '回滚后临时名清理失败仍在账本记录完整残留路径', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'abcdefgh' });
   const target = path.join(f.target, 'a.txt');
@@ -1106,7 +1117,7 @@ test('回滚后临时名清理失败仍在账本记录完整残留路径', async
   assert.match(tx.lastError ?? '', /EBUSY/);
 });
 
-test('长文件名的文件也能完成删除：待删临时名不得超出单段名长度上限', async (t) => {
+caseTest('recycle-crash', '长文件名的文件也能完成删除：待删临时名不得超出单段名长度上限', undefined, async (t) => {
   const f = await fixture(t);
   // 旧规则把原 basename 拼进临时名（209 + 22 + 32 = 263 字符），
   // 超出文件系统单段名上限（255），合法的长文件因此永远删不掉。
@@ -1126,7 +1137,7 @@ test('长文件名的文件也能完成删除：待删临时名不得超出单�
   assert.equal(bin.entries[0].relPath, longName);
 });
 
-test('旧格式索引无 txId 可还原，新格式缺账本在动文件前拒绝', async (t) => {
+caseTest('recycle-crash', '旧格式索引无 txId 可还原，新格式缺账本在动文件前拒绝', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   assert.equal((await runChild(f, { mode: 'start' })).code, 0);
@@ -1149,7 +1160,7 @@ test('旧格式索引无 txId 可还原，新格式缺账本在动文件前拒�
   assert.equal(JSON.parse(await fs.readFile(indexFile, 'utf8')).entries.length, 0);
 });
 
-test('跨任务账本枚举失败时不发布不完整索引', async (t) => {
+caseTest('recycle-crash', '跨任务账本枚举失败时不发布不完整索引', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   assert.equal((await runChild(f, { mode: 'start' })).code, 0);
@@ -1173,7 +1184,7 @@ test('跨任务账本枚举失败时不发布不完整索引', async (t) => {
   assert.ok(txs.some((tx) => tx.relPath === 'b.txt'));
 });
 
-test('重建账本落盘失败时公开列表不返回正常空站', async (t) => {
+caseTest('recycle-crash', '重建账本落盘失败时公开列表不返回正常空站', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   assert.equal((await runChild(f, { mode: 'start' })).code, 0);
@@ -1188,7 +1199,7 @@ test('重建账本落盘失败时公开列表不返回正常空站', async (t) =
   assert.equal(await exists(recycleIndexOf(f)), false);
 });
 
-test('账本不可枚举时还原必须报错，索引条目不得被移除', async (t) => {
+caseTest('recycle-crash', '账本不可枚举时还原必须报错，索引条目不得被移除', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const done = await runChild(f, { mode: 'start' });
@@ -1209,7 +1220,7 @@ test('账本不可枚举时还原必须报错，索引条目不得被移除', as
   assert.equal(raw.entries[0].id, entryId, '条目必须仍是原来那一条');
 });
 
-test('账本不可枚举时彻底删除必须报错，索引条目不得被移除', async (t) => {
+caseTest('recycle-crash', '账本不可枚举时彻底删除必须报错，索引条目不得被移除', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const done = await runChild(f, { mode: 'start' });
@@ -1228,7 +1239,7 @@ test('账本不可枚举时彻底删除必须报错，索引条目不得被移�
   assert.equal(raw.entries[0].id, entryId, '条目必须仍是原来那一条');
 });
 
-test('结账回调在账本不可枚举时必须抛错，不得静默当成已落定', async (t) => {
+caseTest('recycle-crash', '结账回调在账本不可枚举时必须抛错，不得静默当成已落定', undefined, async (t) => {
   const f = await fixture(t);
   await seed(f, { 'a.txt': 'payload-a' });
   const done = await runChild(f, { mode: 'start' });
