@@ -4,6 +4,7 @@
 
 | 项 | 状态 |
 | --- | --- |
+| **本轮（M7 跨平台可靠性 / 安全契约）** | 基线 `aa0374a`（`fbd2188` 的直系后继，本地领先远程 2 个提交）；已创建 5 个本地提交（`45ec8f2` wrapper / `dfed363` 隔离区 / `9b0f492` 写入许可 / `c35d0ae` 新套件 / 本提交文档），**未推送、未合 PR、未关 Issue**；详见下节「本轮：M7 跨平台可靠性与安全契约修复」 |
 | 基线提交 | `d92d19c`：`fix(gui): 修复禁用态区分、分栏消失、启动黑屏、主题持久化与 AppImage 图标`（本轮 issue 修复成果，**已本地提交、尚未推送远程**；远程 `origin/main` 仍在 `fbd2188`）。再上一基线 `5d2f521`：`feat(hardening): make recovery reliable, delete transactions crash-safe, release gated`（四轮独立复审的加固成果，已推送到 `main`） |
 | 工作区 | 本轮 issue 修复（#3 / #4 / #10 / #11 / #17）的全部代码改动已提交到本地 `main`（提交 `d92d19c`，20 个文件修改/新增，+666 / −22），**按用户要求只本地提交、未推送远程**；除打包试验残留的未跟踪目录 `pack-out/` 外工作区干净。**未打 tag、未建 Release、未合 PR** |
 | M1 · 备份正确性与恢复回归 | **已完成并推送**，验收 76 项通过 / 0 失败 / 0 跳过 |
@@ -33,6 +34,137 @@
 - [x] **#17 AppImage 在 KDE 任务栏显示为 Xorg 通用图标。** 补 `build/icon/` 多尺寸图标（16→512）与 `icon.ico`，`package.json` 配置 `linux`/`win` 图标并把 `build/icon/**` 纳入 `files`；`BrowserWindow` 设置窗口图标写入 `_NET_WM_ICON`。已用 electron-builder 的 `icon` 命令实测：`build/icon` 被解析成 16→512 完整图标集，`isFallback=false`（不再回落默认 Electron 图标）。
 
 复审与验收边界：#3 / #4 / #11 经独立只读复审（VERDICT: PASS，另附 3 条非阻断建议：收起前比例在 (0.82, 0.94] 时展开恢复到该比例、非原生 `:disabled` 控件的禁用态需真机抽查、`restoreRatioRef` 卸载边界）。本仓库无渲染层测试框架（8 套测试均测引擎侧），上述 GUI 修复未能产出单元回归用例；本机为 win32，AppImage 打包、KDE 任务栏表现与界面交互均需在 Linux/KDE 真机人工验收。
+
+## 本轮：M7 跨平台可靠性与安全契约修复（2026-11-25）
+
+> **基线**：本地 `main` = `aa0374a`；远程 `origin/main` = `fbd2188`（本轮 `git fetch origin` 后确认未变化）。
+> 本地领先远程 2 个提交（`d92d19c`、`aa0374a`），`fbd2188` 是本地 HEAD 的直系祖先（`git merge-base` 返回 `fbd2188`）。
+> 本轮**未推送、未合并 PR、未关闭 Issue、未打 tag、未建 Release**。
+
+### 一、交接项与落地结果
+
+| 项 | 问题 | 落地 | 证据 |
+| --- | --- | --- | --- |
+| A1 | T13 用 `fs.chmod(indexFile, 0o444)` 模拟索引写失败，依赖操作系统权限语义（POSIX 上 root 与部分文件系统写只读文件仍成功；Windows 的只读位只拦覆盖、不拦改名替换） | `QuarantineStore` 增加**最小**依赖注入 `QuarantineStoreOptions.writeIndex`；默认实现 `atomicQuarantineIndexWriter` 仍是 `writeJsonAtomic`（临时文件 + rename），生产原子语义不变。T13 改为注入「写入直接抛错」的 writer，故障点确定且写入从未发生 | `electron/engine/dup/act.ts`；`test/dup.test.ts` 的 T13（实体已还原 / 原路径内容正确 / 返回 `restored: true` / 原因含「索引更新失败」/ 索引逐字节不变 / 旧条目仍在）与新增 T13b（默认写入仍是原子替换、不留临时文件） |
+| A2 | 6 套自制测试包装器把「提前 return」计为 PASS，产生假阳性 | 6 个文件统一为三态：`TestSkip` + `skip('原因')`（返回类型 `never`），包装器先判 SKIP 再判 FAIL；每个套件打印「X 通过 / Y 失败 / Z 跳过」并在有失败时 `process.exitCode = 1`；跳过逐条打印原因 | `test/{engine,auto-sync,write-gate,recycle,reveal-authority,dup}.test.ts` |
+| B1 | T26 在 POSIX 上因索引校验先拒而「空转通过」，Linux 上又因 `list()` 抛错而失败 | 拆成三段：T26a 跨平台纯字符串（`isNetworkPath` 分类 + `path.win32/posix.isAbsolute` 平台差异证据）、T26b Windows 真机集成（拒绝原因必须命中「网络盘 / UNC」，索引逐字节不变）、T26c POSIX 索引层（`entry-invalid` + 索引完整），各自平台显式 SKIP | `test/dup.test.ts` T26a / T26b / T26c |
+| B2 | 测试把「本机文件系统特性」当成「被测逻辑行为」 | 新增 `test/fs-capabilities.ts`：大小写折叠、大小写同名共存、NFC/NFD 别名、Unicode 存储形式、`chmod` 是否真的阻断写入、`readFile(目录)` 是否报错、`dev/ino` 是否可作身份——**每项单独探测、三态（supported/unsupported/unknown）**，探测失败不会被当成「平台不支持」；探测结果打印进测试输出作为证据 | `test/fs-capabilities.ts`；`test/dup.test.ts` 能力探测输出 + 三处 Unicode 用例改为显式 SKIP、T10/T19 的静默 return 改为显式 SKIP |
+| C | `MediaAssessment.writable` 同时被当成「证据是否充分」和「能否写入」，渲染层另建一套判定（Issue #9） | 收敛为单一口径：新增 `evaluateWriteGate(facts, mode)` 作为**唯一**许可推导点（`decideWriteGate` 变成它的薄包装），输出 `blockers: WriteBlocker[]` + 中文原因；`guardTargetWrites` 不再手写条件、也不再在非 Windows 跳过检测，统一走 `writeGate(..., 'user-directed')`；`inspectTarget` 在结论落地的同一处把 `blockers/blockReason` 写进 `assessment`，并给出 `HealthReport.writeGate`（含 `targetRoot`/`mode`/`at`）；隔离标记改为按卷（`targetRiskKey`）生效 | `shared/types.ts`、`electron/engine/service.ts`、`electron/engine/{health,media}.ts`、`src/App.tsx`、`src/lib/write-permission.ts`、`src/components/MediaDiagnostics.tsx`；`test/write-permission.test.ts`（11 例）、`test/dup.test.ts` §11-10a 真值表 |
+| §3 | Issue #12 的 Windows 路径语义 | 新增 `test/path-semantics.test.ts`：盘符路径、盘符根、UNC、扩展 UNC、卷 GUID 根、路径中间形似卷 GUID 的普通目录、卷命名空间前缀大小写、纯分隔符、POSIX 反斜杠语义；另加 1 例 **Windows 真机**（`fs.realpath` / `fs.stat` 证明规范化后仍是同一目录实体、系统盘根保留末尾分隔符） | `test/path-semantics.test.ts`（11 例，Windows 真机用例在其他平台显式 SKIP） |
+
+### 二、写入许可契约（Issue #9）的最终形态
+
+四件事正交，各自只有一个事实源：
+
+1. **证据等级** `assessment.level`（L0/L1/L2）：判定有多确定。
+2. **成因** `assessment.condition`（`verified` / `uncertain` / `filesystem-repair` / `media-unavailable` / `unreachable`）。
+3. **强制阻断** `assessment.blockers`（`WriteBlocker[]`）：只由事实产生——`unreachable` / `isolated` / `level-l2` / `disk-readonly` / `filesystem-repair`；自动写入额外要求卷健康已知（`volume-health-unknown`）。**证据不足不在其中**。
+4. **最终许可** `HealthReport.writeGate.allowed`：与 `blockers` 同源推导（`allowed === blockers.length === 0`）。
+
+渲染层的唯一判断在 `src/lib/write-permission.ts` 的 `resolveWritePermission`：确认判定是否针对当前目标 → 翻译主进程裁决 → 把「证据不足」降级成提示。**它不推导任何阻断条件**；缺 `blockers` 字段时按「未判定」禁用（fail-closed），而不是放行。
+
+由此修掉的具体矛盾（审计 VERDICT: FAIL 中列出的组合）：磁盘被系统写保护（`disk-readonly`）时界面曾可点；隔离标记跨盘全局生效；卷已修复但未重新检测时界面一直禁用；非 Windows 手动备份实际无闸门。
+
+### 三、GUI 回归测试：Vitest + happy-dom 的评估结论（本轮不实施）
+
+- 现状：仓库没有渲染层测试框架，8 套测试全部只测引擎侧；`node_modules` 中没有 `vitest` / `happy-dom` / `jsdom`。
+- 引入代价：需要新增 devDependency（网络安装）、`vitest.config.ts`、与三套 tsconfig 的兼容处理，并且要把 `.tsx` 组件纳入测试转译链；这些都会触碰构建管线，而需求明确要求「不影响 Electron 构建」「不改变 8 套引擎测试的运行方式」。
+- 本轮采取的替代做法：把真正有安全含义的纯逻辑从组件里抽出来，用现有 `tsx` 直跑：`resolveWritePermission`（写入许可与按钮禁用状态）、`normalizeDirectoryRoot`（路径语义）。二者已分别由 `test/write-permission.test.ts` 与 `test/path-semantics.test.ts` 覆盖。
+- 仍未覆盖、且必须真机验收的：Splitter 拖拽比例与折叠态、主题初始化、启动骨架移除时机——它们依赖 DOM/Electron 环境。建议下一轮单独评估 happy-dom（只对 `src/lib/*` 与纯函数组件做行为测试），不要为了补几个用例重构现有 8 套测试。
+
+### 四、PR #18 的只读审查结论（未合并、未改协作者分支）
+
+- PR 唯一改动：`src/styles/app.css` 的 `.app { grid-template-columns: minmax(0, 1fr); }`（+1 行，head `4809bc3`）。
+- 本地 #4 修复**没有**包含根级保护：`app.css:5` 的 `.app` 只有 `grid-template-rows`，单一隐式列是 `auto`，仍可能被 `.workspace` 的 min-content 撑得比视口宽。因此这一行**不是冗余**，与「内层 Splitter 比例化（`minmax(0, calc(...))`）」是父子两级，可以共存，建议保留。
+- 关联关系判断：PR 描述的症状链是「最大化→还原后右栏与标题栏超出视口」，属 **#4** 的尺寸传导问题；**#8** 的验收要求是窄栏内部重排（指标减列、横幅可收缩换行、诊断按钮换行）并覆盖最大化/还原与拖拽测试，只靠这一行无法满足。因此建议把 `Fixes #8` 改为 `Refs #4`，避免自动关闭 #8。**本轮未修改 PR 描述**（需作者或维护者操作）。
+
+### 五、验证（本机 win32 / NTFS，Node v24.18.0）
+
+| 套件 | 通过 | 失败 | 跳过 | 备注 |
+| --- | --- | --- | --- | --- |
+| 引擎 `test:engine` | 54 | 0 | 0 | 与基线一致，未出现回归 |
+| 自动同步 `test:aut` | 19 | 0 | 0 | 写入许可仍由主进程裁决，桥接逻辑未变 |
+| 写入闸门 `test:gate` | 8 | 0 | 0 | 新增分支取证日志：本机 `E:` 走 `healthy-or-repaired` |
+| 回收站 `test:recycle` | 26 | 0 | 0 | 硬链接用例在本机可用，未触发 SKIP |
+| 事务恢复 `test:transaction` | 16 | 0 | 1 | node:test 自带 skip：大小写敏感卷兄弟目录（本机大小写不敏感） |
+| 查重 `test:dup` | 73 | 0 | 1 | 新增 T13b、T26a/T26b；T26c 在 Windows 上显式 SKIP（对应平台分支为 T26b） |
+| 定位授权 `test:reveal` | 26 | 0 | 0 | 未改动该链路 |
+| 回收站崩溃注入 `test:recycle-crash` | — | — | — | **本轮未跑完**（44 例，本机约 20–30s/例，后台仍在运行）。该套件不引用本轮改动的 API（`grep writeGate|guardTargetWrites|blockers` 零命中），断言未改动；结果未取证，不计入本轮结论 |
+| 写入许可（新增）`test:perm` | 11 | 0 | 0 | 本文件覆盖 Issue #9 契约 |
+| 路径语义（新增）`test:path` | 11 | 0 | 0 | 含 1 例 Windows 真机解析验证 |
+
+其他命令：`npm run typecheck`（三套 tsconfig）通过；`npm run build`（renderer + electron）通过。
+
+**跳过项说明（全量 2 项）**：事务恢复的大小写敏感卷兄弟目录（node:test 自带 skip，本机 NTFS 大小写不敏感）；查重 T26c（POSIX 索引层拒绝，Windows 上 UNC 属绝对路径走不到该关卡）。两项都是「本机不具备该平台能力」，不是「验证失败」，且都有对侧平台的用例覆盖同一安全边界。
+
+**未验证项（不得用其他平台结果替代）**：
+
+- 回收站崩溃注入套件（44 例）本轮未跑完：只观察到前 10 例通过，剩余未取证。不得用上一轮的绿色记录替代本轮证据。
+- Linux / macOS 上的实际运行结果：本轮只在 win32 上跑过。POSIX 分支（T26c、`readDirAsFileFails` 等）的通过与否**未取证**。
+- 真实只读介质 / 脏位卷的端到端复现：需要特定硬件或 ACL 变更，本轮只做了判定层与单元层验证。
+- `GetFinalPathNameByHandle` / `GetVolumePathName`：本仓库没有原生模块或 FFI 接入，未做集成测试。
+- 多卷隔离作用域（隔离 E: 后 F: 可写）：`targetRiskKey` 按盘符比较的代码路径已改，但本机没有两块独立卷可构造该场景，**未实测**。
+- GUI 交互（Splitter 拖拽/折叠、主题初始化、启动骨架移除）：无渲染层测试框架，需真机人工验收。
+
+### 六、安全边界复核
+
+| 检查项 | 结论 | 证据 |
+| --- | --- | --- |
+| 写入闸门是否只有一个推导点 | 是。`evaluateWriteGate` 是唯一推导函数，`decideWriteGate` 是其包装；`writeGate`、`guardTargetWrites`、`inspectTarget` 全部调用它 | `service.ts` 的 `evaluateWriteGate` / `writeGate` / `guardTargetWrites`；`test/write-permission.test.ts` WP-8/WP-10 |
+| 渲染层是否仍在实现安全判定 | 否。渲染层只读 `assessment.blockers`，唯一判断在 `resolveWritePermission`（纯翻译），缺字段按未判定禁用 | `src/lib/write-permission.ts`；WP-4/WP-7 |
+| 旧目标诊断是否会授权新目标 | 不会。`assessment.targetRoot` 与 `writeGate.targetRoot` 在结论落地处同时写入；`resolveWritePermission` 对目标不一致一律不生效 | WP-2；`service.ts` 的 `inspectTarget` |
+| 手动备份与自动同步是否共用闸门 | 是。手动/清理走 `user-directed`，自动同步走 `automatic`，同一函数不同模式 | `service.ts`；`aut/bridge.ts` |
+| 真实阻断是否仍有效 | 是。不可达、隔离、L2、磁盘只读、卷需修复两种模式都拒绝；自动写入额外要求卷健康已知 | `test/dup.test.ts` §11-10a 真值表（6 类事实 × 2 模式） |
+| 是否把「证据不足」当成阻断 | 没有。`uncertain` 不产生 blocker；界面只显示提示，按钮保持可用，文案不再出现「保持只读」 | WP-4、WP-9 |
+| 隔离区原子写入是否被削弱 | 没有。默认写入仍是 `writeJsonAtomic`（临时文件 + rename）；T13b 断言写入后目录只有 `index.json` 与 `files`、无 `.tmp-` 残留 | `act.ts`；T13b |
+| 测试注入是否绕过原子语义 | 没有。注入的只是「写入动作」这一依赖，测试实现只抛错、不写文件；生产路径无法注入 | `QuarantineStoreOptions.writeIndex`；T13 |
+| 测试是否被削弱以换取通过 | 没有。本轮所有改动都是收紧：T19 拒绝原因从「非空」收紧到具体错误；T26 拆分后 Windows 分支要求命中「网络盘/UNC」；T13 从权限语义改为确定性故障；Unicode 用例在能力确认后追加 `listed.length === 2` 断言 | 见各用例 |
+| IPC 类型是否漂移 | 未漂移。`preload.ts` 与 `src/lib/api.ts` 都引用 `shared/types` 的类型，没有各自的副本；新增字段全部可选 | `electron/preload.ts:145/285`；`src/lib/api.ts:71-73` |
+| 备份引擎行为是否改变 | 闸门行为有**有意变更**：非 Windows 的手动备份现在也过闸门（此前在非 win32 直接跳过检测）；隔离标记改为按卷生效（此前跨盘全局拦截）。其余引擎逻辑未改，引擎套件 54 项与基线一致 | `service.ts`；`test:engine` 54/0/0 |
+
+### 七、GitHub 对应关系
+
+| 编号 | 状态 | 本轮动作 | 建议后续 |
+| --- | --- | --- | --- |
+| #19 跨平台测试可靠性 | open | 三态包装器 + 显式 SKIP + 文件系统能力探测；T13 改为确定性故障注入；T26 拆分 | 待 Linux/macOS 实机跑一轮再关闭。Windows 上的 2 项 SKIP 是平台分支，不是残留缺陷 |
+| #9 介质判定为只读但按钮可用 | open | 写入许可收敛为单一口径；渲染层只读主进程裁决；修正与放行冲突的「保持只读」文案 | 待 Linux/KDE 真机复验「L1 证据不足时按钮可用且提示明确」后关闭 |
+| #12 末尾分隔符显示不一致 | open | 新增 Windows 路径语义专项（11 例，含 1 例真机解析） | 字符串规范化已覆盖；`GetFinalPathNameByHandle` / `GetVolumePathName` 未接入，若确需系统 API 应另开 issue |
+| #18 PR：约束根网格 | open | 只读审查，**未合并、未改分支** | 保留该行；建议作者把 `Fixes #8` 改为 `Refs #4` |
+| #4 最大化还原后右栏消失 | open | 无改动（上一轮已修） | 真机验收后关闭 |
+| #8 右栏横向裁切 | open | 无改动 | 需窄栏内部重排（指标减列、横幅可收缩、按钮换行），PR #18 不覆盖 |
+
+### 八、假设与产品契约决策
+
+1. `blockers` 缺省视为「未判定」而不是「无阻断」：宁可要求用户重新检测，也不 fail-open。
+2. `assessment.blockers` 采用 `user-directed` 口径（手动备份、查重清理、回收站还原共用）；自动同步额外要求「卷健康已知」。理由：界面上的「开始备份」是用户主动行为。
+3. 「证据不足」**不**引入风险勾选确认：主进程本就允许继续，勾选只会把无法评估的风险转移给用户；而真正的强制阻断不提供 override 通道，否则就是第二个闸门。
+4. `MediaAssessment.level` 未改名为 `evidenceLevel`：保留字段名以免 IPC/类型漂移，语义在类型注释里固化为「证据等级」；正交性由新增的 `blockers` 承担。
+5. 隔离观察改为按卷（盘符）生效，与 `targetRiskKey` 一致；此前是进程级全局拦截。
+6. 本轮不引入渲染层测试框架（见第三节）。
+
+### 九、未解决 / 需真机验收
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| Linux / macOS 实跑 | 未验证 | 本轮所有测试只在 win32 上执行；POSIX 分支用例（T26c、能力探测的 unsupported 分支、`write-gate` 非 Windows 断言）未取证 |
+| 多卷隔离作用域 | 未验证 | 代码已按 `targetRiskKey` 比较，但本机只有单一系统卷 + 一个可移动卷，未构造「隔离 A 卷、写 B 卷」的实机场景 |
+| 真实只读介质 / 脏位卷端到端 | 未验证 | 需硬件或 ACL 变更；本轮只覆盖判定层与单元层 |
+| Windows 系统调用（GetFinalPathNameByHandle / GetVolumePathName） | 未接入 | 仓库无原生模块/FFI，不做集成测试也不声称已做 |
+| GUI 交互（Splitter、主题、启动骨架） | 未验证 | 无渲染层测试框架，需真机人工验收 |
+| `epoch` 未纳入 blockers | 遗留 | 自动同步的 `epoch` 仍由 `level/reachable/isolated/volumeHealth/allowed` 派生；建议后续把 `blockers.join(',')` 纳入，使「阻断原因变化」也能触发重新校验 |
+| 新增 `backup:write-gate` IPC | 未做 | 目前界面通过 `assessment.blockers` 拿到裁决，未单独开闸门查询接口；若将来需要「不跑体检也能问许可」再补 |
+
+### 十、Sub-agent 调度与主代理复核
+
+| 角色 | 任务 | 结果 | 主代理复核 |
+| --- | --- | --- | --- |
+| worker | 五套自制包装器改三态 + 显式 SKIP + write-gate 分支取证 | 完成，改动仅 5 个 test 文件；5 套全绿（54/19/8/26/26） | `grep` 复核：无残留「静默 return 跳过」；`auto-sync` / `reveal-authority` 因 `noUnusedLocals` 保留 `void skip;`，属可接受的折中；其自建探针留在 `%TEMP%\bs-skip-probe.ts`（仓库外，未清理） |
+| explore | 测试里的大小写/Unicode/UNC/权限假设取证 | 只读产出 6 类假设清单 + 受影响用例表（含 POSIX/macOS 预期） | 采信其 5 处「空跑通过」证据并转交 worker；3 处 Unicode 与 T26 由主代理处理；其推断项（APFS case-only rename 行为）标注为待确认，未写入结论 |
+| verifier | 写入许可契约只读审计 | `VERDICT: FAIL`，列出渲染层自建判定、`disk-readonly` 链路断裂、非 Windows 闸门空转等 | 采纳「可选字段 + 单点推导 + 渲染层只读」方案；未采纳：新增 IPC、`epoch` 改造、`quarantine()` 绑定校验（记为遗留） |
+
+> 模型说明：交接单要求的 `GPT-6.2sol` 在本机不可用，子代理继承主会话模型执行；三个子代理的结论均经主代理独立复核后才落地。
+
+
 
 ## 备份主线安全待办
 

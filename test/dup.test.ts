@@ -562,9 +562,10 @@ async function main(): Promise<void> {
 
     // allowed 与 blockers 必须同源推导：多条阻断全部列出，不能只报第一条
     const multi = evaluateWriteGate({ ...healthy, readOnly: true, level: 'L2', reachable: false }, 'automatic');
-    const multiCount: number = multi.blockers.length;
-    assert.equal(multiCount, 3, `应列出全部阻断原因，实际：${multi.blockers.join(',')}`);
-    assert.equal(multi.allowed, multiCount === 0);
+    // 先比一致性再比具体条数：assert.equal 带 `asserts actual is T`，
+    // 先断言条数会把 length 收窄成字面量，后面的 `=== 0` 会被判成不可能的比较。
+    assert.ok(multi.allowed === (multi.blockers.length === 0), 'allowed 必须由 blockers 派生');
+    assert.equal(multi.blockers.length, 3, `应列出全部阻断原因，实际：${multi.blockers.join(',')}`);
   });
   // ------------------------------------------------ §11-1 进度五阶段与取消
 
