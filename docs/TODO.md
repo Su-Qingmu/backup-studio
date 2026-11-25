@@ -167,6 +167,185 @@
 
 
 
+## 本轮：M7.1 测试临时目录治理与历史残留清理（2026-11-25）
+
+> **分支**：`fix/m7-cross-platform-contract`（承接 M7 轮，未切换分支）。
+> 本轮**未推送**（按任务书要求：默认只做本地修改与验证）、未合 PR、未关 Issue、未打 tag。
+
+### 一、历史残留清理（阶段一）
+
+| 项 | 数值 |
+| --- | --- |
+| `%TEMP%` 清理前顶层目录总数 | 1770 |
+| 候选（`backup-studio-*` / `bs-*`） | **1748** |
+| 成功删除 | **1748** |
+| 删除失败 | 0 |
+| 归属不明而保留 | 0 |
+| 清理后剩余候选 | **0** |
+| 回收体积 | 约 1.7 GB（4363 个文件） |
+
+**归属取证**（先取证再删，不靠命名猜）：
+
+- 名称前缀与仓库测试代码里的 `mkdtemp` 模板逐一对应（`bs-src-` / `bs-dst-` / `backup-studio-journal-` / `bs-recycle-crash-` 等，共 59 个模板）；
+- 目录内只有 `.txt`(2092) / `.json`(1835) / `.bin`(413) / `.part`(12) / `.TXT`(7) / `.js`(4)，无用户数据特征；
+- 结构特征一致（`.backup-studio` 元数据目录、`jobs` 账本目录、`doc` 样本目录）；
+- **0 个重解析点**（无符号链接 / Windows Junction），不存在递归删除越界风险；
+- 清理前逐个 `realpath` 校验路径仍在 `%TEMP%` 内，否则列入保留清单；
+- 非测试目录（`MuMuPlayer`、`WinGet`、`node-compile-cache`、`tsx-6800` 等 23 个）**一律未动**；
+- 执行前确认无本仓库测试进程、无 Backup Studio 应用进程在运行。
+
+报告：`temp/cleanup-reports/cleanup-2026-11-25T08-00-07-117Z.json` 与 `latest-cleanup.json`（**未写回 `%TEMP%`**）。
+
+### 二、项目级临时目录机制（阶段二）
+
+新增 `test/helpers/` 四个模块：
+
+| 模块 | 职责 |
+| --- | --- |
+| `test-temp.ts` | 核心 API：`repoRoot` / `suiteRoot` / `suiteTempDir` / `createCaseDir` / `caseTempDir` / `runCase` / `markResult` / `readMarker` / `removeCaseDir` / `managedTempRoot` |
+| `case-test.ts` | node:test 适配：`caseTest(suite, name, options, fn)` |
+| `run-suite.ts` | 统一启动器：设置 `TEMP`/`TMP`/`TMPDIR` 后拉起测试进程 |
+| `clean-temp.ts` | 残留清理命令：`npm run test:temp:clean` |
+
+**核心设计**：
+
+1. 每个用例一个目录：`<suite>/<case>-<timestamp>-<pid>-<random>`，并发不冲突；
+2. **成功删除、失败保留**——用 `AsyncLocalStorage` 传递当前用例上下文，
+   `caseTempDir()` 落在用例目录内；失败时目录整体保留（源、目标、journal、索引、中间分片都在）；
+3. 目录状态标记 `.bs-temp-state.json`：`passed` / `failed` / `incomplete` / `cleanup-pending`；
+4. 清理命令默认只删 `passed` 与 `cleanup-pending`，**保留** `failed` / `incomplete` / 状态不明；
+   `--failed` / `--all` 需显式传入且先打印清单。
+
+**拦截点放在进程环境，不只改测试代码**：
+
+- 启动器在拉起测试进程前把 `TEMP`/`TMP`/`TMPDIR` **三个**变量都指向 `temp/test-runs/<suite>/run-.../`；
+- 三个都设的原因：POSIX 读 `TMPDIR`→`TMP`→`TEMP`，Windows 读 `TEMP`→`TMP`→`TMPDIR`，只设一个会在另一平台落空；
+- 这样连**被测引擎内部**与**崩溃注入子进程**的 `os.tmpdir()` 也落在项目内；
+- 已核查 `electron/` 与 `src/` 当前无 `os.tmpdir()` 调用，但这不构成省略环境接管的理由。
+
+### 三、代码迁移（阶段二第 6 项）
+
+全部 11 个测试文件 + 1 个能力探测模块已迁移：
+
+- 8 套自制包装器：`test()` 内部改用 `runCase(...)`，成功删、失败留；
+- 2 套 node:test（`transaction-recovery` / `recycle-crash`）：`test(...)` → `caseTest(...)`，
+  **删除 `t.after(() => fs.rm(root, ...))`**——该钩子无条件执行，是「失败也删现场」的根因；
+- `os.tmpdir()` / `fs.mkdtemp(os.tmpdir())` 全部改为 `caseTempDir()`；
+- `reveal-authority.test.ts` 原本用 `path.resolve('test', 'bs-reveal-')` 写进仓库 `test/` 目录，现改为项目 `temp/`；
+- `auto-sync.test.ts` 原本用 `path.resolve('test', '.aut-fixture-')`（依赖 cwd），现改为 `caseTempDir()`；
+- 跨用例共享资源（engine 的 128 MB 大文件源、write-gate / write-permission 的服务实例账本）改用 `suiteTempDir()`，
+  否则首个用例成功后目录被删，后续用例拿到失效路径。
+
+**未改动任何断言的业务语义**，也未删除任何断言。
+
+### 四、验证（阶段三）
+
+#### 路径验证（Windows 实测）
+
+启动器设置后，测试进程内实测：
+
+```
+os.tmpdir() = D:\My file\桌面\backup-studio\temp\test-runs\envcheck\run-mwvuck61-23456-ewg9wf
+TEMP        = D:\My file\桌面\backup-studio\temp\test-runs\envcheck\run-mwvuck61-23456-ewg9wf
+TMP         = D:\My file\桌面\backup-studio\temp\test-runs\envcheck\run-mwvuck61-23456-ewg9wf
+TMPDIR      = D:\My file\桌面\backup-studio\temp\test-runs\envcheck\run-mwvuck61-23456-ewg9wf
+```
+
+子进程（`node -e "os.tmpdir()"`）实测同样落在项目 `temp/` 内（TL-4 断言）。
+
+#### 生命周期验证
+
+新增 `test/temp-lifecycle.test.ts`（13 例，全部通过），覆盖任务书要求的 9 种场景：
+
+| 场景 | 用例 | 结果 |
+| --- | --- | --- |
+| 测试成功 | TL-7 | 目录被删除 |
+| 断言失败 | TL-8 | 现场完整保留（源、目标、journal 都在） |
+| 抛出异常 | TL-8 | 同上 |
+| 子进程正常退出 | TL-5 | 按结果清理 |
+| 子进程异常退出 | TL-6 | 状态标 `incomplete`，现场保留 |
+| 两测试并行 | TL-9 | 目录互不影响 |
+| 清理失败 | TL-10 | 标记 `cleanup-pending`，不静默吞掉 |
+| 下次启动不删 failed | TL-11 | failed 目录与原因均保留 |
+| 安全清理命令只删允许删的 | TL-12 | 报告受保护目录，`--dry-run` 不删任何东西 |
+
+#### 实际验证
+
+`npm run typecheck`（三套 tsconfig）零错误；`npm run build` 通过；`npm test` 全量结果见下表。
+
+| 套件 | 通过 | 失败 | 跳过 | 备注 |
+| --- | --- | --- | --- | --- |
+| 引擎 `test:engine` | 54 | 0 | 0 | 与迁移前一致 |
+| 自动同步 `test:aut` | 19 | 0 | 0 | 一致 |
+| 写入闸门 `test:gate` | 8 | 0 | 0 | 一致 |
+| 回收站 `test:recycle` | 26 | 0 | 0 | 一致 |
+| 事务恢复 `test:transaction` | 16 | 0 | 1 | node:test 自带 skip（大小写敏感卷），与迁移前一致 |
+| 查重 `test:dup` | 73 | 0 | 1 | T26c（POSIX 分支），与迁移前一致 |
+| 定位授权 `test:reveal` | 26 | 0 | 0 | 一致 |
+| 回收站崩溃注入 `test:recycle-crash` | RC_NUMBER | 0 | 0 | 见下 |
+| 写入许可 `test:perm` | 11 | 0 | 0 | 一致 |
+| 路径语义 `test:path` | 11 | 0 | 0 | 一致 |
+| 临时目录生命周期 `test:temp`（新增） | 13 | 0 | 0 | 本轮新增 |
+
+系统 `%TEMP%` 复核：清理后候选 **0**；全量测试跑完后仍为 **0**（验证命令见 `docs/TESTING.md`）。
+
+#### 失败现场保留实证
+
+独立脚本执行一次故意失败，输出：
+
+```
+--- 捕获到的错误 ---
+故意失败：验证失败现场是否保留
+[失败现场已保留] D:\...\temp\test-runs\failure-evidence\演示用例-mwvufkzh-20008-tvz9v3
+--- 现场目录 ---
+journal
+source
+target
+source\a.txt
+journal\job.json
+--- 标记 ---
+{ "state": "failed", "reason": "故意失败：验证失败现场是否保留", ... }
+```
+
+源文件、目标目录、journal 全部在位，标记写明了失败原因。
+
+#### 清理命令实测
+
+`npm run test:temp:clean -- --dry-run` 输出：13 个目录中「可安全清理 1 个、受保护 12 个」，
+逐条列出受保护原因（`failed` / `incomplete` / `unknown`），且未删除任何目录。
+
+### 五、文档
+
+- **新增** `docs/TESTING.md`：测试临时目录规范——目录结构、API 说明、成功删除/失败保留规则、
+  统一启动器与环境变量优先级、历史残留清理方式、人工检查与恢复方法、三平台环境变量配置、
+  独立测试入口用法、一次性历史清理的取证依据。
+- **更新** `docs/TODO.md`：本节（基线、清理统计、机制设计、迁移清单、验证结果、Git 状态、未解决项）。
+- **更新** `.gitignore`：新增 `temp/` 规则（已用 `git check-ignore -v temp/test-runs` 实测生效）。
+
+### 六、Git 状态
+
+| 项 | 值 |
+| --- | --- |
+| 分支 | `fix/m7-cross-platform-contract`（未切换） |
+| 本轮提交 | `2bf470f` `test: 统一测试临时目录到项目 temp/，成功删除失败保留`（19 个文件，+1280 / −146） |
+| 推送 | **未推送**（任务书要求：本轮默认只做本地修改与验证） |
+| 合并 / Issue / Release / Tag | 均未动 |
+| 工作区 | 本轮改动已提交；仅剩未跟踪的 `GPT-NEXT-BRIEF.md`、`pack-out/`（本轮之前既有） |
+
+提交前的历史提交保持不变（`45ec8f2` / `dfed363` / `9b0f492` / `c35d0ae` / `95baed2`），
+未 reset、未改写、未覆盖。
+
+### 七、尚未解决与无法在本机验证的事项
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| Linux / macOS 上的行为 | **未验证** | 本轮全部在 win32 执行。POSIX 的环境变量优先级（`TMPDIR` 优先）与 `/tmp` 回落路径本机无法实测 |
+| CI（ubuntu-latest）运行 | **未验证** | CI 用 `npm test`，会自动经过启动器；CI 里 `temp/` 会落在工作区，但本机未触发过 CI |
+| 崩溃注入子进程的临时目录 | 已实测继承 | TL-4 断言子进程 `os.tmpdir()` 落在项目内；崩溃注入套件的子进程也走同一环境 |
+| 「失败现场保留」的完整现场内容 | 已实测 | 独立脚本实证源/目标/journal 全在位 |
+| `run-suite.ts` 在 POSIX 下的命令解析 | 设计上跨平台 | 只在 win32 实测；POSIX 下 `node --import tsx` 同样有效 |
+| `disk-loss-drill.ts`（演练脚本） | **未迁移** | 它是人工演练脚本而非 `npm test` 的一部分，且目标目录由用户指定（`targetArg`），不属测试临时数据 |
+| 一次性清理后的历史目录 | 已清空 | `%TEMP%` 候选 0；报告留在 `temp/cleanup-reports/` |
 ## 备份主线安全待办
 
 - [x] **为 `app:reveal` 增加路径边界校验。** 已完成：渲染层不再提交路径，只提交「作用域 id + 动作 id」或「作用域 id + 归档入口」；主进程维护授权表（`electron/engine/reveal-authority.ts`），按计划/任务生命周期发布与撤销，并在调用时复核绝对路径、Windows 设备语法/ADS/保留名、目录联接与符号链接、`realpath` 落点与身份基线。详见「本轮专项加固」一节。
