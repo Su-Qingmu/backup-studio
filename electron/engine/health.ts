@@ -190,7 +190,10 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
   else if (repair) { condition = 'filesystem-repair'; assessment.level = 'L1'; assessment.confidence = 0.95; assessment.suggestion = '卷状态或脏位提示文件系统需人工检查；保持只读，先保护其他副本。'; }
   else if (!probe.reachable) condition = 'unreachable';
   else if (verified) condition = 'verified';
-  else if (assessment.level === 'L0') { assessment.level = 'L1'; assessment.confidence = 0.5; assessment.suggestion = '分层证据不足，保持只读；尝试换口、换线、换主机后重查。'; }
+  // 证据不足 ≠ 禁止写入：这里只描述事实与建议，不再写「保持只读」。
+  // 是否真的阻断由 service.evaluateWriteGate 按事实裁决，界面显示的就是那个裁决，
+  // 两者措辞不一致会让用户看到「保持只读」却能点「开始备份」（Issue #9）。
+  else if (assessment.level === 'L0') { assessment.level = 'L1'; assessment.confidence = 0.5; assessment.suggestion = '分层证据不足（未取得卷级健康或分区证据）；本轮写入不受此条阻断，但建议换口、换线、换主机后重查。'; }
   if (!strong && !repair && probe.reachable && probe.writable && volume?.readOnly === false && dirty === false && bootReadable && /^(MBR|GPT)/.test(partition) && index !== '未验证' && !files.unchecked && !verifyFailures) {
     assessment.level = 'L0'; assessment.confidence = 0.8; assessment.suggestion = verified ? '分层校验通过；如需恢复备份，须显式确认并重建计划。' : '仅备份集层需要处理；优先用本机账本和完好分片，显式确认后重扫。';
   }

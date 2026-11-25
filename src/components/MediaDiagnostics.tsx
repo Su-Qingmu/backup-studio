@@ -35,7 +35,14 @@ export function MediaDiagnostics({ api, root, disabled }: { api: BackupAPI; root
     </div>
     {!root ? <p className="media-diagnostics-hint">未选择备份目标目录，诊断不可用。</p> : null}
     {report && <>
-      <p><strong>{report.assessment.level} / {labels[report.condition]}</strong>（置信度 {Math.round(report.assessment.confidence * 100)}%）</p>
+      {/* 三件事必须分开显示，否则用户看到的就是互相矛盾的三句话（Issue #9）：
+          证据等级（判定得多确定）、成因（为什么是这个等级）、写入许可（到底能不能写）。 */}
+      <p><strong>{report.assessment.level} / {labels[report.condition]}</strong>（置信度 {Math.round(report.assessment.confidence * 100)}% · 证据{report.assessment.writable ? '充分' : '不足'}）</p>
+      <p><strong>写入许可：</strong>{report.assessment.blockers === undefined
+        ? '未判定（该报告未经过写入闸门）'
+        : report.assessment.blockers.length === 0
+          ? '允许写入'
+          : `已阻断 · ${report.assessment.blockReason ?? '原因未报告'}`}</p>
       <p>{report.assessment.suggestion}</p>
       <details open><summary>分层证据</summary><dl>{report.assessment.evidence.map(({ kind, detail }, i) => <div key={`${kind}-${i}`}><dt>{kind}</dt><dd>{detail}</dd></div>)}</dl></details>
       {report.condition === 'filesystem-repair' && report.volume && <fieldset disabled={locked || !report.permission}>

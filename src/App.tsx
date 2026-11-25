@@ -15,6 +15,7 @@ import { IconAlert, IconCheck, IconLayers, IconMoon, IconRefresh, IconSun } from
 import { useSpringValue } from './hooks/useSpringValue';
 import { POP_SPRING } from './lib/spring';
 import { fmtBytes, fmtDuration, fmtInt, normalizeDirectoryRoot } from './lib/format';
+import { resolveWritePermission } from './lib/write-permission';
 import type { BackupPhase, RecycleEntry, SyncMode } from '../shared/types';
 import type { BackupRevealResult, BackupRevealState } from '../shared/reveal-types';
 
@@ -323,24 +324,17 @@ export default function App() {
 
   const running = phase === 'running' || phase === 'paused';
   const assessment = state?.assessment;
-  // 判定结论只对被判定过的目标有效：目标换了就不得沿用上一份结论。
-  const assessmentApplies = Boolean(
-    assessment?.targetRoot && targetRoot && assessment.targetRoot === targetRoot
-  );
-  // L1 有两种成因，含义不同：
-  // - filesystem-repair：文件系统需人工检查，必须保持只读，按钮禁用；
-  // - uncertain：仅是证据不足（常见于平台不支持卷级探测或权限不足），不等于禁止写入。
-  const mustStayReadOnly = assessmentApplies
-    && (assessment?.condition === 'filesystem-repair'
-      || assessment?.condition === 'media-unavailable'
-      || assessment?.condition === 'unreachable'
-      || assessment?.level === 'L2');
-  // 证据不足：提示复查，但不禁用——引擎的写入闸门会按 volumeHealth 与模式裁决。
-  const evidenceIncomplete = assessmentApplies && !mustStayReadOnly && assessment?.writable === false;
+  // 写入许可**只读主进程的裁决**：渲染层不再从 level / condition / writable 自行推导。
+  //
+  // 这里曾经自己拼过一遍条件（condition ∈ {…} || level === 'L2'），结果是第二个闸门：
+  // 磁盘被系统写保护、目标卷需修复、隔离标记跨盘生效时界面照样可点；
+  // 而卷已修好但没重新检测时界面又一直禁用（Issue #9）。
+  // 推导集中在 resolveWritePermission：它只翻译、不推理，因此可以单独回归测试。
+  const permission = resolveWritePermission(assessment, targetRoot);
+  // 证据不足只是提示，不参与禁用判断：主进程放行就放行，但用户要知道证据并不充分。
+  const evidenceIncomplete = permission.evidenceIncomplete;
   // 完成态按钮只重新扫描和生成计划，不会启动写入。
-  const writeBlockReason = phase !== 'completed' && mustStayReadOnly
-    ? `${assessment?.level}：${assessment?.suggestion}`
-    : null;
+  const writeBlockReason = phase !== 'completed' && permission.blocked ? permission.reason : null;
   const canStart = Boolean(sourceRoot && targetRoot) && !running && phase !== 'scanning' && phase !== 'planning'
     && writeBlockReason === null;
 

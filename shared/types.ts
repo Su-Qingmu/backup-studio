@@ -201,16 +201,56 @@ export interface HealthReport {
   smart: '能力缺失' | '有基线';
   index: '完整' | '截断' | '缺失' | '索引不一致' | '未验证';
   files: { complete: number; truncated: number; missing: number; mismatch: number; unchecked: number };
+  /**
+   * 本次体检同时给出的写入许可（**用户主动操作**口径）。
+   *
+   * 与 `assessment.blockers` 同源（同一个 evaluateWriteGate 调用），
+   * 单独保留是为了让诊断页能直接显示模式、时刻与目标，而不必从 assessment 反推。
+   */
+  writeGate?: WriteGate;
 }
+
+/**
+ * 强制写阻断原因。
+ *
+ * 只有**事实**能成为阻断原因：拿不到证据（`uncertain`）不是阻断原因，
+ * 这一点是 Issue #9 的核心——"证据不足"曾经被当成"禁止写入"，
+ * 结果界面显示「保持只读」而引擎实际放行，两个状态互相冲突。
+ */
+export type WriteBlocker =
+  /** 目标根不可读（拔盘、路径不存在、权限不足） */
+  | 'unreachable'
+  /** 介质处于隔离观察且未撤销 */
+  | 'isolated'
+  /** 容灾判定 L2：介质层已确认不可用 */
+  | 'level-l2'
+  /** 操作系统报告磁盘写保护 */
+  | 'disk-readonly'
+  /** 卷状态或脏位提示需人工修复（含本进程已记忆的需修复目标） */
+  | 'filesystem-repair'
+  /** 自动写入策略要求确认卷健康，但当前平台/权限拿不到卷级事实（仅 automatic 模式） */
+  | 'volume-health-unknown';
 
 /**
  * 写入闸门结果。
  *
- * 手动备份与自动备份共用这一套判定，避免出现第二套写入规则而相互漂移。
- * 条件与 `guardTargetWrites` 一致：L2、磁盘只读、卷需修复、隔离中，一律禁止写入。
+ * 手动备份、回收站还原、自动同步、查重清理**共用这一个函数**得出的结论，
+ * 不允许任何调用方（尤其渲染层）再自己拼一遍条件——那是第二个闸门。
  */
 export interface WriteGate {
   allowed: boolean;
+  /**
+   * 强制阻断原因（与 `allowed` 由同一处推导：`allowed === blockers.length === 0`）。
+   *
+   * 缺省表示调用方没有提供该项信息（老版本或字面量构造），**不得**当成"无阻断"以外的推断依据。
+   */
+  blockers?: WriteBlocker[];
+  /** 本次裁决针对的目标根：换了目标，这张许可就不再适用 */
+  targetRoot?: string;
+  /** 裁决所用的策略：自动写入要求确认卷健康，用户主动操作放宽这一条 */
+  mode?: 'automatic' | 'user-directed';
+  /** 裁决时刻 */
+  at?: number;
   /** 目标根是否可达 */
   reachable: boolean;
   /** 是否处于隔离观察（未撤销） */
@@ -319,6 +359,18 @@ export interface MediaAssessment {
    * 界面据此判断是否允许开始备份，避免拿旧结论误放行或误禁用。
    */
   targetRoot?: string;
+  /**
+   * 强制写阻断原因（由主进程用**用户主动操作**口径判定）。
+   *
+   * 渲染层必须只读这一个字段来决定「开始备份」是否可用，
+   * 不得再从 `level` / `condition` / `writable` 自行推导安全结论。
+   *
+   * 缺省（`undefined`）表示这份判定没有经过主进程闸门（旧状态、演示数据等），
+   * 界面必须按「未判定」处理（禁用写入口并提示重新检测），不得 fail-open。
+   */
+  blockers?: WriteBlocker[];
+  /** 与 `blockers` 同时给出的中文原因（第一条阻断原因的可读文案） */
+  blockReason?: string;
   /**
    * 判定条件。区分同为 L1 的不同成因：
    * - filesystem-repair：文件系统需人工检查，必须保持只读；

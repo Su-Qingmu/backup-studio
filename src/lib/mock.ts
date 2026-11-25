@@ -756,7 +756,19 @@ export function createMockApi(): BackupAPI {
     },
 
     async health() {
-      return { assessment: { level: 'L1', confidence: 0.95, writable: false, at: Date.now(), suggestion: '演示卷需人工检查，保持只读。', evidence: [{ kind: '演示卷', detail: 'NTFS / Full Repair Needed / 脏位置位', at: Date.now() }] }, condition: 'filesystem-repair', permission: true, volume: 'X:', smart: '能力缺失', index: '未验证', files: { complete: 0, truncated: 0, missing: 0, mismatch: 0, unchecked: 0 } };
+      // 演示数据同样必须给出写入许可：缺少 blockers 会被界面判成「未判定」并禁用写入口，
+      // 演示态的职责是展示真实交互，不能靠"没有字段"蒙混过去。
+      return {
+        assessment: {
+          level: 'L1', confidence: 0.95, writable: false, at: Date.now(),
+          suggestion: '卷状态或脏位提示文件系统需人工检查；先保护其他副本，处理完成并重新检测后再写。',
+          evidence: [{ kind: '演示卷', detail: 'NTFS / Full Repair Needed / 脏位置位', at: Date.now() }],
+          blockers: ['filesystem-repair'],
+          blockReason: '卷需要人工检查，禁止写入；处理完成并重新对账后再继续',
+        },
+        condition: 'filesystem-repair', permission: true, volume: 'X:', smart: '能力缺失', index: '未验证',
+        files: { complete: 0, truncated: 0, missing: 0, mismatch: 0, unchecked: 0 },
+      };
     },
     async reenumerate(root) { return this.health(root); },
     async repairDryRun(_root, request) {
@@ -766,7 +778,7 @@ export function createMockApi(): BackupAPI {
     async exportPartitionEvidence() { return { auditId: 'demo', guidance: '浏览器演示：未写入文件。' }; },
     async capabilities() { return (await import('../../electron/engine/capability')).capabilityMatrix; },
 
-    async assess(_targetRoot: string) {
+    async assess(targetRoot: string) {
       return {
         assessment: {
           level: 'L0' as const,
@@ -775,6 +787,8 @@ export function createMockApi(): BackupAPI {
           suggestion: '介质读取稳定',
           at: Date.now(),
           writable: true,
+          targetRoot,
+          blockers: [],
         },
         state: current,
       };

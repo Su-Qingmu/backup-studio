@@ -233,12 +233,13 @@ export function assessMedia(input: AssessInput): MediaAssessment {
     };
   }
 
-  // ---- L1：不确定时默认只读 ----
+  // ---- L1：证据不足（**不是**禁止写入）----
+  // 这里只表达「判定不了」，阻断与否由写入闸门按具体事实裁决。
   return {
     level: 'L1',
     confidence: 0.5,
     evidence: evidenceList,
-    suggestion: '证据不足以自动判定，默认只读。请人工确认修复方式后再继续。',
+    suggestion: '证据不足，未能确认介质风险；未取得卷级/分区级证据，建议人工复查后再决定是否写入。',
     at: Date.now(),
     writable: false,
   };
