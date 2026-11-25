@@ -1274,6 +1274,60 @@ async function main(): Promise<void> {
     );
   });
 
+  await test('可靠性：预览之后出现的同名文件不被覆盖，任务报失败并要求重扫', async () => {
+    const source = await makeTemp('bs-stale-src-');
+    const target = await makeTemp('bs-stale-dst-');
+    const userData = await makeTemp('bs-stale-ud-');
+    await writeFile(source, 'report.txt', 'source-content');
+
+    const service = new BackupService(userData);
+    const plan = await service.plan(source, target, 'copy');
+    assert.equal(plan.summary.copy, 1, '预览应显示新增 1');
+    assert.equal(plan.summary.update, 0, '预览应显示更新 0');
+    assert.equal(plan.summary.delete, 0, '预览应显示删除 0');
+    assert.equal(plan.requiresConfirmation, false, '没有删除就不需要二次确认');
+
+    // 预览之后、开始之前，用户把另一份同名文件放进目标目录，且仅此一份。
+    await writeFile(target, 'report.txt', 'only-copy');
+
+    await service.start({
+      sourceRoot: source,
+      targetRoot: target,
+      syncMode: 'copy',
+      allowMassDelete: true,
+      resume: true,
+    });
+
+    // 目标被占用：那份文件的原字节必须原样保留，不得被覆盖。
+    assert.equal(await fs.readFile(path.join(target, 'report.txt'), 'utf8'), 'only-copy',
+      '预览之后出现的同名文件不得被覆盖');
+    // 任务不得报完成。
+    assert.notEqual(service.getState().phase, 'completed', '发生冲突时不得报完成');
+    // 必须如实报告计划已过期并要求重扫。
+    const logs = service.getState().logs.map((entry) => entry.text).join('\n');
+    assert.match(logs, /计划已过期/, '必须报告计划已过期并要求重扫');
+  });
+
+  await test('可靠性：目标保持为空时新增照常完成', async () => {
+    const source = await makeTemp('bs-add-src-');
+    const target = await makeTemp('bs-add-dst-');
+    const userData = await makeTemp('bs-add-ud-');
+    await writeFile(source, 'report.txt', 'source-content');
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'copy');
+    await service.start({
+      sourceRoot: source,
+      targetRoot: target,
+      syncMode: 'copy',
+      allowMassDelete: true,
+      resume: true,
+    });
+    assert.equal(service.getState().phase, 'completed');
+    assert.equal(await fs.readFile(path.join(target, 'report.txt'), 'utf8'), 'source-content',
+      '目标保持为空时新增照常完成');
+  });
+
   if (process.platform === 'win32') {
     await test('Windows 大小写变更：并发拷贝与大量删除不误删仅大小写变化的源端文件', async () => {
       const source = await makeTemp('bs-case-src-');

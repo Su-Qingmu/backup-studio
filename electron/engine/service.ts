@@ -91,6 +91,19 @@ function errorCode(err: unknown): string | undefined {
   return typeof code === 'string' ? code : undefined;
 }
 
+/**
+ * 计划已过期：预览之后目标端出现了同名文件。
+ *
+ * 计划为「源端新增」的文件以「目标不存在」为前提。前提被打破时不得覆盖：
+ * 那是用户自己的内容，而且这份内容在目标盘上只有一份。
+ */
+function stalePlanError(relPath: string): Error {
+  return Object.assign(
+    new Error(`目标已被占用，计划已过期，请重新扫描后重试：${relPath}`),
+    { code: 'PLAN_STALE' },
+  );
+}
+
 /** 删除事务的幂等键：同一任务同一路径永远得到同一个 txId。 */
 function deleteTxId(jobId: string, relPath: string): string {
   return createHash('sha256').update(`${jobId}\u0000${relPath}`, 'utf8').digest('hex').slice(0, 32);
@@ -258,6 +271,14 @@ export class BackupService extends EventEmitter {
   /** 上次探测结果 */
   private lastProbe: MediaProbe | null = null;
   private actionIndex = new Map<string, PlanAction>();
+  /**
+   * 本次任务中因目标已被占用而无法提交的新增路径。
+   *
+   * 计划为「源端新增」的文件以「目标不存在」为前提；预览与开始之间
+   * 目标端出现同名文件时，备份不得覆盖它，任务也不得报完成——
+   * 必须如实报告计划已过期并要求重新扫描。
+   */
+  private stalePlanPaths = new Set<string>();
   private readonly recycleMaxBytes: number;
   /** 恢复期间允许执行的删除路径集合：只包含删除账本里已授权的条目。 */
   private recoveryDeleteScope: Set<string> | null = null;
@@ -815,6 +836,7 @@ export class BackupService extends EventEmitter {
     this.transaction = null;
     this.journalDirty = false;
     this.copyCallbackFailure = null;
+    this.stalePlanPaths.clear();
     try {
     const previous = await this.journal.getActive();
     if (recovering ? previous?.jobId !== recovering.jobId : previous &&
@@ -1225,6 +1247,9 @@ export class BackupService extends EventEmitter {
       if (this.copyCallbackFailure) reasons.push(this.copyCallbackFailure);
       if (directoryFailures) reasons.push(`${directoryFailures} 个目录创建失败`);
       if (plan.hashErrors.length) reasons.push(`${plan.hashErrors.length} 个文件规划期读取失败`);
+      if (this.stalePlanPaths.size) {
+        reasons.push(`计划已过期：${this.stalePlanPaths.size} 个文件的目标已被占用（未覆盖），请重新扫描后重试`);
+      }
       // 「保留」是正常结果（status 为 skipped），不算前置操作未完成。
       if (actions.some((a) => a.type !== 'delete' && a.type !== 'retain' && a.status !== 'done')) {
         reasons.push('前置文件操作未完成');
@@ -1422,13 +1447,26 @@ export class BackupService extends EventEmitter {
     const finalPath = path.join(targetRoot, relPath);
 
     try {
-      await this.transaction!.preserveTarget(finalPath);
-      await this.commitToTarget(task.partPath, finalPath);
+      if (action.type === 'copy') {
+        // 计划为「源端新增」：提交条件是「目标仍然不存在」。
+        await this.commitNewTarget(task.partPath, finalPath, relPath);
+      } else {
+        await this.transaction!.preserveTarget(finalPath);
+        await this.commitToTarget(task.partPath, finalPath);
+      }
     } catch (err) {
       const code = errorCode(err);
       if (code && MEDIA_ERROR_CODES.has(code)) {
         this.ioErrors += 1;
         await this.handleMediaLoss(errorText(err));
+        return;
+      }
+      if (code === 'PLAN_STALE') {
+        // 目标已被占用：那份文件原样保留，任务不得报完成。
+        this.stalePlanPaths.add(relPath);
+        this.updateAction(action.id, { status: 'failed', error: errorText(err) });
+        this.log('warn', `计划已过期：目标已被占用，未覆盖 ${relPath}，请重新扫描后重试`);
+        this.pendingTasks.delete(relPath);
         return;
       }
       this.updateAction(action.id, { status: 'failed', error: errorText(err) });
@@ -1466,6 +1504,86 @@ export class BackupService extends EventEmitter {
     await fs.rename(srcPath, destPath);
     await syncDirectory(path.dirname(destPath));
     if (path.dirname(srcPath) !== path.dirname(destPath)) await syncDirectory(path.dirname(srcPath));
+  }
+
+  /**
+   * 提交「源端新增」的文件：**绝不替换**计划所依据的那个目标路径。
+   *
+   * 计划里的新增动作以「目标不存在」为前提。预览与开始之间，目标端可能
+   * 已经出现同名文件——那是用户自己的内容，备份既不得覆盖它，也不得在
+   * 事务收尾时把它的唯一副本一起清掉（归档在事务历史里，收尾时会被删掉）。
+   *
+   * 因此提交要同时满足两件事：
+   *   1. 目标此刻确实不存在；
+   *   2. 检查与发布之间没有窗口——用「不覆盖」语义的原子提交收尾。
+   *
+   * `fs.rename` 在 Windows 上走 MoveFileEx(REPLACE_EXISTING)，目标存在就被
+   * 覆盖；所以这里优先用 `fs.link`（原子的，目标已存在就 EEXIST），
+   * 硬链接不可用时退化为 `fs.copyFile(..., COPYFILE_EXCL)`——同样不覆盖。
+   */
+  private async commitNewTarget(srcPath: string, destPath: string, relPath: string): Promise<void> {
+    await this.assertTargetWritable();
+    await createDurableDirectory(path.dirname(destPath), path.resolve(this.state.targetRoot));
+    await this.assertTargetWritable();
+    const occupied = await this.commitWithoutReplace(srcPath, destPath);
+    if (!occupied) {
+      // 目标原本不存在：提交完成，暂存件随提交一起落地。
+      await fs.unlink(srcPath);
+      await syncDirectory(path.dirname(destPath));
+      if (path.dirname(srcPath) !== path.dirname(destPath)) await syncDirectory(path.dirname(srcPath));
+      return;
+    }
+    // 目标路径已被占用。只有一种例外：盘上是同一路径的另一种大小写写法，
+    // 那在文件系统意义上就是同一个文件，按既有语义照常更新。
+    if (await this.hasExactEntry(path.dirname(destPath), path.basename(destPath))) {
+      // 计划所依据的「目标不存在」已被打破：保留那份文件的原字节，
+      // 报计划已过期并要求重新扫描。
+      throw stalePlanError(relPath);
+    }
+    await this.transaction!.preserveTarget(destPath);
+    await this.commitToTarget(srcPath, destPath);
+  }
+
+  /**
+   * 不覆盖地提交暂存件。
+   *
+   * 返回 true 表示目标路径已被占用（暂存件原封不动留在盘上），
+   * 返回 false 表示提交成功。其他错误照常抛出。
+   */
+  private async commitWithoutReplace(srcPath: string, destPath: string): Promise<boolean> {
+    try {
+      await fs.link(srcPath, destPath);
+      return false;
+    } catch (err) {
+      const code = errorCode(err);
+      if (code === 'EEXIST') return true;
+      if (!code || !HARDLINK_UNSUPPORTED_CODES.has(code)) throw err;
+      // 降级：硬链接不可用（exFAT / FAT32 等）→ 独占复制（同样不覆盖）。
+      try {
+        await fs.copyFile(srcPath, destPath, fs.constants.COPYFILE_EXCL);
+        return false;
+      } catch (copyErr) {
+        if (errorCode(copyErr) === 'EEXIST') return true;
+        throw copyErr;
+      }
+    }
+  }
+
+  /**
+   * 目标目录里是否有一个**名字完全一致**的条目。
+   *
+   * 大小写不敏感的文件系统上，"Report.txt" 与 "report.txt" 是同一个文件：
+   * 计划里的新增动作在盘上遇到同一条目的另一种写法时，那是既有语义里的
+   * 「同名不同写法」，照常更新即可。但名字完全一致时，它就是「预览之后
+   * 才出现的同名文件」，绝不能覆盖。
+   *
+   * 读不到目录时按「已被占用」处理：拿不准就不覆盖。
+   */
+  private async hasExactEntry(dir: string, name: string): Promise<boolean> {
+    let entries: string[];
+    try { entries = await fs.readdir(dir); }
+    catch { return true; }
+    return entries.includes(name);
   }
 
   private async onCopyError(relPath: string, message: string, code?: string): Promise<void> {
