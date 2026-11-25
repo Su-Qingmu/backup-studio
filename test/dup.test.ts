@@ -8,9 +8,14 @@ import { DuplicateFinder, MAX_PREVIEW_GROUPS } from '../electron/engine/dup';
 import { createDuplicateFinder } from '../electron/engine/dup/wiring';
 import { groupNameConflicts } from '../electron/engine/dup/detect';
 import { FULL_HASH_LIMIT_BYTES } from '../electron/engine/dup/hash';
-import { QuarantineStore, executeAct, registryKey } from '../electron/engine/dup/act';
+import { QuarantineStore, executeAct, registryKey, isNetworkPath } from '../electron/engine/dup/act';
+import {
+  probeFsCapabilities,
+  formatFsCapabilities,
+  type FsCapabilities,
+} from './fs-capabilities';
 import type { ActRegistryEntry, QuarantineEntry, QuarantineErrorCode } from '../electron/engine/dup/act';
-import { BackupService, decideWriteGate } from '../electron/engine/service';
+import { BackupService, decideWriteGate, evaluateWriteGate } from '../electron/engine/service';
 import type {
   DupActRequest,
   DupActResult,
@@ -37,6 +42,31 @@ import type {
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
+const skipReasons: string[] = [];
+
+/**
+ * 显式跳过信号。
+ *
+ * 用「抛出专用错误」而不是「正常 return」表达跳过：
+ * 正常 return 会被 try 块当成成功，于是一个什么都没验证的用例也被计成 PASS——
+ * 这正是 Issue #19 里「假阳性」的来源。返回类型声明为 `never` 之后，
+ * 调用处无法既不抛错又继续往下执行，编译期就能挡住误用。
+ */
+class TestSkip extends Error {
+  readonly reason: string;
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'TestSkip';
+    this.reason = reason;
+  }
+}
+
+/** 声明本用例在本机无法执行。原因必填，且会进入统计明细。 */
+function skip(reason: string): never {
+  if (!reason || !reason.trim()) throw new Error('skip() 必须给出非空原因');
+  throw new TestSkip(reason);
+}
 
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
   try {
@@ -44,10 +74,26 @@ async function test(name: string, fn: () => Promise<void>): Promise<void> {
     passed += 1;
     console.log(`PASS ${name}`);
   } catch (err) {
+    if (err instanceof TestSkip) {
+      skipped += 1;
+      skipReasons.push(`${name}：${err.reason}`);
+      console.log(`SKIP ${name}（${err.reason}）`);
+      return;
+    }
     failed += 1;
     console.error(`FAIL ${name}`);
     console.error(`     ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
   }
+}
+
+/** 文件系统能力探测（惰性、只做一次）；结果会打印进测试输出作为证据 */
+let capabilitiesCache: FsCapabilities | undefined;
+async function capabilities(): Promise<FsCapabilities> {
+  if (!capabilitiesCache) {
+    capabilitiesCache = await probeFsCapabilities(FIXTURE_ROOT);
+    console.log(formatFsCapabilities(capabilitiesCache));
+  }
+  return capabilitiesCache;
 }
 
 // ---------------------------------------------------------------- 夹具工具
@@ -478,24 +524,47 @@ async function main(): Promise<void> {
     assert.equal(isScanActive(false, 'cancelled'), false);
   });
 
-  await test('§11-10a 未知卷健康只放行用户主动操作，硬阻断对两种模式均有效', async () => {
+  await test('§11-10a 写入许可只有一个推导点：阻断只来自事实，evidence 不足不是阻断', async () => {
     const healthy = {
       reachable: true, isolated: false, level: 'L0', readOnly: false,
       repairNeeded: false, volumeHealth: 'healthy',
     } as const;
     const unknown = { ...healthy, volumeHealth: 'unknown' } as const;
-    assert.equal(decideWriteGate(unknown, 'automatic').allowed, false);
+
+    // 证据不足（拿不到卷级事实）只拦无人值守的自动写入；用户主动操作允许继续。
+    assert.deepEqual(evaluateWriteGate(unknown, 'automatic').blockers, ['volume-health-unknown']);
+    assert.equal(evaluateWriteGate(unknown, 'automatic').allowed, false);
+    assert.deepEqual(evaluateWriteGate(unknown, 'user-directed').blockers, []);
+    assert.equal(evaluateWriteGate(unknown, 'user-directed').allowed, true);
+    // 兼容入口必须给出同一结论，不允许存在第二套判定
     assert.equal(decideWriteGate(unknown, 'user-directed').allowed, true);
 
+    // 真阻断：两种模式都必须拒绝，且必须点名具体原因
+    const truthTable: { label: string; patch: Record<string, unknown>; code: string }[] = [
+      { label: '目标不可达', patch: { reachable: false }, code: 'unreachable' },
+      { label: '隔离观察', patch: { isolated: true }, code: 'isolated' },
+      { label: 'L2', patch: { level: 'L2' }, code: 'level-l2' },
+      { label: '磁盘只读', patch: { readOnly: true }, code: 'disk-readonly' },
+      { label: '需人工修复', patch: { repairNeeded: true }, code: 'filesystem-repair' },
+      { label: '卷状态要求修复', patch: { volumeHealth: 'repair-required' }, code: 'filesystem-repair' },
+    ];
     for (const mode of ['automatic', 'user-directed'] as const) {
-      assert.equal(decideWriteGate(healthy, mode).allowed, true, `${mode}: healthy`);
-      assert.equal(decideWriteGate({ ...healthy, reachable: false }, mode).allowed, false, `${mode}: unreachable`);
-      assert.equal(decideWriteGate({ ...healthy, isolated: true }, mode).allowed, false, `${mode}: isolated`);
-      assert.equal(decideWriteGate({ ...healthy, level: 'L2' }, mode).allowed, false, `${mode}: L2`);
-      assert.equal(decideWriteGate({ ...healthy, readOnly: true }, mode).allowed, false, `${mode}: readOnly`);
-      assert.equal(decideWriteGate({ ...healthy, repairNeeded: true }, mode).allowed, false, `${mode}: repairNeeded`);
-      assert.equal(decideWriteGate({ ...healthy, volumeHealth: 'repair-required' }, mode).allowed, false, `${mode}: repair-required`);
+      for (const row of truthTable) {
+        const verdict = evaluateWriteGate({ ...healthy, ...row.patch } as typeof healthy, mode);
+        assert.equal(verdict.allowed, false, `${mode}: ${row.label} 必须阻断`);
+        assert.ok(verdict.blockers.includes(row.code as never), `${mode}: ${row.label} 必须给出 ${row.code}`);
+        assert.ok((verdict.reason ?? '').length > 0, `${mode}: ${row.label} 必须给中文原因`);
+      }
+      const pass = evaluateWriteGate(healthy, mode);
+      assert.equal(pass.allowed, true, `${mode}: 没有任何事实阻断时必须放行`);
+      assert.deepEqual(pass.blockers, []);
     }
+
+    // allowed 与 blockers 必须同源推导：多条阻断全部列出，不能只报第一条
+    const multi = evaluateWriteGate({ ...healthy, readOnly: true, level: 'L2', reachable: false }, 'automatic');
+    const multiCount: number = multi.blockers.length;
+    assert.equal(multiCount, 3, `应列出全部阻断原因，实际：${multi.blockers.join(',')}`);
+    assert.equal(multi.allowed, multiCount === 0);
   });
   // ------------------------------------------------ §11-1 进度五阶段与取消
 
@@ -602,10 +671,14 @@ async function main(): Promise<void> {
       await put(dir, nfdName, blob('unicode-nfd'));
 
       const listed = await fs.readdir(dir);
-      if (listed.length < 2) {
-        // 文件系统自身会做规范化（如同 macOS）：两个名字落成同一个文件，无法构造该形态
-        return;
+      // 不做 Unicode 归一的文件系统（如 NTFS、ext4）才能让 NFC / NFD 两个名字同时存在。
+      // 归一化的文件系统（如 APFS/HFS+）会把它们落成同一个文件——那不是缺陷，是本机没有这个能力，
+      // 必须显式跳过并写明探测证据，不能靠「返回了所以算通过」。
+      const caps = await capabilities();
+      if (caps.unicodeAlias.state !== 'unsupported') {
+        skip(`本机文件系统把 NFC/NFD 当成同一个名字，无法构造同名文件现场（探测：${caps.unicodeAlias.detail}）`);
       }
+      assert.equal(listed.length, 2, '能力探测确认不做 Unicode 别名后，两个名字必须都能落盘');
 
       const { status } = await scanWatch(finder, root);
       const result = resultOf(status);
@@ -1239,7 +1312,9 @@ async function main(): Promise<void> {
         trash: async (absPath) => {
           await fs.rm(absPath, { force: true });
         },
-        writeGate: (gateRoot) => service.writeGate(gateRoot),
+        // 与生产接线（electron/main.ts 的 registerDupIpc）保持同一模式：
+        // 查重删除是用户显式指定目录上的可恢复清理，走 user-directed。
+        writeGate: (gateRoot) => service.writeGate(gateRoot, { mode: 'user-directed' }),
         isBackupBusy: () => service.isBusy(),
         isAutoSyncRunning: () => false,
         revealFile: () => undefined,
@@ -1345,6 +1420,10 @@ async function main(): Promise<void> {
       // 但同名判定会先归一到 NFC，因此它们构成「同名不同内容」告警组。
       // 于是 NFC 那一份同时属于「内容重复」组与「同名告警」组——
       // 登记表若只按路径建键，就会被后写入的组覆盖，硬约束随之用错组。
+      const caps = await capabilities();
+      if (caps.unicodeAlias.state !== 'unsupported') {
+        skip(`本机文件系统把 NFC/NFD 当成同一个名字，无法构造「一个文件同属两组」的现场（探测：${caps.unicodeAlias.detail}）`);
+      }
       await put(root, 'same/caf\u00e9.txt', blob('content-x'));
       await put(root, 'same/cafe\u0301.txt', blob('content-y'));
       await put(root, 'same/other.txt', blob('content-x'));
@@ -1397,6 +1476,10 @@ async function main(): Promise<void> {
   await test('同名不同内容告警区删除必须显式二次确认（FR-18）', () =>
     fixture({}, async ({ root, finder, trashCalls }) => {
       // NFC / NFD 两种写法同名但内容不同 → 告警区
+      const caps = await capabilities();
+      if (caps.unicodeAlias.state !== 'unsupported') {
+        skip(`本机文件系统把 NFC/NFD 当成同一个名字，无法构造同名不同内容现场（探测：${caps.unicodeAlias.detail}）`);
+      }
       await put(root, 'same/caf\u00e9.txt', blob('x-content'));
       await put(root, 'same/cafe\u0301.txt', blob('y-content'));
       const { status } = await scanWatch(finder, root);
@@ -1685,8 +1768,8 @@ async function main(): Promise<void> {
         code = (err as { code?: string }).code;
       }
       if (!code || code === 'ENOENT') {
-        console.log('     SKIP T10：本平台读目录不报错，无法模拟索引读取失败');
-        return;
+        const caps = await capabilities();
+        skip(`本平台读目录不报错，无法用「索引文件是目录」模拟索引读取失败（探测：${caps.readDirAsFileFails.detail}）`);
       }
       const store = new QuarantineStore(dir);
       await expectQuarantineError(store.list(), 'read-failed', /读取失败/);
@@ -1839,25 +1922,52 @@ async function main(): Promise<void> {
       await fs.mkdir(path.dirname(entry.storedPath), { recursive: true });
       await fs.writeFile(entry.storedPath, content, 'utf8');
       const indexFile = await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+      const indexBefore = await fs.readFile(indexFile, 'utf8');
 
-      // 索引文件置为只读：读得到、覆盖写不进去（Windows 上覆盖只读文件会 EPERM）
-      await fs.chmod(indexFile, 0o444);
-      const store = new QuarantineStore(quarantineDirectory);
-      let outcome: { restored: boolean; path?: string; reason?: string } | undefined;
-      try {
-        outcome = await store.restore('q-restore');
-      } finally {
-        await fs.chmod(indexFile, 0o666);
-      }
-      assert.equal(outcome?.restored, true, '索引写失败不得把已完成的还原报成失败');
-      assert.match(outcome?.reason ?? '', /索引更新失败/);
-      // 文件确实回到了原处
+      // 故障必须**确定性**地发生在「收尾写索引」这一步。
+      // 早期实现用 `fs.chmod(indexFile, 0o444)`，依赖操作系统权限语义：
+      // POSIX 下 root 与部分文件系统写只读文件照样成功，Windows 的只读位只拦覆盖
+      // 而不拦改名替换——于是同一用例在不同平台时而通过时而失败，
+      // 更糟的是"其实没写失败"也会被算成通过。
+      // 现在只注入「写入动作」这一个依赖：默认实现仍是 writeJsonAtomic（原子替换），
+      // 注入实现直接抛错，写入根本没有发生。
+      let writeAttempts = 0;
+      const store = new QuarantineStore(quarantineDirectory, {
+        writeIndex: async () => {
+          writeAttempts += 1;
+          throw new Error('模拟索引写入失败：临时文件无法落盘');
+        },
+      });
+      const outcome = await store.restore('q-restore');
+
+      assert.equal(writeAttempts, 1, '还原收尾必须正好尝试写一次索引');
+      assert.equal(outcome.restored, true, '索引写失败不得把已完成的还原报成失败');
+      assert.match(outcome.reason ?? '', /索引更新失败/, '原因必须点明索引更新失败');
+      // 隔离区实体确实回到了原路径，且内容正确
       assert.equal(await fs.readFile(originalPath, 'utf8'), content);
-      // 索引记录仍在（写失败意味着旧索引原封不动）
-      const raw = await fs.readFile(indexFile, 'utf8');
-      const parsed = JSON.parse(raw) as { items: { id: string }[] };
+      // 隔离区里不该再留副本（移动而非复制）
+      await assert.rejects(fs.stat(entry.storedPath), { code: 'ENOENT' }, '还原后隔离区实体必须已移走');
+      // 写失败意味着旧索引原封不动：逐字节相等，而且旧条目仍在
+      assert.equal(await fs.readFile(indexFile, 'utf8'), indexBefore, '索引写入失败时旧索引必须保持原样');
+      const parsed = JSON.parse(indexBefore) as { items: { id: string }[] };
       assert.equal(parsed.items.length, 1);
       assert.equal(parsed.items[0].id, 'q-restore');
+    }));
+
+  await test('T13b 默认写入仍是原子替换：成功的写不留临时文件、内容可解析', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      const source = await put(path.join(dir, 'scan'), 'a.txt', 'atomic-write-check');
+      const store = new QuarantineStore(quarantineDirectory);
+      const stored = await store.store(source, Buffer.byteLength('atomic-write-check'), '');
+
+      const files = await fs.readdir(quarantineDirectory);
+      assert.deepEqual(files.sort(), ['files', 'index.json'], `隔离区索引目录只应有 index.json 与 files，实际：${files.join(',')}`);
+      assert.ok(!files.some((name) => name.includes('.tmp-')), '原子写入完成后不得留下临时文件');
+      const parsed = JSON.parse(await fs.readFile(path.join(quarantineDirectory, 'index.json'), 'utf8')) as { version: number; items: { id: string }[] };
+      assert.equal(parsed.version, 1);
+      assert.deepEqual(parsed.items.map((item) => item.id), [stored.id]);
     }));
 
   await test('T14 隔离区实体文件已丢失：还原如实报失败且索引记录保留', () =>
@@ -2006,15 +2116,18 @@ async function main(): Promise<void> {
       try {
         await fs.symlink(outside, entry.storedPath, 'junction');
       } catch (err) {
-        console.log(`     SKIP T19：本平台无法创建目录联接（${(err as Error).message}）`);
-        return;
+        // 目录联接在 Windows 上不需要管理员权限，但 POSIX 与部分受限环境没有这个类型；
+        // 无法创建就无法构造「实体是越界联接」的现场，只能显式跳过并写明原因。
+        skip(`本平台无法创建目录联接，无法构造越界联接现场（${(err as Error).message}）`);
       }
       await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
 
       const store = new QuarantineStore(quarantineDirectory);
       const outcome = await store.restore('q-junction');
       assert.equal(outcome.restored, false, '联接指向隔离区外时不得还原');
-      assert.ok((outcome.reason ?? '').length > 0, '必须给出拒绝原因');
+      // 断言收紧到具体拒绝原因：只要求"reason 非空"会让任何失败都算通过，
+      // 包括那些根本没走到越界校验的失败。
+      assert.match(outcome.reason ?? '', /越出|非法|不是普通文件/, `必须给出越界/类型拒绝原因，实际：${outcome.reason ?? '（无）'}`);
       // 外部文件仍在原处、内容未变
       assert.equal(await fs.readFile(precious, 'utf8'), 'precious-content');
       // 隔离区外未被创建新东西
@@ -2182,7 +2295,36 @@ async function main(): Promise<void> {
       assert.equal(healed.quarantineError, undefined, '索引恢复正常后必须清空 quarantineError');
     }));
 
-  await test('T26 存放路径是 UNC 网络路径：还原被拒', () =>
+  // UNC 的拒绝路径在 Windows 与 POSIX 上是**两道不同的关卡**：
+  // - Windows：UNC 是绝对路径，能通过索引校验，随后被「网络盘 / UNC」这道关卡拦住；
+  // - POSIX：UNC 字符串不是绝对路径，更早地在索引校验阶段就被判为路径非法。
+  // 早期把两件事塞进一个用例，在本机能通过却说不清到底验证了哪一道，
+  // 换平台后又因为 list() 抛错而失败——因此拆成「纯字符串语义」「Windows 集成」「POSIX 索引层」三段。
+
+  await test('T26a 跨平台纯字符串：UNC / 网络路径的识别口径（不依赖本机平台）', async () => {
+    const BS = String.fromCharCode(92); // 反斜杠：避免在源码里堆叠转义，减少写错的机会
+    const unc = `${BS}${BS}server${BS}share${BS}payload.txt`;
+    const extendedUnc = `${BS}${BS}?${BS}UNC${BS}server${BS}share${BS}payload.txt`;
+    const volumeGuid = `${BS}${BS}?${BS}Volume{0123-4567}${BS}payload.txt`;
+    const forwardUnc = '//server/share/payload.txt';
+    const drivePath = `C:${BS}data${BS}payload.txt`;
+    assert.equal(isNetworkPath(unc), true, 'UNC 必须识别为网络路径');
+    assert.equal(isNetworkPath(extendedUnc), true, '扩展 UNC（问号 + UNC 前缀）必须识别为网络路径');
+    assert.equal(isNetworkPath(forwardUnc), true, '正斜杠写法的网络路径也必须识别（实现先统一分隔符）');
+    assert.equal(isNetworkPath(drivePath), false, '盘符路径是本机路径');
+    assert.equal(isNetworkPath('/tmp/payload.txt'), false, 'POSIX 绝对路径不是网络路径');
+    assert.equal(isNetworkPath('relative/payload.txt'), false, '相对路径不是网络路径');
+    // 卷 GUID 路径以两个反斜杠开头，当前实现按「网络路径」保守处理。
+    // 这一步只会更严：任何 \? 前缀的存放路径本来也过不了「隔离区目录 + id」的布局校验。
+    assert.equal(isNetworkPath(volumeGuid), true, '卷 GUID 路径被保守判为网络路径（只会更严，不会放行）');
+    // 平台差异的证据：同一个 UNC 字符串在 Windows 上是绝对路径，在 POSIX 上不是。
+    // 这正是「POSIX 先在索引校验阶段拒绝」的成因，不是缺陷。
+    assert.equal(path.win32.isAbsolute(unc), true, 'UNC 在 Windows 语义下是绝对路径');
+    assert.equal(path.posix.isAbsolute(unc), false, 'UNC 在 POSIX 语义下不是绝对路径');
+    assert.equal(path.win32.isAbsolute(extendedUnc), true, '扩展 UNC 在 Windows 语义下也是绝对路径');
+  });
+
+  await test('T26b Windows 集成：存放路径是 UNC 网络路径时还原被拒（真实文件系统）', () =>
     withTempDir('dup-q-index-', async (dir) => {
       const quarantineDirectory = path.join(dir, 'quarantine');
       await fs.mkdir(quarantineDirectory, { recursive: true });
@@ -2194,14 +2336,54 @@ async function main(): Promise<void> {
       });
       await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
 
+      const indexBefore = await fs.readFile(path.join(quarantineDirectory, 'index.json'), 'utf8');
+
+      // 这一用例验证的是「真实 Windows 文件系统上的 UNC 关卡」。
+      // POSIX 上根本走不到这一关（更早地在索引校验阶段就被拒），
+      // 因此在别的平台上显式跳过——绝不能让 Linux/macOS 的结果冒充 UNC 文件系统测试。
+      if (process.platform !== 'win32') {
+        skip(`UNC 关卡只在 Windows 上可达；本机 platform=${process.platform} 会在索引校验阶段先拒绝（见 T26c）`);
+      }
+
       const store = new QuarantineStore(quarantineDirectory);
       const outcome = await store.restore('q-unc');
       assert.equal(outcome.restored, false, 'UNC 路径不得被还原');
-      assert.ok((outcome.reason ?? '').length > 0, '必须给出拒绝原因');
-      // 索引记录仍在
+      // 拒绝原因必须指向网络盘这一道关卡，而不是笼统的「失败了」
+      assert.match(outcome.reason ?? '', /网络盘|UNC/, '拒绝原因必须点明网络盘 / UNC');
+      // 索引记录仍在，且逐字节未被改写
       const items = await store.list();
       assert.equal(items.length, 1);
       assert.equal(items[0].id, 'q-unc');
+      assert.equal(await fs.readFile(path.join(quarantineDirectory, 'index.json'), 'utf8'), indexBefore, '被拒的还原不得改写索引');
+    }));
+
+  await test('T26c POSIX：UNC 条目在索引校验阶段被拒，并保持索引完整', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      if (process.platform === 'win32') {
+        skip('Windows 上 UNC 是绝对路径，不会在索引校验阶段被拒；对应平台分支见 T26b');
+      }
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      const outside = path.join(dir, 'outside');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      await fs.mkdir(outside, { recursive: true });
+      const BS = String.fromCharCode(92);
+      const target = path.join(outside, 'restore-me.txt');
+      const entry = fakeQuarantineEntry(quarantineDirectory, target, {
+        id: 'q-unc-posix',
+        storedPath: `${BS}${BS}server${BS}share${BS}payload.txt`,
+      });
+      const indexFile = await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+      const before = await fs.readFile(indexFile, 'utf8');
+      const store = new QuarantineStore(quarantineDirectory);
+      // 索引校验层：UNC 不是 POSIX 绝对路径 → entry-invalid（路径非法）
+      await expectQuarantineError(store.list(), 'entry-invalid', /路径非法/);
+      // 还原入口也必须拒绝，且不得把索引读失败直接抛给调用方
+      const outcome = await store.restore('q-unc-posix');
+      assert.equal(outcome.restored, false, 'UNC 路径不得被还原');
+      assert.match(outcome.reason ?? '', /越出|非法/, `必须给出路径非法的拒绝原因，实际：${outcome.reason ?? '（无）'}`);
+      // 原路径未被写入，索引逐字节未变
+      await assert.rejects(fs.stat(target), { code: 'ENOENT' }, '原路径不得被创建');
+      assert.equal(await fs.readFile(indexFile, 'utf8'), before, '被拒的还原不得改写索引');
     }));
 
   // ------------------------------------------------ 阶段覆盖汇总
@@ -2212,7 +2394,12 @@ async function main(): Promise<void> {
     assert.deepEqual(missing, [], `未观测到的进度阶段：${missing.join(',')}`);
   });
 
-  console.log(`重复文件检测：${passed} 通过，${failed} 失败`);
+  console.log(`重复文件检测：${passed} 通过，${failed} 失败，${skipped} 跳过`);
+  if (skipped) {
+    // 跳过必须逐条列出原因：只报数字等于把「没验证」藏起来。
+    console.log('跳过明细：');
+    for (const entry of skipReasons) console.log(`  - ${entry}`);
+  }
   if (failed) process.exitCode = 1;
 }
 

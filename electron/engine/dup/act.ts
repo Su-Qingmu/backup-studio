@@ -86,10 +86,38 @@ export interface QuarantineEntry {
   createdAt: number;
 }
 
-interface QuarantineFile {
+export interface QuarantineFile {
   version: 1;
   updatedAt: number;
   items: QuarantineEntry[];
+}
+
+/**
+ * 隔离区索引写入依赖（最小接缝）。
+ *
+ * 存在的唯一理由：让"索引写入失败"可以被**确定性地**触发。
+ * 早期测试用 `chmod(indexFile, 0o444)` 模拟写失败，依赖操作系统权限语义——
+ * POSIX 上 root 用户与部分文件系统下写只读文件仍会成功，
+ * 而 Windows 的只读位只拦截覆盖、不拦截改名替换，于是同一用例在不同平台
+ * 时而通过时而失败，甚至根本没走到"写失败"分支却被算成通过。
+ *
+ * 注入的是**写入动作**，不是"允许跳过写入"：默认实现仍然是 `writeJsonAtomic`，
+ * 生产路径永远走原子替换；测试实现只被允许"抛错"或"调用默认实现"，
+ * 不得把写入降级成非原子的 `writeFile`。
+ */
+export type QuarantineIndexWriter = (file: string, value: QuarantineFile) => Promise<void>;
+
+/** 生产实现：原子替换写（临时文件 + rename），与索引其它写入点同一口径 */
+export const atomicQuarantineIndexWriter: QuarantineIndexWriter = (file, value) => writeJsonAtomic(file, value);
+
+export interface QuarantineStoreOptions {
+  /**
+   * 覆盖索引写入动作。仅用于测试注入故障；不传则使用 `atomicQuarantineIndexWriter`。
+   *
+   * 只注入这一个依赖：隔离区其它行为（移动、校验、授权）都直接依赖真实文件系统，
+   * 抽象成"存储框架"既没有第二个实现，也会把安全校验藏进抽象层。
+   */
+  writeIndex?: QuarantineIndexWriter;
 }
 
 function errorText(err: unknown): string {
@@ -222,7 +250,11 @@ async function moveFile(source: string, destination: string, overwrite = false):
  * 记录原路径映射，随时可还原；只写本机。
  */
 export class QuarantineStore {
-  constructor(readonly directory: string) {}
+  private readonly writeIndex: QuarantineIndexWriter;
+
+  constructor(readonly directory: string, options: QuarantineStoreOptions = {}) {
+    this.writeIndex = options.writeIndex ?? atomicQuarantineIndexWriter;
+  }
 
   private get file(): string {
     return path.join(this.directory, 'index.json');
@@ -328,7 +360,7 @@ export class QuarantineStore {
   }
 
   private async write(items: QuarantineEntry[]): Promise<void> {
-    await writeJsonAtomic(this.file, { version: 1, updatedAt: Date.now(), items } satisfies QuarantineFile);
+    await this.writeIndex(this.file, { version: 1, updatedAt: Date.now(), items });
   }
 
   /**
