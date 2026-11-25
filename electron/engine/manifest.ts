@@ -132,3 +132,29 @@ export async function readManifest(targetRoot: string): Promise<Manifest | null>
 export async function writeManifest(targetRoot: string, manifest: Manifest): Promise<void> {
   await writeJsonAtomic(manifestPath(targetRoot), manifest);
 }
+
+/**
+ * 严格识别「某个目录是不是一份备份」。
+ *
+ * readManifest 只校验 version 与 files 的形状：用户自己放一个
+ * `{"version":1,"files":{}}` 也能蒙混过关。若拿它当「源端是备份」的判据，
+ * 用户的真实数据会被整棵排除在备份之外，任务却仍报完成。
+ *
+ * 引擎写出的清单一定带 sourceRoot 与 updatedAt，凑巧的 JSON 没有——
+ * 这里据此加严判定。
+ */
+export async function readStrictManifest(root: string): Promise<Manifest | null> {
+  try {
+    const raw = await fs.readFile(manifestPath(root), 'utf8');
+    const parsed = JSON.parse(raw) as Partial<Manifest>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (parsed.version !== 1) return null;
+    const files = parsed.files as unknown;
+    if (!files || typeof files !== 'object' || Array.isArray(files)) return null;
+    if (typeof parsed.sourceRoot !== 'string' || !parsed.sourceRoot) return null;
+    if (typeof parsed.updatedAt !== 'number' || !Number.isFinite(parsed.updatedAt)) return null;
+    return parsed as Manifest;
+  } catch {
+    return null;
+  }
+}

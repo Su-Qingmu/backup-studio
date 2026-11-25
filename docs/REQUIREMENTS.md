@@ -53,6 +53,8 @@ Backup Studio 是一个**高性能本地目录备份工具**。核心命题是�
 | 分片命名 | `.part` 临时文件名后缀改用相对路径 SHA-256 前 24 位十六进制（96 bit），消除大批量文件下的命名碰撞 | `electron/engine/journal.ts` |
 | 目录边界校验 | 源目录与目标目录同路径、或互为父子嵌套时直接拒绝，防止递归备份与镜像删除互相冲突 | `electron/engine/service.ts` |
 | 空目录与源端元数据目录 | 源端新增空目录同步到目标端；源端同名 `.backup-studio` 用户目录**不再被跳过**（仅目标端排除元数据目录） | `electron/engine/planner.ts`、`electron/engine/scan.ts` |
+| 引擎保留路径 | 目标端 `.backup-studio` 下的 `parts/`、`history/`、`history-index/`、`recycle/`、`aut-history/`、`aut-recycle/`、`manifest.json`、`journal-mirror.json` 是引擎私有状态。源端出现同名路径时**在写入前阻断**（不复制、不覆盖、不删除），且目标端不被写入任何内容；源端整体是一份备份时（严格识别引擎清单：`version=1` + `files` + `sourceRoot` + `updatedAt`），其引擎状态不重复备份，同名目录里的其它文件照常备份 | `electron/engine/reserved.ts`、`electron/engine/manifest.ts`、`electron/engine/service.ts` |
+| 提交期回读 | 报「完成」之前，清理阶段之后必须逐个复核已登记文件：存在性与大小一致；本次写入的文件再做 SHA-256 回读（对照登记的源端哈希）。任一不符即判失败，绝不带着假清单报完成 | `electron/engine/verify.ts`、`electron/engine/service.ts` |
 | 复制线程自愈 | worker `error` / 异常退出时终止旧线程、回调当前任务失败并重建槽位，避免池任务永久挂起 | `electron/engine/pool.ts` |
 | 多线程复制 | `worker_threads` 池，线程数 `max(2, min(8, cpus-1))`；先写 `.part` 临时件再 `rename` 原子落盘 | `electron/engine/pool.ts`、`electron/engine/copyWorker.ts` |
 | 完整性校验 | 落盘后 `fsync` → 回读整份文件重算 SHA-256 比对；校验失败返回 `VERIFY_FAILED` 并**保留临时件**，不再整份重传 | `electron/engine/copyWorker.ts` |
