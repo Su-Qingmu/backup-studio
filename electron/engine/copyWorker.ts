@@ -74,20 +74,29 @@ async function readRange(handle: FileHandle, buf: Buffer, length: number, offset
   return filled;
 }
 
+/**
+ * 暂存件是不是还有别的硬链接。
+ *
+ * 有别的硬链接，说明上一次提交已经把同一份内容发布到目标路径，只是没
+ * 来得及删掉暂存件。这种暂存件既不能续写、也不能截断重写：两者都会
+ * 连带改掉已经发布的目标文件。
+ */
+async function isAliasedPart(partPath: string): Promise<boolean> {
+  try {
+    return (await fs.lstat(partPath)).nlink > 1;
+  } catch {
+    return false;
+  }
+}
+
 async function openPart(partPath: string, resume: boolean): Promise<FileHandle> {
+  if (await isAliasedPart(partPath)) {
+    await fs.unlink(partPath).catch(() => undefined);
+    return fs.open(partPath, 'wx+');
+  }
   if (!resume) return fs.open(partPath, 'w+');
   try {
-    const handle = await fs.open(partPath, 'r+');
-    const stat = await handle.stat();
-    if (stat.nlink > 1) {
-      // 暂存件还有别的硬链接：上一次提交已经把同一份内容发布到目标路径，
-      // 只是没来得及删掉暂存件。继续往这里写会连带改掉已发布的目标文件，
-      // 把「已备份好的内容」写成半截。
-      await handle.close();
-      await fs.unlink(partPath);
-      return fs.open(partPath, 'wx+');
-    }
-    return handle;
+    return await fs.open(partPath, 'r+');
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     return fs.open(partPath, 'wx+');

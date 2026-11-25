@@ -1,5 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
+import { promises as fs } from 'node:fs';
 import { hashFilesDetailed } from './hash';
 import type { ScannedFile, ScannedTree } from './scan';
 import type { Manifest, ManifestEntry } from './manifest';
@@ -46,6 +47,22 @@ export const MAX_PREVIEW_ACTIONS = 20000;
 
 const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin';
 
+/**
+ * 目标端这两个只差大小写的路径是不是同一个实体。
+ *
+ * 只读探测：用 realpath 取磁盘上的真实路径。同一个实体在两种大小写写法下
+ * 解析到同一条真实路径；大小写敏感的目标卷上，另一种写法要么根本不存在
+ * （ENOENT），要么就是另一个文件（真实路径不同）。
+ */
+async function sameTargetEntity(a: string, b: string): Promise<boolean> {
+  try {
+    const [ra, rb] = await Promise.all([fs.realpath(a), fs.realpath(b)]);
+    return ra === rb;
+  } catch {
+    return false;
+  }
+}
+
 function hashConcurrency(): number {
   return Math.max(2, Math.min(8, os.cpus().length - 1));
 }
@@ -88,13 +105,13 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
   const sameSize: { src: ScannedFile; dst: ScannedFile }[] = [];
   const sizeChanged: { src: ScannedFile; dst: ScannedFile }[] = [];
 
-  // 大小写不敏感的文件系统上，"Report.txt" 与 "report.txt" 是同一个文件。
-  // 目标端存在仅大小写不同的同名文件时，源端这一项**不是**新增：
-  // 它在文件系统意义上就落在目标端那个位置上。按新增规划会让执行期的
-  // 新增提交撞上已占用的目标（要么报错、要么覆盖用户内容）。
-  const dstLowerMap = CASE_INSENSITIVE_FS
-    ? new Map([...dstFiles.keys()].map((k) => [k.toLowerCase(), k]))
-    : null;
+  // 目标端存在仅大小写不同的同名文件时，源端这一项**可能**不是新增：
+  // 在大小写不敏感的目标卷上，它在文件系统意义上就落在目标端那个位置上。
+  // 按新增规划会让执行期的新增提交撞上已占用的目标（要么报错、要么覆盖
+  // 用户内容）。但「是否同一个实体」必须以**目标卷**的实际表现为准——
+  // 宿主操作系统的大小写敏感度当不了代理：NTFS 可以按目录开启大小写敏感，
+  // macOS 上也能挂大小写敏感的 APFS 卷。
+  const dstLowerMap = new Map([...dstFiles.keys()].map((k) => [k.toLowerCase(), k]));
 
   // ---- 第一轮：零 I/O 的元数据快判 ----
   report('分类', 0, srcFiles.size);
@@ -239,10 +256,12 @@ export async function buildPlan(input: PlanInput): Promise<PlanResult> {
         continue;
       }
     }
-    // 目标端存在仅大小写不同的同名文件：规划期就认出来，按「更新」处理。
-    // 这类文件不是「目标不存在」的新增，按更新走覆盖语义才是对的。
-    const aliasKey = dstLowerMap?.get(src.relPath.toLowerCase());
-    if (aliasKey && aliasKey !== src.relPath) {
+    // 目标端存在仅大小写不同的同名文件：确认它们在目标卷上确实是同一个
+    // 实体时，才按「更新」处理。确认不了就按「新增」走——新增提交不覆盖
+    // 任何已存在的文件，这比误判成更新安全得多。
+    const aliasKey = dstLowerMap.get(src.relPath.toLowerCase());
+    if (aliasKey && aliasKey !== src.relPath
+        && await sameTargetEntity(path.join(targetRoot, src.relPath), path.join(targetRoot, aliasKey))) {
       update++;
       bytes += src.size;
       actions.push({

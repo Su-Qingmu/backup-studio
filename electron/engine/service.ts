@@ -1564,13 +1564,28 @@ export class BackupService extends EventEmitter {
       // 独占复制不是原子发布：内容是边拷边落的，落盘之前目标路径上
       // 已经是一份可能不完整的数据。必须落盘并回读校验，否则「已发布」
       // 可能只是一份没写完的内容。
+      //
+      // 回读用**句柄**：句柄绑定的是实体而不是路径——按路径重新打开读到的
+      // 可能是替换之后的新版本，那份内容从未被归档，删掉它等于丢数据。
       const handle = await fs.open(destPath, 'r+');
-      try { await handle.sync(); } finally { await handle.close(); }
+      try {
+        await handle.sync();
+        if (expectedHash && await hashOpenHandle(handle) !== expectedHash) {
+          // 只撤销自己写的那一份：路径可能已经被别人换掉了。
+          const mine = await handle.stat().catch(() => undefined);
+          const current = await fs.stat(destPath).catch(() => undefined);
+          const ours = Boolean(mine && current && mine.ino !== 0
+            && mine.dev === current.dev && mine.ino === current.ino);
+          if (ours) await fs.unlink(destPath).catch(() => undefined);
+          throw Object.assign(
+            new Error(ours
+              ? '提交内容校验失败，已撤销未完成的目标文件'
+              : '提交内容校验失败，目标文件已被外部替换，未做删除'),
+            { code: 'VERIFY_FAILED' },
+          );
+        }
+      } finally { await handle.close(); }
       await syncDirectory(path.dirname(destPath));
-      if (expectedHash && await hashFile(destPath) !== expectedHash) {
-        await fs.unlink(destPath).catch(() => undefined);
-        throw Object.assign(new Error('提交内容校验失败，已撤销未完成的目标文件'), { code: 'VERIFY_FAILED' });
-      }
       return false;
     }
   }
