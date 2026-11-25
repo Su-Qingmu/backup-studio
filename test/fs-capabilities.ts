@@ -73,7 +73,11 @@ async function withProbeDir<T>(base: string, tag: string, fn: (dir: string) => P
   try {
     return await fn(dir);
   } finally {
-    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    // 探测目录清理失败必须可追踪：残留目录会被下一轮清理命令当成「状态不明」保护起来，
+    // 悄悄吞掉只会让 temp/ 一轮轮攒垃圾，却没人知道是哪里漏的。
+    await fs.rm(dir, { recursive: true, force: true }).catch((err) => {
+      console.warn(`[fs-capabilities] 探测目录清理失败，目录已保留：${dir}（${err instanceof Error ? err.message : String(err)}）`);
+    });
   }
 }
 
@@ -192,7 +196,11 @@ async function probeChmod(base: string): Promise<CapabilityVerdict> {
         }
         return verdict('unknown', `chmod 0444 后写入失败但错误码不是 EACCES/EPERM（${code ?? '无'}）`, err);
       } finally {
-        await fs.chmod(file, 0o666).catch(() => undefined);
+        // 还原权限失败必须报出来：否则探测目录会被永久留在只读状态，
+        // 后续清理命令删不掉它，而现场却没有任何提示。
+        await fs.chmod(file, 0o666).catch((err) => {
+          console.warn(`[fs-capabilities] 还原文件权限失败，文件可能残留只读：${file}（${err instanceof Error ? err.message : String(err)}）`);
+        });
       }
       return verdict('unsupported', 'chmod 0444 后仍然写成功（权限未生效，如 root 或只读位语义不同）');
     });
@@ -267,7 +275,10 @@ export async function probeFsCapabilities(base?: string): Promise<FsCapabilities
       inodeIdentity,
     };
   } finally {
-    await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
+    // 探测根目录清理失败必须可追踪（见 withProbeDir 的说明）
+    await fs.rm(root, { recursive: true, force: true }).catch((err) => {
+      console.warn(`[fs-capabilities] 探测根目录清理失败，目录已保留：${root}（${err instanceof Error ? err.message : String(err)}）`);
+    });
   }
 }
 

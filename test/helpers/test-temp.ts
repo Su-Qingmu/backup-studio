@@ -232,6 +232,11 @@ export async function markResult(
   detail?: { reason?: string; reasonDetail?: string },
 ): Promise<void> {
   const existing = await readMarker(dir);
+  // 失败原因：显式传入优先；否则保留既有的。
+  // 早先这里无条件写 detail?.reason，一次无关的状态更新（例如把 failed 改成
+  // incomplete）就会把失败原因抹掉——现场还在，但「为什么失败」丢了。
+  // 例外：转入 passed 时原因不再成立，必须清掉。
+  const keepReason = state !== 'passed';
   const marker: TempMarker = {
     state,
     label: existing?.label ?? path.basename(dir),
@@ -239,10 +244,40 @@ export async function markResult(
     createdAt: existing?.createdAt ?? new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     pid: process.pid,
-    reason: detail?.reason,
-    reasonDetail: detail?.reasonDetail,
+    reason: detail?.reason ?? (keepReason ? existing?.reason : undefined),
+    reasonDetail: detail?.reasonDetail ?? (keepReason ? existing?.reasonDetail : undefined),
   };
   await writeMarker(dir, marker);
+}
+
+/**
+ * 删除实现。
+ *
+ * 默认用真实的 `fs.rm`；测试可以注入一个**确定失败**的实现，
+ * 用来验证「删除失败 → 标记 cleanup-pending」这条契约。
+ *
+ * 为什么需要注入：`fs.rm(..., { force: true })` 对**不存在的路径**不会报错
+ * （ENOENT 被 force 吞掉），对「被占用的文件」的失败则依赖操作系统行为，
+ * 既不确定也不跨平台。靠 chmod / 文件占用制造失败，测试就会变成偶发失败。
+ */
+export type TempDeleter = (dir: string) => Promise<void>;
+
+/** 默认删除实现：真实 `fs.rm` */
+export const defaultTempDeleter: TempDeleter = async (dir: string) => {
+  await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+};
+
+export interface RemoveCaseDirResult {
+  /** 目录是否已删除 */
+  removed: boolean;
+  /** 删除失败的错误信息 */
+  error?: string;
+  /**
+   * 状态标记写入失败——目录状态**没有被正确登记**。
+   *
+   * 非空意味着现场仍在，但清理命令不会按 `cleanup-pending` 处理它。
+   */
+  markerError?: string;
 }
 
 /**
@@ -250,17 +285,32 @@ export async function markResult(
  *
  * 失败时**不吞掉**：标记成 `cleanup-pending` 并把错误返回给调用方。
  * 静默吞掉会让「测试跑过了但现场还在」这件事没人知道。
+ *
+ * 连标记本身写不进去的情况也必须报出来：标记写失败意味着现场没有正确登记，
+ * 此时不能假装「状态已经是 cleanup-pending」。
  */
-export async function removeCaseDir(dir: string): Promise<{ removed: boolean; error?: string }> {
+export async function removeCaseDir(
+  dir: string,
+  deleter: TempDeleter = defaultTempDeleter,
+): Promise<RemoveCaseDirResult> {
   try {
-    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    await deleter(dir);
     return { removed: true };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await markResult(dir, 'cleanup-pending', {
-      reason: '清理失败',
-      reasonDetail: `临时目录删除失败：${message}`,
-    }).catch(() => undefined);
+    try {
+      await markResult(dir, 'cleanup-pending', {
+        reason: '清理失败',
+        reasonDetail: `临时目录删除失败：${message}`,
+      });
+    } catch (markerErr) {
+      const markerMessage = markerErr instanceof Error ? markerErr.message : String(markerErr);
+      console.error(
+        `[test-temp] 删除失败且状态标记写入失败，目录状态未登记为 cleanup-pending：${dir}` +
+        `（删除错误：${message}；标记错误：${markerMessage}）`,
+      );
+      return { removed: false, error: message, markerError: markerMessage };
+    }
     return { removed: false, error: message };
   }
 }
@@ -289,12 +339,12 @@ export async function runCase<T>(suite: string, label: string, fn: () => Promise
     const value = await caseStore.run({ dir, suite, label }, fn);
     const cleanup = await removeCaseDir(dir);
     if (!cleanup.removed) {
-      // 用例本身通过了，但目录没删掉：标记成 cleanup-pending 供后续回收
-      await markResult(dir, 'cleanup-pending', {
-        reason: '清理失败',
-        reasonDetail: `用例已通过但临时目录删除失败：${cleanup.error}`,
-      }).catch(() => undefined);
-      console.warn(`[test-temp] 临时目录清理失败，已标记 cleanup-pending：${dir}（${cleanup.error}）`);
+      // 用例本身通过了，但目录没删掉。
+      // removeCaseDir 内部已经标记过 cleanup-pending；这里只做如实汇报。
+      const suffix = cleanup.markerError
+        ? `；状态标记写入失败，目录状态未登记：${cleanup.markerError}`
+        : '，已标记 cleanup-pending';
+      console.warn(`[test-temp] 临时目录清理失败：${dir}（${cleanup.error}${suffix}）`);
     }
     return value;
   } catch (err) {
@@ -303,17 +353,28 @@ export async function runCase<T>(suite: string, label: string, fn: () => Promise
     if (isSkipSignal(err)) {
       const cleanup = await removeCaseDir(dir);
       if (!cleanup.removed) {
-        console.warn(`[test-temp] 跳过用例的临时目录清理失败，已标记 cleanup-pending：${dir}（${cleanup.error}）`);
+        const suffix = cleanup.markerError
+          ? `；状态标记写入失败，目录状态未登记：${cleanup.markerError}`
+          : '，已标记 cleanup-pending';
+        console.warn(`[test-temp] 跳过用例的临时目录清理失败：${dir}（${cleanup.error}${suffix}）`);
       }
       throw err;
     }
     // 失败：完整保留现场（源、目标、journal、索引、中间件都在里面）
     const message = err instanceof Error ? err.message : String(err);
-    await markResult(dir, 'failed', {
-      reason: message.split('\n')[0],
-      reasonDetail: message,
-    }).catch(() => undefined);
     const wrapped = err instanceof Error ? err : new Error(String(err));
+    try {
+      await markResult(dir, 'failed', {
+        reason: message.split('\n')[0],
+        reasonDetail: message,
+      });
+    } catch (markerErr) {
+      // 标记写不进去 = 现场没有正确登记为 failed。
+      // 这时绝不能假装登记成功：必须显式报出来，并把路径写进异常信息。
+      const markerMessage = markerErr instanceof Error ? markerErr.message : String(markerErr);
+      console.error(`[test-temp] 失败现场的状态标记写入失败，目录未被登记为 failed：${dir}（${markerMessage}）`);
+      wrapped.message += `\n[失败现场状态标记写入失败] ${dir}：${markerMessage}`;
+    }
     wrapped.message = `${wrapped.message}\n[失败现场已保留] ${dir}`;
     throw wrapped;
   }
