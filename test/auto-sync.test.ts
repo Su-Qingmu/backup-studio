@@ -231,6 +231,10 @@ async function main() {
     const aaaaHash = sha256('AAAA');
     const objectFile = path.join(objects, aaaaHash);
     assert.ok((await fs.readdir(objects)).includes(aaaaHash), '归档对象按内容哈希命名');
+    // 打一个哨兵时间戳：复制会保留源文件的 mtime，靠自然时间戳区分不出
+    // 「复用」与「重写」，哨兵可以。
+    const sentinel = new Date('2020-01-01T00:00:00Z');
+    await fs.utimes(objectFile, sentinel, sentinel);
     const before = await fs.stat(objectFile);
 
     // 再同步一次：备份端那份 AAAA 又要归档一次。对象库里已有内容完好的

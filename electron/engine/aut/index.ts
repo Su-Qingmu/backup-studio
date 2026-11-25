@@ -572,11 +572,6 @@ export class AutoSync implements AutoSyncApi {
     const source = entry.hash ? ledger.objectPath(entry.hash) : await recyclePath(st.pair, entry.id);
     const stat = await statMaybe(source);
     if (!stat?.isFile() || stat.size !== entry.size) throw new Error('回收项内容已不可用');
-    // 核对来源内容：对象可能事后损坏。发布前的校验是权威判据，
-    // 这里提前核对是为了不把一份损坏内容拷进目标再报错。
-    if (entry.hash && await hashFile(source) !== entry.hash) {
-      throw fault('CONFLICT', '回收项内容与登记哈希不符，已保留现有目标与历史证据');
-    }
     const dest = await safePath(st.pair.targetRoot, entry.relPath);
     // 发布前核对：复制所得字节必须与所选版本的登记哈希一致。
     // 临时件回读只能证明「复制忠实于当前对象」——对象本身损坏时它照样通过，
@@ -588,6 +583,11 @@ export class AutoSync implements AutoSyncApi {
       if (await statMaybe(dest)) throw new Error('备份端已有同名项，未覆盖');
     };
     await verifyDest();
+    // 来源内容核对放在目标占用检查之后：目标已被占用时这次还原根本发不出去，
+    // 不必先把整个对象读一遍。发布前的校验仍是权威判据。
+    if (entry.hash && await hashFile(source) !== entry.hash) {
+      throw fault('CONFLICT', '回收项内容与登记哈希不符，已保留现有目标与历史证据');
+    }
     await gate(); await fs.mkdir(path.dirname(dest), { recursive: true });
     const part = await safePath(st.pair.targetRoot, path.posix.join(path.posix.dirname(entry.relPath), `.aut-part-restore-${entry.id}`));
     const hash = await copyAtomic(source, dest, part, 0, gate, verifyDest, true);
@@ -613,7 +613,11 @@ export class AutoSync implements AutoSyncApi {
     // 内容来源：优先介质对象库；现存文件内容一致时也可用。
     let source: string | undefined;
     const object = version.hash ? ledger.objectPath(version.hash) : undefined;
-    if (object && await statMaybe(object)) {
+    const objectStat = object ? await statMaybe(object) : undefined;
+    if (object && objectStat) {
+      // 对象必须是普通文件：FIFO 之类的特殊文件不能直接开读流
+      // （没有写端会把整条操作队列卡住），符号链接也不跟随。
+      if (!objectStat.isFile()) throw fault('CONFLICT', '历史对象条目类型异常');
       // 对象可能事后损坏。必须在归档当前内容**之前**核对：
       // 先归档再发现不符，会留下一条没有对应提交的版本记录，
       // 回收站视图会把它当成可撤回项，重试一次就多一条。
