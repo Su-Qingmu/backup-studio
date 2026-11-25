@@ -216,6 +216,33 @@ async function main() {
     assert.equal(await get(input.targetRoot, 'report.txt'), 'AAAA', '还原出的是完好内容');
   }));
 
+  await test('既有历史对象内容完好时复用而不重写（去重仍然生效）', () => fixture({ syncDeletes: true }, async (aut, input) => {
+    await put(input.sourceRoot, 'report.txt', 'AAAA');
+    for (const name of ['k1', 'k2', 'k3']) await put(input.sourceRoot, name, name);
+    const id = await enable(aut, input); await idle(aut, id);
+    await put(input.sourceRoot, 'report.txt', 'BBBB');
+    await aut.resume(id); await idle(aut, id);
+    await put(input.sourceRoot, 'report.txt', 'CCCC');
+    await aut.resume(id); await idle(aut, id);
+    await put(input.sourceRoot, 'report.txt', 'AAAA');
+    await aut.resume(id); await idle(aut, id);
+
+    const objects = path.join(input.targetRoot, '.backup-studio', 'aut-history', id, 'objects');
+    const aaaaHash = sha256('AAAA');
+    const objectFile = path.join(objects, aaaaHash);
+    assert.ok((await fs.readdir(objects)).includes(aaaaHash), '归档对象按内容哈希命名');
+    const before = await fs.stat(objectFile);
+
+    // 再同步一次：备份端那份 AAAA 又要归档一次。对象库里已有内容完好的
+    // 同名对象时必须直接复用，不得重写——否则内容寻址的去重就白做了。
+    await put(input.sourceRoot, 'report.txt', 'BBBB');
+    await aut.resume(id); await idle(aut, id);
+
+    const after = await fs.stat(objectFile);
+    assert.equal(after.mtimeMs, before.mtimeMs, '内容完好的既有对象必须复用，不得重写');
+    assert.equal(await fs.readFile(objectFile, 'utf8'), 'AAAA', '复用后对象内容不变');
+  }));
+
   await test('历史版本撤回时对象已损坏：报错且目标不被写坏', () => fixture({}, async (aut, input) => {
     await put(input.sourceRoot, 'file', 'AAAA');
     const id = await enable(aut, input); await idle(aut, id);
@@ -231,9 +258,14 @@ async function main() {
     const history = await aut.history(id);
     const archived = history.versions.find(v => v.relPath === 'file' && v.kind === 'replace' && v.hash === aaaaHash);
     assert.ok(archived, '存在归档的 AAAA 版本');
+    const versionsBefore = history.versions.length;
     await assert.rejects(aut.restoreVersion(id, archived.id), /登记哈希/);
     // 目标不得被写坏：仍是最后一次同步进去的内容。
     assert.equal(await get(input.targetRoot, 'file'), 'CCCC');
+    // 被拒的撤回不得留下孤儿版本记录：否则回收站视图会多出一条可撤回项，
+    // 反复重试就会越积越多。
+    const after = await aut.history(id);
+    assert.equal(after.versions.length, versionsBefore, '被拒的撤回不得留下额外的版本记录');
     // 历史证据保留：损坏对象既没被改写，也没被删掉。
     assert.equal(await fs.readFile(path.join(objects, aaaaHash), 'utf8'), 'AXAA');
   }));

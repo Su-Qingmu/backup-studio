@@ -126,7 +126,7 @@ export class PairLedger {
       if (!existing.isFile()) throw fault('CONFLICT', '历史对象库条目类型异常');
       // 内容与文件名一致：正常去重，直接复用。
       if (await hashFile(dest) === hash) return false;
-      await this.repairObject(hash, src, dest, gate);
+      await this.repairObject(hash, src, gate);
       return true;
     }
     const dir = await safePath(this.pair.targetRoot, `.backup-studio/aut-history/${this.pair.id}/objects`);
@@ -145,11 +145,19 @@ export class PairLedger {
    * 源文件是调用方即将删除/替换的那一份完好内容，哈希由它算出，
    * 因此修复后对象的内容必然与对象名一致。修复不成时抛错：
    * 调用方据此中止同步，备份目录里的完好文件不会被删掉。
+   *
+   * 修复同样是写操作，路径闸门不能省：对象目录被换成符号链接或联接时，
+   * 不受控的暂存与改名会把内容写到备份根之外。暂存与发布之间目录仍可能
+   * 被换掉，所以发布前再核一次。
    */
-  private async repairObject(hash: string, src: string, dest: string, gate: Gate): Promise<void> {
-    const part = path.join(path.dirname(dest), `.aut-part-${hash}`);
+  private async repairObject(hash: string, src: string, gate: Gate): Promise<void> {
+    const rel = `.backup-studio/aut-history/${this.pair.id}/objects`;
+    const dir = await safePath(this.pair.targetRoot, rel);
+    const dest = path.join(dir, hash);
+    const part = path.join(dir, `.aut-part-${hash}`);
     await copyAtomic(src, dest, part, 0, gate, async computed => {
       if (computed !== hash) throw fault('CONFLICT', '内容与历史哈希不一致');
+      await safePath(this.pair.targetRoot, rel);
     });
     if (await hashFile(dest) !== hash) throw fault('CONFLICT', '历史对象修复后校验失败');
   }
