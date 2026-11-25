@@ -272,6 +272,8 @@ export interface RemoveCaseDirResult {
   removed: boolean;
   /** 删除失败的错误信息 */
   error?: string;
+  /** 删除失败的错误码（如 EBUSY / EPERM），便于调用方按码判断 */
+  code?: string;
   /**
    * 状态标记写入失败——目录状态**没有被正确登记**。
    *
@@ -298,6 +300,7 @@ export async function removeCaseDir(
     return { removed: true };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    const code = (err as { code?: string } | undefined)?.code;
     try {
       await markResult(dir, 'cleanup-pending', {
         reason: '清理失败',
@@ -309,9 +312,9 @@ export async function removeCaseDir(
         `[test-temp] 删除失败且状态标记写入失败，目录状态未登记为 cleanup-pending：${dir}` +
         `（删除错误：${message}；标记错误：${markerMessage}）`,
       );
-      return { removed: false, error: message, markerError: markerMessage };
+      return { removed: false, error: message, code, markerError: markerMessage };
     }
-    return { removed: false, error: message };
+    return { removed: false, error: message, code };
   }
 }
 

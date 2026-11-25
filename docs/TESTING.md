@@ -60,7 +60,7 @@ backup-studio/
 | `runCase(suite, label, fn)` | 执行用例：**成功删除目录，失败保留并把路径写进错误信息** |
 | `markResult(dir, state, detail)` | 写目录状态标记 |
 | `readMarker(dir)` | 读状态标记（损坏/缺失返回 `null`） |
-| `removeCaseDir(dir)` | 删除目录；失败时标记 `cleanup-pending` 并返回错误（不静默吞掉） |
+| `removeCaseDir(dir, deleter?)` | 删除目录；失败时标记 `cleanup-pending` 并返回错误（不静默吞掉）。`deleter` 可注入——测试用它确定性地制造删除失败 |
 | `managedTempRoot()` | 当前进程是否已被统一启动器接管 |
 
 ### 在自制包装器里用
@@ -119,6 +119,11 @@ node:test 的 after 钩子无条件执行，断言失败后现场也会被删掉
 - **进程异常退出**（超时、被中断、机器重启）无法保证清理，允许留下目录；
   这类目录状态为 `incomplete`，**不会被自动删除**。
 - 清理失败（文件被占用等）标记为 `cleanup-pending`，由清理命令重试，**不静默吞掉**。
+- **状态标记写不进去也要报出来**：标记写失败意味着现场没有正确登记，
+  此时不能假装「状态已经是 cleanup-pending」——`removeCaseDir()` 的返回值里
+  有专门的 `markerError` 字段，调用方必须把它显示出来。
+- **失败原因不会被无关的状态更新抹掉**：`markResult()` 在未显式传入 reason 时保留既有原因；
+  只有转入 `passed` 时才清空（通过的原因不再成立）。
 - **显式跳过不是失败**：各测试文件里的 `TestSkip`（`error.name === 'TestSkip'`）表示
   「本环境不适用该用例」，此时**没有失败现场要保留**，目录按「已通过」处置并删除，
   异常原样抛回给调用方的跳过分支。否则每个按平台跳过的用例都会永久留下一个 `failed` 目录，
@@ -170,6 +175,46 @@ Node 各平台读取临时目录环境变量的优先级不同：
 Windows 上 `tsx`、`npx` 是 `.cmd` 脚本，`spawn` 不带 shell 时会 `EINVAL` / `ENOENT`。
 用 `node` 就没有这个问题，也不依赖 shell 语法。
 
+## 清理器的安全边界（M7.2）
+
+清理命令会**递归删除**目录，所以「这个目录属于本仓库的测试临时数据」必须是**能证明**的，
+不能靠路径长得像就算数。`test/helpers/clean-temp.ts` 有五道防线：
+
+| # | 防线 | 作用 |
+| --- | --- | --- |
+| 0 | **边界锚点校验** | `temp/` 与 `temp/test-runs/` 都必须是普通目录，真实路径必须逐层落在仓库根与 `temp/` 之内；否则**拒绝执行** |
+| 1 | 入口用 `lstat()` | 符号链接与 Windows Junction 一律识别为重解析点，**不递归进入、不删除** |
+| 2 | 真实路径边界校验 | 每个候选用 `fs.realpath()` 解析后必须落在 `temp/test-runs/` 的真实路径范围内 |
+| 3 | 子树重解析点扫描 | 候选目录**内部**若含链接 / Junction / 其它重解析点，整个候选受保护 |
+| 4 | 删除前二次校验 | `fs.rm` 之前再解析真实路径 + 复核类型 |
+| 5 | 身份比对（TOCTOU） | 扫描时记录 dev/ino，删除前比对，不一致说明条目被换过 → 拒绝删除；身份缺失或 inode 不可用时 **fail-closed** |
+
+第 0 道最容易被漏掉：后面几道防线全都相对「扫描根的真实路径」成立，
+如果扫描根本身是指向仓库外的 Junction，**边界锚点会整体外移**，
+`--all` 下无标记目录会被判定为可删并递归删除外部内容。
+所以必须先证明「仓库根 → temp/ → temp/test-runs/」每一层都是仓库内的真实目录。
+
+**第 3 道为什么存在**：Node 的 `fs.rm(..., { recursive: true })` 对链接的处理是内部实现细节，
+不同 Node / libuv 版本可能不同（Windows 上 `unlink` 对 Junction 返 `EPERM` 后存在回退到
+跟随型 stat 再下钻的分支）。安全边界不能建在「当前 Node 版本的内部实现恰好是安全的」上，
+所以由扫描逻辑自己挡住。本机实测（Node v24.18.0 / libuv 1.52.1）`fs.rm` 不跟随 Junction，
+但这不作为安全保证的依据。
+
+**Windows 全部类型的重解析点**：Node 的 `lstat` 只把 symlink 与 Junction 报成链接，
+挂载点、云端占位符等其它重解析点会被当成普通文件。清理器额外用
+`FILE_ATTRIBUTE_REPARSE_POINT` 查一遍（固定脚本 + 路径走 stdin JSON，
+与 `electron/engine/reveal-authority.ts` 同一套做法）。
+
+**flag 不能豁免边界**：`--failed` / `--all` 只影响**状态分类**（failed / 状态不明是否可删），
+**不影响归属判定**。归属无法确认的条目一律进受保护清单，任何 flag 都放行不了。
+
+**状态标记本身**：`.bs-temp-state.json` 如果是链接，按「无标记」处理——
+不让边界外的文件影响状态判定。
+
+**读不到的目录不算「不存在」**：扫描时读不到的套件目录 / 运行目录会被列进
+「读不到、已跳过」清单并逐条给出原因，退出码置 1——
+权限故障不能被伪装成「无事可做」。
+
 ## 历史残留清理
 
 ```powershell
@@ -177,7 +222,17 @@ npm run test:temp:clean              # 只删 passed / cleanup-pending
 npm run test:temp:clean -- --dry-run # 只打印清单，不删
 npm run test:temp:clean -- --failed  # 额外删 failed（需显式传入）
 npm run test:temp:clean -- --all     # 删全部，含状态不明（需显式传入）
+npm run test:temp:clean -- --suite engine   # 只处理某个套件目录
 ```
+
+`--suite` 的套件名只允许字母、数字、点、下划线、连字符（白名单，杜绝路径穿越）。
+它用于把清理范围限定到单个套件——安全回归测试靠它做**限定范围**的真实清理，
+不会误删其它套件的失败现场。两种写法都支持：`--suite engine` 与 `--suite=engine`。
+
+**未知参数一律报错退出（退出码 2）**，不静默忽略——
+参数写错却按全量处理，比直接报错危险得多。
+
+不带 `--suite` 时仍然处理**全部**套件，但判定规则本轮已收紧（链接拦截、子树扫描、边界锚点校验）。
 
 默认行为**保留**：`failed`、`incomplete`、无标记或标记损坏的目录。
 理由：失败现场是排查问题的唯一证据，不能因为「跑过一次清理」就抹掉。

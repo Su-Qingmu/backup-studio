@@ -168,6 +168,61 @@ async function reparsePoints(files: readonly string[]): Promise<Set<string>> {
   return out;
 }
 
+/**
+ * 解析并**验证**删除边界的锚点。
+ *
+ * 五道防线全都相对 `runsRootReal` 成立，所以锚点本身必须先被证明是
+ * 「仓库 temp/ 下的一个真实目录」：
+ *
+ * - `temp/` 与 `temp/test-runs/` 都必须是**普通目录**（不是符号链接 / Junction /
+ *   其它重解析点）；
+ * - `temp/test-runs/` 的真实路径必须落在 `temp/` 的真实路径之内；
+ * - `temp/` 的真实路径必须落在**仓库根**的真实路径之内。
+ *
+ * 否则攻击者只要把 `temp/test-runs` 预置成指向仓库外的 Junction，
+ * 边界锚点就会整体外移，`--all` 下无标记目录会被判定为 safe 并递归删除外部内容。
+ */
+interface Boundary {
+  /** `temp/test-runs/` 的真实路径 */
+  runsRootReal: string;
+}
+
+export async function resolveBoundary(
+  baseRoot: string,
+  scanRoot: string,
+): Promise<{ boundary: Boundary } | { error: string }> {
+  const repoReal = await realpathOf(baseRoot);
+  if (!repoReal) return { error: '仓库根的真实路径无法解析，无法确认删除边界' };
+
+  const tempRoot = path.join(baseRoot, 'temp');
+  const tempSt = await fs.lstat(tempRoot).catch(() => null);
+  if (!tempSt) return { error: '项目 temp/ 目录不存在或不可读' };
+  if (tempSt.isSymbolicLink()) {
+    return { error: '项目 temp/ 是符号链接或 Junction，拒绝以它作为删除边界' };
+  }
+  const tempReal = await realpathOf(tempRoot);
+  if (!tempReal) return { error: '项目 temp/ 的真实路径无法解析' };
+  if (!isInsideReal(repoReal, tempReal)) {
+    return { error: `项目 temp/ 的真实路径越界（${tempReal}），不在仓库根内，拒绝以它作为删除边界` };
+  }
+
+  const runsSt = await fs.lstat(scanRoot).catch(() => null);
+  if (!runsSt) return { error: '扫描根 temp/test-runs/ 不存在或不可读' };
+  if (runsSt.isSymbolicLink()) {
+    return { error: '扫描根 temp/test-runs/ 是符号链接或 Junction，拒绝以它作为删除边界' };
+  }
+  const runsRootReal = await realpathOf(scanRoot);
+  if (!runsRootReal) return { error: '扫描根 temp/test-runs/ 的真实路径无法解析' };
+  if (!isInsideReal(tempReal, runsRootReal)) {
+    return {
+      error:
+        `扫描根 temp/test-runs/ 的真实路径越界（${runsRootReal}），不在项目 temp/ 内，` +
+        '拒绝以它作为删除边界',
+    };
+  }
+  return { boundary: { runsRootReal } };
+}
+
 interface Candidate {
   dir: string;
   relative: string;
@@ -285,20 +340,20 @@ async function scanSubtree(root: string): Promise<SubtreeScan> {
 
 interface CollectResult {
   candidates: Candidate[];
-  /** `temp/test-runs/` 的真实路径；为空表示扫描根不存在，无事可做 */
-  runsRootReal: string | null;
+  /** 读不到、因而无法判断归属的目录（不能被当成「不存在」） */
+  unreadable: { path: string; reason: string }[];
 }
 
-async function collect(suiteFilter: string | null): Promise<CollectResult> {
+async function collect(suiteFilter: string | null, runsRootReal: string): Promise<CollectResult> {
   const out: Candidate[] = [];
-  const runsRootReal = await realpathOf(runsRoot);
-  if (!runsRootReal) return { candidates: out, runsRootReal: null };
+  const unreadable: { path: string; reason: string }[] = [];
 
   let suites: string[];
   try {
     suites = await fs.readdir(runsRoot);
-  } catch {
-    return { candidates: out, runsRootReal };
+  } catch (err) {
+    unreadable.push({ path: runsRoot, reason: `扫描根读取失败（${errorCode(err)}）` });
+    return { candidates: out, unreadable };
   }
   if (suiteFilter) suites = suites.filter((s) => s === suiteFilter);
 
@@ -313,7 +368,8 @@ async function collect(suiteFilter: string | null): Promise<CollectResult> {
     let entries: string[];
     try {
       entries = await fs.readdir(suiteDir);
-    } catch {
+    } catch (err) {
+      unreadable.push({ path: suiteDir, reason: `套件目录读取失败（${errorCode(err)}）` });
       continue;
     }
 
@@ -337,7 +393,8 @@ async function collect(suiteFilter: string | null): Promise<CollectResult> {
         let children: string[];
         try {
           children = await fs.readdir(dir);
-        } catch {
+        } catch (err) {
+          unreadable.push({ path: dir, reason: `运行目录读取失败（${errorCode(err)}）` });
           continue;
         }
         for (const child of children) {
@@ -360,7 +417,7 @@ async function collect(suiteFilter: string | null): Promise<CollectResult> {
       }
     }
   }
-  return { candidates: out, runsRootReal };
+  return { candidates: out, unreadable };
 }
 
 /** 记录文件身份（dev/ino），用于删除前的 TOCTOU 比对 */
@@ -425,33 +482,71 @@ async function blockUnsafeSubtrees(candidates: Candidate[]): Promise<void> {
   }
 }
 
-/** 解析 `--suite <name>`：限定只处理某个套件目录 */
-function parseSuiteFlag(argv: string[]): { suite: string | null; error: string | null } {
-  const idx = argv.indexOf('--suite');
-  if (idx === -1) return { suite: null, error: null };
-  const value = argv[idx + 1];
-  if (!value || value.startsWith('--')) {
-    return { suite: null, error: '--suite 需要一个套件名参数' };
+const KNOWN_FLAGS = new Set(['--dry-run', '--failed', '--all']);
+
+/**
+ * 解析命令行参数。
+ *
+ * `--suite` 支持两种写法（`--suite engine` 与 `--suite=engine`）——
+ * 等号写法如果不被识别，操作者会以为已经限域，实际却按全量处理，
+ * 这种「静默降级」比报错危险得多。
+ *
+ * 未知参数一律报错退出，不静默忽略。
+ */
+function parseArgs(argv: string[]): { suite: string | null; flags: Set<string>; error: string | null } {
+  const flags = new Set<string>();
+  let suite: string | null = null;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--suite') {
+      const value = argv[i + 1];
+      if (!value || value.startsWith('--')) {
+        return { suite: null, flags, error: '--suite 需要一个套件名参数' };
+      }
+      suite = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--suite=')) {
+      suite = arg.slice('--suite='.length);
+      if (!suite) return { suite: null, flags, error: '--suite 需要一个套件名参数' };
+      continue;
+    }
+    if (KNOWN_FLAGS.has(arg)) {
+      flags.add(arg);
+      continue;
+    }
+    return { suite: null, flags, error: `未知参数：${arg}（可用：--dry-run / --failed / --all / --suite <name>）` };
   }
-  // 只允许普通名字，杜绝路径分隔符与 .. 造成的目录穿越
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) {
-    return { suite: null, error: `套件名不合法：${value}（只允许字母、数字、点、下划线、连字符）` };
+  if (suite !== null) {
+    // 只允许普通名字，杜绝路径分隔符与 .. 造成的目录穿越
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(suite)) {
+      return { suite: null, flags, error: `套件名不合法：${suite}（只允许字母、数字、点、下划线、连字符）` };
+    }
   }
-  return { suite: value, error: null };
+  return { suite, flags, error: null };
 }
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  const { suite, error: suiteError } = parseSuiteFlag(argv);
-  if (suiteError) {
-    console.error(`[clean-temp] 参数错误：${suiteError}`);
+  const { suite, flags, error: argError } = parseArgs(argv);
+  if (argError) {
+    console.error(`[clean-temp] 参数错误：${argError}`);
     process.exitCode = 2;
     return;
   }
-  const flags = new Set(argv.filter((a, i) => !(a === '--suite' || (i > 0 && argv[i - 1] === '--suite'))));
   const dryRun = flags.has('--dry-run');
 
-  const { candidates, runsRootReal } = await collect(suite);
+  // 边界锚点必须先被验证，否则五道防线全都建立在可能外移的基准上
+  const resolved = await resolveBoundary(repoRoot, runsRoot);
+  if ('error' in resolved) {
+    console.error(`[clean-temp] 拒绝执行：${resolved.error}`);
+    process.exitCode = 1;
+    return;
+  }
+  const { runsRootReal } = resolved.boundary;
+
+  const { candidates, unreadable } = await collect(suite, runsRootReal);
 
   // 先按状态分类，只对「本来会被删」的候选做子树扫描：
   // failed / incomplete 这类永远不删的目录不值得付这个 I/O。
@@ -462,8 +557,18 @@ async function main(): Promise<void> {
   const { safe, protected: protectedList } = classify(candidates, flags);
 
   console.log(`项目内测试临时目录：${runsRoot}`);
+  console.log(`删除边界（真实路径）：${runsRootReal}`);
   if (suite) console.log(`仅处理套件：${suite}`);
   console.log(`扫描到 ${candidates.length} 个目录；可安全清理 ${safe.length} 个；受保护 ${protectedList.length} 个`);
+
+  // 读不到的目录不能被当成「不存在」——否则权限故障会被伪装成「无事可做」
+  if (unreadable.length) {
+    console.log(`--- 读不到、已跳过（不计为候选）---`);
+    for (const item of unreadable.slice(0, 20)) {
+      console.log(`  ${item.path}  原因：${item.reason}`);
+    }
+    if (unreadable.length > 20) console.log(`  …… 另有 ${unreadable.length - 20} 个`);
+  }
 
   if (protectedList.length) {
     console.log('--- 受保护（不会自动删除）---');
@@ -520,12 +625,20 @@ async function main(): Promise<void> {
       failures.push({ dir: c.relative, error: '删除前复核发现是符号链接或 Junction，已拒绝删除' });
       continue;
     }
-    // 身份比对：扫描之后条目被换掉（TOCTOU）就拒绝删除
-    if (c.dev !== undefined && c.ino !== undefined) {
-      if (st.dev.toString() !== c.dev || st.ino.toString() !== c.ino) {
-        failures.push({ dir: c.relative, error: '删除前复核发现文件身份已变化（疑似被替换），已拒绝删除' });
-        continue;
-      }
+    // 身份比对：扫描之后条目被换掉（TOCTOU）就拒绝删除。
+    // 身份缺失（扫描时没读到）或 inode 不可用（恒为 0）时**一律拒绝**——
+    // 静默跳过比对等于把防线降级成没有，那才是真正的不安全。
+    if (c.dev === undefined || c.ino === undefined) {
+      failures.push({ dir: c.relative, error: '扫描时未能记录文件身份，无法确认删除前未被替换，已拒绝删除' });
+      continue;
+    }
+    if (c.ino === '0') {
+      failures.push({ dir: c.relative, error: '该文件系统不提供稳定的 inode，身份比对不可用，已拒绝删除' });
+      continue;
+    }
+    if (st.dev.toString() !== c.dev || st.ino.toString() !== c.ino) {
+      failures.push({ dir: c.relative, error: '删除前复核发现文件身份已变化（疑似被替换），已拒绝删除' });
+      continue;
     }
     try {
       await fs.rm(c.dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
@@ -537,6 +650,8 @@ async function main(): Promise<void> {
   console.log(`已删除 ${removed} 个；失败 ${failures.length} 个`);
   for (const f of failures.slice(0, 20)) console.log(`  失败 ${f.dir}：${f.error}`);
   if (failures.length) process.exitCode = 1;
+  // 读不到的目录必须让退出码反映出来，不能以 0 退出假装一切正常
+  if (unreadable.length) process.exitCode = 1;
 }
 
 void main().catch((err) => {

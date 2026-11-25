@@ -15,6 +15,7 @@ import {
   suiteRoot,
   suiteTempDir,
 } from './helpers/test-temp';
+import { resolveBoundary } from './helpers/clean-temp';
 
 /**
  * 测试临时目录生命周期专项（M7.1 建立，M7.2 加固）。
@@ -237,16 +238,31 @@ async function writeMarkerFile(dir: string, state: string): Promise<void> {
 }
 
 /**
+ * 真正的系统临时目录。
+ *
+ * 不能用 `os.tmpdir()`：统一启动器把 TEMP / TMP / TMPDIR 全指向了项目内的运行目录，
+ * 所以在本进程里 `os.tmpdir()` 落在仓库内，测不到「仓库外」这一档。
+ * Windows 上用 LOCALAPPDATA 推导（启动器没有改它），POSIX 上用 /tmp。
+ */
+function genuineSystemTemp(): string {
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA;
+    if (localAppData) return path.join(localAppData, 'Temp');
+  }
+  return '/tmp';
+}
+
+/**
  * 建一个「边界外」的目标目录。
  *
  * `insideRepo` 为真时放在仓库的 temp/ 下但位于 temp/test-runs/ **之外**——
- * 这正是清理器的工作边界；为假时放在系统临时目录里，覆盖「仓库外」这一档。
+ * 这正是清理器的工作边界；为假时放在**真正的系统临时目录**里，覆盖「仓库外」这一档。
  */
 async function makeOutsideTarget(insideRepo: boolean, tag: string): Promise<{ dir: string; sentinel: string }> {
   const name = 'm72-safety-' + tag + '-' + uniqueSuffix();
   const dir = insideRepo
     ? path.join(repoRoot, 'temp', name)
-    : path.join(os.tmpdir(), name);
+    : path.join(genuineSystemTemp(), name);
   await fs.mkdir(dir, { recursive: true });
   const sentinel = path.join(dir, 'sentinel.txt');
   await fs.writeFile(sentinel, SENTINEL_TEXT, 'utf8');
@@ -379,7 +395,7 @@ async function main() {
     const outcome = await runChild('ok', pointer);
     assert.equal(outcome.code, 0, '子进程必须正常退出（0），实际：' + outcome.code + '；stderr=' + outcome.stderr);
     assert.equal(outcome.signal, null, '子进程不得被信号杀死');
-    assert.ok(outcome.stdout.length >= 0);
+    assert.equal(outcome.stderr, '', '正常退出的子进程不应有 stderr 输出，实际：' + outcome.stderr);
 
     // 指针文件由子进程同步写入，退出前一定落盘
     const inner = (await fs.readFile(pointer, 'utf8')).trim();
@@ -568,6 +584,27 @@ async function main() {
     }
   });
 
+  await test('TL-14 无关的状态更新不得抹掉既有失败原因', async () => {
+    const dir = await createCaseDir('temp-lifecycle', 'TL-14');
+    try {
+      await markResult(dir, 'failed', { reason: '最初的失败原因', reasonDetail: '细节' });
+      // 不带 detail 的状态更新：原因必须保留（转入 passed 时才清空）
+      await markResult(dir, 'incomplete');
+      const kept = await readMarker(dir);
+      assert.equal(kept?.state, 'incomplete');
+      assert.equal(kept?.reason, '最初的失败原因', '无关的状态更新不得抹掉失败原因');
+      assert.equal(kept?.reasonDetail, '细节', '失败细节也不得被抹掉');
+
+      // 转入 passed 时原因不再成立，必须清空
+      await markResult(dir, 'passed');
+      const cleared = await readMarker(dir);
+      assert.equal(cleared?.state, 'passed');
+      assert.equal(cleared?.reason, undefined, '转入 passed 必须清空失败原因');
+    } finally {
+      await removeOrReport(dir, 'TL-14 现场');
+    }
+  });
+
   // ===== M7.2：清理器安全边界 =====
 
   await test('TL-S1 普通 passed 目录可清理，failed / incomplete / unknown 默认保留', async () => {
@@ -686,6 +723,92 @@ async function main() {
     } finally {
       await cleanupProbe(probe);
     }
+  });
+
+  await test('TL-S7 边界锚点校验：扫描根或 temp/ 是链接时必须拒绝（确定性构造）', async () => {
+    // 这是 P0 回归：五道防线全都相对「扫描根的真实路径」成立，
+    // 若扫描根本身（或 temp/）是指向仓库外的 Junction，边界锚点会整体外移，
+    // --all 下无标记目录会被判定为 safe 并递归删除外部内容。
+    //
+    // 这里用一份**独立的假仓库**构造，避免动到真正在用的 temp/test-runs。
+    const base = path.join(genuineSystemTemp(), 'm72-safety-fakerepo-' + uniqueSuffix());
+    const outside = path.join(genuineSystemTemp(), 'm72-safety-fakeoutside-' + uniqueSuffix());
+    try {
+      await fs.mkdir(outside, { recursive: true });
+      await fs.writeFile(path.join(outside, 'sentinel.txt'), SENTINEL_TEXT, 'utf8');
+
+      // 1) 正常形态：边界应当成立
+      const okRepo = path.join(base, 'ok-repo');
+      await fs.mkdir(path.join(okRepo, 'temp', 'test-runs'), { recursive: true });
+      const ok = await resolveBoundary(okRepo, path.join(okRepo, 'temp', 'test-runs'));
+      assert.ok(!('error' in ok), '正常形态必须通过边界校验，实际：' + ('error' in ok ? ok.error : ''));
+
+      // 2) 扫描根自身是指向仓库外的链接 → 必须拒绝
+      const linkRepo = path.join(base, 'link-repo');
+      await fs.mkdir(path.join(linkRepo, 'temp'), { recursive: true });
+      await createDirLink(outside, path.join(linkRepo, 'temp', 'test-runs'));
+      const linked = await resolveBoundary(linkRepo, path.join(linkRepo, 'temp', 'test-runs'));
+      assert.ok('error' in linked, '扫描根是链接时必须拒绝边界校验');
+      assert.match(linked.error, /链接|Junction/, '拒绝原因必须点明是链接：' + linked.error);
+
+      // 3) temp/ 自身是指向仓库外的链接 → 必须拒绝
+      const tempLinkRepo = path.join(base, 'temp-link-repo');
+      await fs.mkdir(tempLinkRepo, { recursive: true });
+      await createDirLink(outside, path.join(tempLinkRepo, 'temp'));
+      const tempLinked = await resolveBoundary(tempLinkRepo, path.join(tempLinkRepo, 'temp', 'test-runs'));
+      assert.ok('error' in tempLinked, 'temp/ 是链接时必须拒绝边界校验');
+      assert.match(tempLinked.error, /链接|Junction/, '拒绝原因必须点明是链接：' + tempLinked.error);
+
+      // 外部内容自始至终不得被碰
+      assert.equal(
+        await fs.readFile(path.join(outside, 'sentinel.txt'), 'utf8'),
+        SENTINEL_TEXT,
+        '边界校验不得删除外部内容',
+      );
+    } finally {
+      await removeOrReport(base, 'TL-S7 假仓库');
+      await removeOrReport(outside, 'TL-S7 边界外目标');
+    }
+  });
+
+  await test('TL-S8 端到端：扫描根被换成链接时清理命令必须拒绝执行', async () => {
+    // 把真正在用的 temp/test-runs 暂时挪开，在原位放一个指向仓库外的 Junction，
+    // 跑真实的清理命令，必须以非零码拒绝执行，且外部内容完好。
+    const realRunsRoot = path.join(repoRoot, 'temp', 'test-runs');
+    const stashRoot = path.join(repoRoot, 'temp', 'test-runs-stash-' + uniqueSuffix());
+    const outsideDir = path.join(genuineSystemTemp(), 'm72-safety-anchor-' + uniqueSuffix());
+    const sentinel = path.join(outsideDir, 'sentinel.txt');
+    let moved = false;
+    try {
+      await fs.mkdir(outsideDir, { recursive: true });
+      await fs.writeFile(sentinel, SENTINEL_TEXT, 'utf8');
+      await fs.rename(realRunsRoot, stashRoot);
+      moved = true;
+      // 扫描根的位置现在是一个指向仓库外的 Junction
+      await createDirLink(outsideDir, realRunsRoot);
+
+      const real = await runCleaner(['--all']);
+      assert.notEqual(real.code, 0, '扫描根是链接时必须以非零码拒绝执行，实际：' + real.code);
+      assert.ok(
+        /拒绝|越界|链接|Junction/i.test(real.stdout + real.stderr),
+        '必须明确报告拒绝原因，实际输出：' + (real.stdout + real.stderr).slice(0, 400),
+      );
+      assert.equal(await fs.readFile(sentinel, 'utf8'), SENTINEL_TEXT, '拒绝执行也不得删除外部内容');
+    } finally {
+      // 复原：先移除 Junction（只删链接本身），再把真正的扫描根挪回来
+      await fs.rm(realRunsRoot, { recursive: true, force: true }).catch(() => undefined);
+      if (moved) {
+        await fs.rename(stashRoot, realRunsRoot).catch(async () => {
+          await fs.mkdir(realRunsRoot, { recursive: true });
+          await fs.cp(stashRoot, realRunsRoot, { recursive: true });
+          await fs.rm(stashRoot, { recursive: true, force: true });
+        });
+      }
+      await removeOrReport(outsideDir, 'TL-S8 边界外目标');
+    }
+    // 复原后清理命令必须能正常工作
+    const after = await runCleaner(['--dry-run']);
+    assert.equal(after.code, 0, '复原后清理命令必须恢复正常，实际：' + after.code + after.stderr);
   });
 
   await test('TL-S6 清理器必须报告被拦截的条目及其原因', async () => {
