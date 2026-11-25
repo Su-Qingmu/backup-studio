@@ -4,7 +4,7 @@
 
 | 项 | 状态 |
 | --- | --- |
-| **本轮（M7 跨平台可靠性 / 安全契约）** | 基线 `aa0374a`（`fbd2188` 的直系后继，本地领先远程 2 个提交）；本轮 5 个提交位于分支 **`fix/m7-cross-platform-contract`**（`45ec8f2` wrapper / `dfed363` 隔离区 / `9b0f492` 写入许可 / `c35d0ae` 新套件 / 文档提交），本地 `main` 退回本轮基线 `aa0374a`（上一轮成果仍在其上）；**未推送、未合 PR、未关 Issue**；详见下节「本轮：M7 跨平台可靠性与安全契约修复」 |
+| **本轮（M7 跨平台可靠性 / 安全契约）** | 基线 `aa0374a`（`fbd2188` 的直系后继，本地领先远程 2 个提交）；本轮提交位于分支 **`fix/m7-cross-platform-contract`**（`45ec8f2` wrapper / `dfed363` 隔离区 / `9b0f492` 写入许可 / `c35d0ae` 新套件 / 文档提交），本地 `main` 停在 `aa0374a`（上一轮成果仍在其上）；推送状态以远程分支 `origin/fix/m7-cross-platform-contract` 为准，未合 PR、未关 Issue；详见下节「本轮：M7 跨平台可靠性与安全契约修复」 |
 | 基线提交 | `d92d19c`：`fix(gui): 修复禁用态区分、分栏消失、启动黑屏、主题持久化与 AppImage 图标`（本轮 issue 修复成果，**已本地提交、尚未推送远程**；远程 `origin/main` 仍在 `fbd2188`）。再上一基线 `5d2f521`：`feat(hardening): make recovery reliable, delete transactions crash-safe, release gated`（四轮独立复审的加固成果，已推送到 `main`） |
 | 工作区 | 本轮 issue 修复（#3 / #4 / #10 / #11 / #17）的全部代码改动已提交到本地 `main`（提交 `d92d19c`，20 个文件修改/新增，+666 / −22），**按用户要求只本地提交、未推送远程**；除打包试验残留的未跟踪目录 `pack-out/` 外工作区干净。**未打 tag、未建 Release、未合 PR** |
 | M1 · 备份正确性与恢复回归 | **已完成并推送**，验收 76 项通过 / 0 失败 / 0 跳过 |
@@ -89,9 +89,11 @@
 | 事务恢复 `test:transaction` | 16 | 0 | 1 | node:test 自带 skip：大小写敏感卷兄弟目录（本机大小写不敏感） |
 | 查重 `test:dup` | 73 | 0 | 1 | 新增 T13b、T26a/T26b；T26c 在 Windows 上显式 SKIP（对应平台分支为 T26b） |
 | 定位授权 `test:reveal` | 26 | 0 | 0 | 未改动该链路 |
-| 回收站崩溃注入 `test:recycle-crash` | — | — | — | **本轮未跑完**（44 例，本机约 20–30s/例，后台仍在运行）。该套件不引用本轮改动的 API（`grep writeGate|guardTargetWrites|blockers` 零命中），断言未改动；结果未取证，不计入本轮结论 |
+| 回收站崩溃注入 `test:recycle-crash` | 44 | 0 | 0 | 单跑耗时约 14.4 分钟（本机约 20–30s/例，IO 受限）；不引用本轮改动的 API，断言未改 |
 | 写入许可（新增）`test:perm` | 11 | 0 | 0 | 本文件覆盖 Issue #9 契约 |
 | 路径语义（新增）`test:path` | 11 | 0 | 0 | 含 1 例 Windows 真机解析验证 |
+
+合计 **288 通过 / 0 失败 / 2 跳过**（290 项，10 套）。与上一轮基线（265 项）的差额 25 = 本轮新增 2 套 22 项（写入许可 11、路径语义 11）+ 查重净增 3 例（T13b 新增 1 例、T26 拆成 T26a/T26b/T26c 净增 2 例）。
 
 其他命令：`npm run typecheck`（三套 tsconfig）通过；`npm run build`（renderer + electron）通过。
 
@@ -99,7 +101,6 @@
 
 **未验证项（不得用其他平台结果替代）**：
 
-- 回收站崩溃注入套件（44 例）本轮未跑完：只观察到前 10 例通过，剩余未取证。不得用上一轮的绿色记录替代本轮证据。
 - Linux / macOS 上的实际运行结果：本轮只在 win32 上跑过。POSIX 分支（T26c、`readDirAsFileFails` 等）的通过与否**未取证**。
 - 真实只读介质 / 脏位卷的端到端复现：需要特定硬件或 ACL 变更，本轮只做了判定层与单元层验证。
 - `GetFinalPathNameByHandle` / `GetVolumePathName`：本仓库没有原生模块或 FFI 接入，未做集成测试。
