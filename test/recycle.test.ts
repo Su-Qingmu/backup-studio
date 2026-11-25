@@ -14,6 +14,25 @@ import type { SyncMode } from '../shared/types';
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
+
+/**
+ * 显式跳过信号。
+ *
+ * 用例表达「本环境不适用」必须 throw TestSkip，不能用「正常 return」——
+ * 后者会被包装器计成 PASS，制造假阳性（Issue #19）。
+ */
+class TestSkip extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'TestSkip';
+  }
+}
+
+function skip(reason: string): never {
+  if (!reason.trim()) throw new Error('skip() 必须给出非空原因');
+  throw new TestSkip(reason);
+}
 
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
   try {
@@ -21,6 +40,13 @@ async function test(name: string, fn: () => void | Promise<void>): Promise<void>
     passed += 1;
     console.log(`  PASS  ${name}`);
   } catch (err) {
+    // SKIP 先于 FAIL 判定：跳过不计入通过，也不影响退出码。
+    if (err instanceof TestSkip) {
+      skipped += 1;
+      console.log(`  SKIP  ${name}`);
+      console.log(`        原因：${err.message}`);
+      return;
+    }
     failed += 1;
     console.log(`  FAIL  ${name}`);
     console.log(`        ${err instanceof Error ? err.message : String(err)}`);
@@ -539,9 +565,9 @@ async function main(): Promise<void> {
     try {
       await fs.link(first, second);
     } catch (err) {
-      if (['EPERM', 'EACCES', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP'].includes((err as NodeJS.ErrnoException).code ?? '')) {
-        console.log('        SKIP: 当前文件系统不支持创建硬链接');
-        return;
+      const code = (err as NodeJS.ErrnoException).code ?? '';
+      if (['EPERM', 'EACCES', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP'].includes(code)) {
+        skip(`当前文件系统不支持创建硬链接（errno ${code || 'unknown'}），无法构造「同一实体双链接」夹具`);
       }
       throw err;
     }
@@ -657,7 +683,7 @@ async function main(): Promise<void> {
     assert.equal(ledger.entries.find((e) => e.txId === 'tx-other')?.contentState, 'verified');
   });
 
-  console.log(`\n结果：${passed} 通过 / ${failed} 失败\n`);
+  console.log(`\n回收站：${passed} 通过，${failed} 失败，${skipped} 跳过\n`);
   if (failed > 0) process.exitCode = 1;
 }
 

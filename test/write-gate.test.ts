@@ -10,6 +10,25 @@ import type { HealthReport, WriteGate } from '../shared/types';
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
+
+/**
+ * 显式跳过信号。
+ *
+ * 用例表达「本环境不适用」必须 throw TestSkip，不能用「正常 return」——
+ * 后者会被包装器计成 PASS，制造假阳性（Issue #19）。
+ */
+class TestSkip extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'TestSkip';
+  }
+}
+
+function skip(reason: string): never {
+  if (!reason.trim()) throw new Error('skip() 必须给出非空原因');
+  throw new TestSkip(reason);
+}
 
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
   try {
@@ -17,6 +36,13 @@ async function test(name: string, fn: () => void | Promise<void>): Promise<void>
     passed += 1;
     console.log(`  PASS  ${name}`);
   } catch (err) {
+    // SKIP 先于 FAIL 判定：跳过不计入通过，也不影响退出码。
+    if (err instanceof TestSkip) {
+      skipped += 1;
+      console.log(`  SKIP  ${name}`);
+      console.log(`        原因：${err.message}`);
+      return;
+    }
     failed += 1;
     console.log(`  FAIL  ${name}`);
     console.log(`        ${err instanceof Error ? err.message : String(err)}`);
@@ -103,13 +129,27 @@ async function main() {
     // 真机取证回放：拔盘演练后的 U 盘处于「Full Repair Needed + 脏位」状态。
     // 该盘可能已被修复或拔下，因此按实际探测结果断言，不做硬编码。
     const removable = process.platform === 'win32' ? 'E:\\' : '';
-    if (!removable) return;
+    if (!removable) {
+      skip(`非 Windows 无盘符路径（当前平台 ${process.platform}），无法构造需修复卷样本`);
+    }
     let gate: WriteGate;
     try {
       gate = await service.writeGate(removable);
-    } catch {
-      return;
+    } catch (err) {
+      // 探测本身失败（盘符不存在/无权限）：无法判定卷级修复状态，不是断言失败。
+      skip(`探测 ${removable} 失败，无法取得卷级事实：${err instanceof Error ? err.message : String(err)}`);
     }
+    // 该用例依赖本机 E: 盘的真实状态：同一提交在不同机器上会走不同分支。
+    // 因此把实际分支与探测值打印出来，避免「走了哪个分支却无从判断」。
+    const branch =
+      gate.volumeHealth === 'repair-required'
+        ? 'repair-required'
+        : gate.reachable === false
+          ? 'unreachable'
+          : 'healthy-or-repaired';
+    console.log(
+      `     分支：${branch}（volumeHealth=${gate.volumeHealth}, reachable=${gate.reachable}, allowed=${gate.allowed}, level=${gate.level}, evidence=${JSON.stringify(gate.evidence)}）`,
+    );
     if (gate.volumeHealth === 'repair-required') {
       assert.equal(gate.allowed, false, '卷需修复时必须禁止写入');
       assert.equal(gate.level, 'L1', '卷需修复属逻辑层损伤，应判 L1 只读而非 L2 物理坏盘');
@@ -199,7 +239,8 @@ async function main() {
     assert.ok(actual.evidence.length > 0, '拒写原因必须附证据');
   });
 
-  console.log(`\n结果：${passed} 通过 / ${failed} 失败`);
+  console.log(`\n写入闸门：${passed} 通过，${failed} 失败，${skipped} 跳过`);
+  // 跳过不影响退出码：只有真实失败才非零退出。
   process.exit(failed === 0 ? 0 : 1);
 }
 

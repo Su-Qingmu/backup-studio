@@ -20,6 +20,26 @@ import type { BackupRevealErrorCode, BackupRevealResult } from '../shared/reveal
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
+
+/**
+ * 显式跳过信号：用例表达「本环境不适用」必须 throw TestSkip。
+ * 用「正常 return」表示跳过会被包装器计成 PASS，制造假阳性（Issue #19）。
+ */
+class TestSkip extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'TestSkip';
+  }
+}
+
+function skip(reason: string): never {
+  if (!reason.trim()) throw new Error('skip() 必须给出非空原因');
+  throw new TestSkip(reason);
+}
+
+// 本套件当前没有「环境不适用」用例；保留显式信号供后续用例调用，避免变成死代码。
+void skip;
 
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
   try {
@@ -27,6 +47,13 @@ async function test(name: string, fn: () => Promise<void>): Promise<void> {
     passed += 1;
     console.log(`PASS ${name}`);
   } catch (err) {
+    // SKIP 先于 FAIL 判定：跳过不计入通过，也不影响退出码。
+    if (err instanceof TestSkip) {
+      skipped += 1;
+      console.log(`SKIP ${name}`);
+      console.log(`     原因：${err.message}`);
+      return;
+    }
     failed += 1;
     console.error(`FAIL ${name}`);
     console.error(`     ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
@@ -894,7 +921,7 @@ async function main(): Promise<void> {
     }
   });
 
-  console.log(`定位授权：${passed} 通过，${failed} 失败`);
+  console.log(`定位授权：${passed} 通过，${failed} 失败，${skipped} 跳过`);
   if (failed) process.exitCode = 1;
 }
 

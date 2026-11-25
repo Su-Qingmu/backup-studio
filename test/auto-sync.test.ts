@@ -7,10 +7,27 @@ import { Debounce, retryDelay } from '../electron/engine/aut/queue';
 import { ensureRoom, recyclePath } from '../electron/engine/aut/recycle';
 import type { AutoPairInput, AutoRecycleEntry, AutoStatus } from '../shared/aut-types';
 
-let passed = 0, failed = 0;
+let passed = 0, failed = 0, skipped = 0;
+/**
+ * 显式跳过信号：用例表达「本环境不适用」必须 throw TestSkip。
+ * 用「正常 return」表示跳过会被包装器计成 PASS，制造假阳性（Issue #19）。
+ */
+class TestSkip extends Error {
+  constructor(reason: string) { super(reason); this.name = 'TestSkip'; }
+}
+function skip(reason: string): never {
+  if (!reason.trim()) throw new Error('skip() 必须给出非空原因');
+  throw new TestSkip(reason);
+}
+// 本套件当前没有「环境不适用」用例；保留显式信号供后续用例调用，避免变成死代码。
+void skip;
 async function test(name: string, fn: () => Promise<void>) {
   try { await fn(); passed++; console.log(`PASS ${name}`); }
-  catch (error) { failed++; console.error(`FAIL ${name}`, error); }
+  catch (error) {
+    // SKIP 先于 FAIL 判定：跳过不计入通过，也不影响退出码。
+    if (error instanceof TestSkip) { skipped++; console.log(`SKIP ${name}`); console.log(`     原因：${error.message}`); return; }
+    failed++; console.error(`FAIL ${name}`, error);
+  }
 }
 const decision = (): WriteDecision => ({ allowed: true, reachable: true, isolated: false, level: 'L0', volumeHealth: 'healthy', epoch: 'test-medium', evidence: [] });
 async function fixture(options: Partial<AutoPairInput>, fn: (aut: AutoSync, input: AutoPairInput, decision: WriteDecision, local: string) => Promise<void>) {
@@ -340,7 +357,7 @@ async function main() {
     }
   }));
 
-  console.log(`自动同步：${passed} 通过，${failed} 失败`);
+  console.log(`自动同步：${passed} 通过，${failed} 失败，${skipped} 跳过`);
   if (failed) process.exitCode = 1;
 }
 void main().catch(e => { console.error(e); process.exitCode = 1; });

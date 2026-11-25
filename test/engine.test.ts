@@ -16,6 +16,25 @@ const WORKER_PATH = path.join(process.cwd(), 'dist-electron', 'electron', 'engin
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
+
+/**
+ * 显式跳过信号。
+ *
+ * 用例表达「本环境不适用」必须 throw TestSkip，不能用「正常 return」——
+ * 后者会被包装器计成 PASS，制造假阳性（Issue #19）。
+ */
+class TestSkip extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'TestSkip';
+  }
+}
+
+function skip(reason: string): never {
+  if (!reason.trim()) throw new Error('skip() 必须给出非空原因');
+  throw new TestSkip(reason);
+}
 
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
   try {
@@ -23,6 +42,13 @@ async function test(name: string, fn: () => void | Promise<void>): Promise<void>
     passed += 1;
     console.log(`  PASS  ${name}`);
   } catch (err) {
+    // SKIP 先于 FAIL 判定：跳过不计入通过，也不影响退出码。
+    if (err instanceof TestSkip) {
+      skipped += 1;
+      console.log(`  SKIP  ${name}`);
+      console.log(`        原因：${err.message}`);
+      return;
+    }
     failed += 1;
     console.log(`  FAIL  ${name}`);
     console.log(`        ${err instanceof Error ? err.message : String(err)}`);
@@ -985,7 +1011,9 @@ async function main(): Promise<void> {
 
   await test('FR-06：真实样本回放，卷告警与脏位优先，SMART 不伪造', async () => {
     // 只向假执行器传递盘符，真实文件系统只访问测试目录。
-    if (process.platform !== 'win32') return;
+    if (process.platform !== 'win32') {
+      skip(`卷级取证回放依赖 Windows 专属事实（chkdsk dirty / volume 健康），当前平台为 ${process.platform}`);
+    }
     const result = await dirtySample(await makeTemp('bs-health-'));
     assert.equal(result.assessment.level, 'L1');
     assert.equal(result.assessment.writable, false);
@@ -1097,6 +1125,10 @@ async function main(): Promise<void> {
       const report = await dirtySample(local);
       assert.equal(report.permission, false);
       assert.ok(report.assessment.evidence.some((x) => x.kind === '权限'));
+    } else {
+      // 卷级取证依赖 Windows 原始设备查询。本用例主断言（权限不足必须拒绝演练）跨平台有效，
+      // 因此只标注附加断言未执行，不把整个用例判为跳过（否则会丢真实覆盖）。
+      console.log(`        分支：仅 Windows 取证（当前平台 ${process.platform}），附加卷证据断言未执行`);
     }
   });
 
@@ -1274,32 +1306,35 @@ async function main(): Promise<void> {
     );
   });
 
-  if (process.platform === 'win32') {
-    await test('Windows 大小写变更：并发拷贝与大量删除不误删仅大小写变化的源端文件', async () => {
-      const source = await makeTemp('bs-case-src-');
-      const target = await makeTemp('bs-case-dst-');
-      const userData = await makeTemp('bs-case-ud-');
-      await writeFile(source, 'zzz_target.txt', 'MUST-SURVIVE');
-      await writeFile(target, 'ZZZ_TARGET.txt', 'old-small');
-      for (let i = 0; i < 60; i += 1) {
-        await writeFile(target, `aaa_del_${String(i).padStart(2, '0')}.txt`, 'x');
-      }
+  await test('Windows 大小写变更：并发拷贝与大量删除不误删仅大小写变化的源端文件', async () => {
+    if (process.platform !== 'win32') {
+      skip(
+        `该用例验证 Windows 大小写不敏感卷上的路径身份与删除行为，本平台（${process.platform}）无对应能力`,
+      );
+    }
+    const source = await makeTemp('bs-case-src-');
+    const target = await makeTemp('bs-case-dst-');
+    const userData = await makeTemp('bs-case-ud-');
+    await writeFile(source, 'zzz_target.txt', 'MUST-SURVIVE');
+    await writeFile(target, 'ZZZ_TARGET.txt', 'old-small');
+    for (let i = 0; i < 60; i += 1) {
+      await writeFile(target, `aaa_del_${String(i).padStart(2, '0')}.txt`, 'x');
+    }
 
-      const service = new BackupService(userData);
-      await service.plan(source, target, 'mirror');
-      await service.start({
-        sourceRoot: source,
-        targetRoot: target,
-        syncMode: 'mirror',
-        allowMassDelete: true,
-        resume: true,
-      });
-      assert.equal(service.getState().phase, 'completed');
-      assert.equal(await fs.readFile(path.join(target, 'zzz_target.txt'), 'utf8'), 'MUST-SURVIVE');
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'mirror');
+    await service.start({
+      sourceRoot: source,
+      targetRoot: target,
+      syncMode: 'mirror',
+      allowMassDelete: true,
+      resume: true,
     });
-  }
+    assert.equal(service.getState().phase, 'completed');
+    assert.equal(await fs.readFile(path.join(target, 'zzz_target.txt'), 'utf8'), 'MUST-SURVIVE');
+  });
 
-  console.log(`\n结果：${passed} 通过 / ${failed} 失败\n`);
+  console.log(`\n引擎：${passed} 通过，${failed} 失败，${skipped} 跳过\n`);
   if (failed > 0) process.exitCode = 1;
 }
 
