@@ -54,7 +54,7 @@ backup-studio/
 | `testRunsRoot` | `<repo>/temp/test-runs` |
 | `cleanupReportsRoot` | `<repo>/temp/cleanup-reports` |
 | `suiteRoot(suite)` | 套件级根目录 `<repo>/temp/test-runs/<suite>` |
-| `suiteTempDir(prefix)` | 套件级目录：用于**跨用例共享**的资源（如 engine 那份 128 MB 大文件源） |
+| `suiteTempDir(prefix)` | 套件级目录：用于**跨用例共享**的资源（如 engine 那份 128 MB 大文件源）。落在启动器的**本次运行目录**内，因此整轮退出码 0 时随之清理 |
 | `createCaseDir(suite, label)` | 用例级目录 `<case>-<timestamp>-<pid>-<random>` |
 | `caseTempDir(prefix)` | **测试体里创建夹具的标准入口**：落在当前用例目录内 |
 | `runCase(suite, label, fn)` | 执行用例：**成功删除目录，失败保留并把路径写进错误信息** |
@@ -119,6 +119,10 @@ node:test 的 after 钩子无条件执行，断言失败后现场也会被删掉
 - **进程异常退出**（超时、被中断、机器重启）无法保证清理，允许留下目录；
   这类目录状态为 `incomplete`，**不会被自动删除**。
 - 清理失败（文件被占用等）标记为 `cleanup-pending`，由清理命令重试，**不静默吞掉**。
+- **显式跳过不是失败**：各测试文件里的 `TestSkip`（`error.name === 'TestSkip'`）表示
+  「本环境不适用该用例」，此时**没有失败现场要保留**，目录按「已通过」处置并删除，
+  异常原样抛回给调用方的跳过分支。否则每个按平台跳过的用例都会永久留下一个 `failed` 目录，
+  把「failed = 真实失败现场」这条约定稀释掉。
 
 ## 统一启动器
 
@@ -136,6 +140,11 @@ npm run test:engine           → tsx test/helpers/run-suite.ts engine node --im
 2. 创建 `temp/test-runs/<suite>/run-<timestamp>-<pid>-<random>/`；
 3. 把 `TEMP`、`TMP`、`TMPDIR` 三个环境变量**全部**指向该目录；
 4. 通过子进程环境传递，测试进程及其所有子进程（崩溃注入测试会拉子进程）继承同一配置。
+
+运行目录自身的处置：**退出码 0 → 删除并打印 `[run-suite] 本次运行目录已清理：…`**；
+退出码非 0 → 保留并打印路径。删除失败（Windows 上 tsx 转译缓存的句柄释放有延迟，
+可能撞上 EBUSY/EPERM）会**如实报告**并提示用清理命令回收——不静默吞掉，
+否则「跑完了但目录还在」没人知道。
 
 ### 为什么必须设三个变量
 
@@ -172,6 +181,10 @@ npm run test:temp:clean -- --all     # 删全部，含状态不明（需显式�
 
 默认行为**保留**：`failed`、`incomplete`、无标记或标记损坏的目录。
 理由：失败现场是排查问题的唯一证据，不能因为「跑过一次清理」就抹掉。
+
+命令会**下钻** `run-*` 运行目录，逐个用例目录读状态：
+失败运行留下的现场因此能按用例逐条列出，而不是只显示成一个「未知目录」；
+里面已经通过的用例目录也可以被单独回收（删除时先深后浅）。
 
 命令只处理**项目内** `temp/test-runs/` 下的目录，不碰系统临时目录，
 也不碰任何其它软件的临时文件。
@@ -221,13 +234,18 @@ Get-ChildItem -Recurse temp\test-runs\recycle-crash\<case>-<...>
 
 确认不再需要后，手动删除该目录即可（清理命令默认不会碰 `failed`）。
 
+`test/temp-lifecycle.test.ts` 每跑一次都会**故意**制造几个 `failed` / `incomplete` 目录
+来验证「失败保留」契约——它们是证据，不是垃圾。确认不需要后用
+`npm run test:temp:clean -- --all` 一次性回收。
+
 ### 系统临时目录是否被污染
 
 ```powershell
-Get-ChildItem $env:TEMP -Directory | Where-Object { $_.Name -like 'bs-*' -or $_.Name -like 'backup-studio-*' }
+Get-ChildItem $env:TEMP | Where-Object { $_.Name -like 'bs-*' -or $_.Name -like 'backup-studio-*' }
 ```
 
-正常情况下应当**没有输出**。
+正常情况下应当**没有输出**（目录与文件都算）。
+注意：`tsx` 自己的转译缓存目录 `tsx-<uid>` 不匹配上述前缀，属工具缓存，不在治理范围内。
 
 ## 一次性历史清理
 

@@ -170,7 +170,7 @@
 ## 本轮：M7.1 测试临时目录治理与历史残留清理（2026-11-25）
 
 > **分支**：`fix/m7-cross-platform-contract`（承接 M7 轮，未切换分支）。
-> 本轮**未推送**（按任务书要求：默认只做本地修改与验证）、未合 PR、未关 Issue、未打 tag。
+> 本轮已按用户明确授权推送该分支；未合 PR、未关 Issue、未建 Release、未打 tag，未做任何 reset / 改写历史。
 
 ### 一、历史残留清理（阶段一）
 
@@ -282,12 +282,21 @@ TMPDIR      = D:\My file\桌面\backup-studio\temp\test-runs\envcheck\run-mwvuck
 | 事务恢复 `test:transaction` | 16 | 0 | 1 | node:test 自带 skip（大小写敏感卷），与迁移前一致 |
 | 查重 `test:dup` | 73 | 0 | 1 | T26c（POSIX 分支），与迁移前一致 |
 | 定位授权 `test:reveal` | 26 | 0 | 0 | 一致 |
-| 回收站崩溃注入 `test:recycle-crash` | RC_NUMBER | 0 | 0 | 见下 |
+| 回收站崩溃注入 `test:recycle-crash` | 44 | 0 | 0 | node:test 崩溃注入 44 例，与迁移前一致 |
 | 写入许可 `test:perm` | 11 | 0 | 0 | 一致 |
 | 路径语义 `test:path` | 11 | 0 | 0 | 一致 |
 | 临时目录生命周期 `test:temp`（新增） | 13 | 0 | 0 | 本轮新增 |
 
-系统 `%TEMP%` 复核：清理后候选 **0**；全量测试跑完后仍为 **0**（验证命令见 `docs/TESTING.md`）。
+合计 **301 通过 / 0 失败 / 2 跳过**（303 项，11 套）。与 M7 轮基线（290 项 / 10 套）的差额 13，
+全部来自本轮新增的临时目录生命周期套件；其余 10 套的用例数与迁移前**逐项一致**。
+
+两项跳过的说明：事务恢复的「大小写敏感卷兄弟目录」（node:test 自带 skip，本机 NTFS 大小写不敏感）、
+查重 T26c（POSIX 索引层拒绝，Windows 上 UNC 属绝对路径走不到该关卡）。
+两项都是「本机不具备该平台能力」，不是验证失败，且都有对侧平台的用例覆盖同一安全边界。
+
+系统 `%TEMP%` 复核：清理后候选 **0**；全量测试跑完后（含修复后重跑）仍为 **0**（验证命令见 `docs/TESTING.md`）。
+复核口径为「顶层**目录与文件**都算」——首轮按目录统计漏掉了我自己遗留的 25 个 `bs-*` 工具脚本
+（提交信息、运行日志、ps1 助手），已一并移出系统 `%TEMP%`，改放项目 `temp/tooling-scratch/`（已被 `.gitignore` 忽略）。
 
 #### 失败现场保留实证
 
@@ -311,8 +320,52 @@ journal\job.json
 
 #### 清理命令实测
 
-`npm run test:temp:clean -- --dry-run` 输出：13 个目录中「可安全清理 1 个、受保护 12 个」，
-逐条列出受保护原因（`failed` / `incomplete` / `unknown`），且未删除任何目录。
+`npm run test:temp:clean -- --dry-run` 输出：6 个目录中「可安全清理 1 个、受保护 5 个」，
+逐条列出受保护原因（`failed` / `incomplete`），且未删除任何目录：
+
+```
+扫描到 6 个目录；可安全清理 1 个；受保护 5 个
+--- 受保护（不会自动删除）---
+  [failed] temp\test-runs\failure-evidence\演示用例-mwvufkzh-20008-tvz9v3  原因：故意失败：验证失败现场是否保留
+  [failed] temp\test-runs\temp-lifecycle\TL-12-failed-mwvudrru-19888-jfodad  原因：保留
+  [failed] temp\test-runs\temp-lifecycle\TL-12-安全清理命令只清理允许删除的目录-mwvudrrt-19888-oehohv  原因：spawn npx ENOENT
+  [incomplete] temp\test-runs\temp-lifecycle\TL-6-mwvudrpf-19888-em0gdh
+  [failed] temp\test-runs\temp-lifecycle\TL-6-子进程异常退出：现场保留（状态标为-incomplete）-mwvudrpe-19888-mm66ve  原因：Missing expected rejection: 现场必须仍在
+--- 将要删除 ---
+  [passed] temp\test-runs\temp-lifecycle\TL-12-passed-mwvudrru-19888-wg0nqb
+--dry-run：未执行任何删除
+```
+
+注意后两条 `failed` 的原因写着 `spawn npx ENOENT` 与 `Missing expected rejection`——那是**修复前**
+那一轮里 TL-12 / TL-6 真的失败了（当时 TL-12 用 `npx` 在 Windows 上 spawn 失败，TL-6 的断言
+也确实没过），现场按契约原样留下。修复后重跑，这两个用例通过并自行清理，目录不再新增。
+这正是「失败保留、成功删除」应有的样子：留的是真实失败，不是所有跑过的东西。
+
+#### 复跑中发现并修掉的四个机制缺陷
+
+首轮全量跑完后扫描项目 `temp/`，发现四个真实缺陷。它们都不是断言问题，
+而是「机制本身不成立」——不改掉的话，临时目录会一轮一轮地攒起来：
+
+| # | 缺陷 | 根因 | 修法 |
+| --- | --- | --- | --- |
+| 1 | **跨用例共享目录每轮泄漏** | `suiteTempDir()` 把共享资源放在套件根 `<suite>/` 下，而启动器只删自己的运行目录 `run-*/`，两者不同层 | 共享资源改落进启动器的**运行目录**：退出码 0 随运行目录一起清掉，非 0 则与失败现场一起保留 |
+| 2 | **启动器静默吞掉删除失败** | `run-suite.ts` 用 `.catch(() => undefined)` 吞掉 `fs.rm` 的失败 | 加重试（`maxRetries: 5`）并如实报告失败路径，提示用清理命令回收 |
+| 3 | **清理命令看不见 run 目录里的用例目录** | `clean-temp.ts` 只扫 `<suite>/` 一层，失败运行留下的现场只显示成「一个未知目录」 | 下钻 `run-*` 目录，逐个用例目录读状态；删除时先深后浅 |
+| 4 | **显式跳过被当成失败** | 7 个自制套件用 `TestSkip` 表达「本环境不适用」，`runCase` 把任何异常都当失败 → 永久留下 `failed` 目录 | `runCase` 识别 `name === 'TestSkip'`：跳过按「已通过」处置（删目录），异常原样抛回给调用方的跳过分支 |
+
+实测证据：
+
+- 缺陷 1：清点出 6 个无人回收的共享目录（`engine/bs-big-src-*`、`write-gate/bs-gate-journal-*`、`permissions/bs-perm-state-*` ×4），每次跑完各多一批；
+- 缺陷 2：3 个 `run-*` 目录残留，里面只有 tsx 的转译缓存 `tsx-6800/`——Windows 上文件句柄释放有延迟，`fs.rm` 撞上 EBUSY/EPERM，而旧代码把错误吞了，所以「跑完了但目录还在」没人知道；
+- 缺陷 4：`duplicate/T26c-POSIX…` 目录带着 `failed` 标记，可该用例在套件里明明计为 SKIP——「failed = 真实失败现场」这条约定被稀释了。
+
+修完后重跑全量（typecheck + build + `npm test`，退出码 0）：
+
+- 11 套 **301 通过 / 0 失败 / 2 跳过**（303 项），与修复前逐项一致；
+- **共享目录泄漏 0**：跑完后 `temp/` 下不再新增 `bs-big-src-*` / `bs-gate-journal-*` / `bs-perm-state-*` / `T26c-*`；
+- **11 个运行目录全部清理成功**，启动器逐个打印 `[run-suite] 本次运行目录已清理：…`；
+- 清理命令能逐个列出失败现场目录及其失败原因；
+- 系统 `%TEMP%` 复核仍是 **0** 候选（目录与文件都算）。
 
 ### 五、文档
 
@@ -327,8 +380,8 @@ journal\job.json
 | 项 | 值 |
 | --- | --- |
 | 分支 | `fix/m7-cross-platform-contract`（未切换） |
-| 本轮提交 | `2bf470f` `test: 统一测试临时目录到项目 temp/，成功删除失败保留`（19 个文件，+1280 / −146） |
-| 推送 | **未推送**（任务书要求：本轮默认只做本地修改与验证） |
+| 本轮提交 | `2bf470f` `test: 统一测试临时目录到项目 temp/，成功删除失败保留`（19 个文件，+1280 / −146）<br>`252e143` `docs: 记录 M7.1 临时目录治理与历史残留清理`<br>`ba77785` `test: 修复临时目录机制的四处缺陷`（共享目录泄漏 / 静默吞掉清理失败 / 清理命令看不见 run 目录 / 跳过被当成失败） |
+| 推送 | 已推送 `git push -u origin fix/m7-cross-platform-contract`（含上述全部提交） |
 | 合并 / Issue / Release / Tag | 均未动 |
 | 工作区 | 本轮改动已提交；仅剩未跟踪的 `GPT-NEXT-BRIEF.md`、`pack-out/`（本轮之前既有） |
 
@@ -345,6 +398,8 @@ journal\job.json
 | 「失败现场保留」的完整现场内容 | 已实测 | 独立脚本实证源/目标/journal 全在位 |
 | `run-suite.ts` 在 POSIX 下的命令解析 | 设计上跨平台 | 只在 win32 实测；POSIX 下 `node --import tsx` 同样有效 |
 | `disk-loss-drill.ts`（演练脚本） | **未迁移** | 它是人工演练脚本而非 `npm test` 的一部分，且目标目录由用户指定（`targetArg`），不属测试临时数据 |
+| 机制四处缺陷的修复效果 | **已在 win32 全量复跑验证** | 修完后重跑 typecheck + build + `npm test`（11 套 / 303 项）全绿；Linux / macOS 上同样未验证 |
+| 项目 `temp/` 内的 `failed` / `incomplete` 目录 | **按设计保留** | `test/temp-lifecycle.test.ts` 每轮故意制造这些目录来验证「失败保留」契约，它们是证据不是垃圾；确认不需要后用 `npm run test:temp:clean -- --all` 回收 |
 | 一次性清理后的历史目录 | 已清空 | `%TEMP%` 候选 0；报告留在 `temp/cleanup-reports/` |
 ## 备份主线安全待办
 
