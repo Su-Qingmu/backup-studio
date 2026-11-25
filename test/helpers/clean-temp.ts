@@ -86,7 +86,13 @@ async function readMarker(dir: string): Promise<Marker | null> {
  */
 function stripNamespace(p: string): string {
   if (p.startsWith('\\\\?\\UNC\\')) return '\\\\' + p.slice(8);
-  if (p.startsWith('\\\\?\\')) return p.slice(4);
+  if (p.startsWith('\\\\?\\')) {
+    const rest = p.slice(4);
+    // `\\?\Volume{...}` 之类不是盘符路径：剥掉前缀会变成相对路径，
+    // path.resolve 会把它落到 cwd，比较口径就失真了。这类一律判错。
+    if (!/^[A-Za-z]:/.test(rest) && !rest.startsWith('\\\\')) return p;
+    return rest;
+  }
   return p;
 }
 
@@ -117,6 +123,17 @@ async function realpathOf(p: string): Promise<string | null> {
 function errorCode(err: unknown): string {
   const code = (err as { code?: string } | undefined)?.code;
   return typeof code === 'string' ? code : '未知错误';
+}
+
+/**
+ * 判断一次读取失败是不是「目录已经不在了」。
+ *
+ * 并发删除（另一个测试进程或清理命令刚把它删掉）会报 ENOENT，
+ * 那是**正常状态**而不是权限故障——不该把它算进「读不到」并让退出码变成 1。
+ */
+function isVanished(err: unknown): boolean {
+  const code = (err as { code?: string } | undefined)?.code;
+  return code === 'ENOENT';
 }
 
 /**
@@ -191,6 +208,14 @@ export async function resolveBoundary(
   baseRoot: string,
   scanRoot: string,
 ): Promise<{ boundary: Boundary } | { error: string }> {
+  // 扫描根必须是约定的 <baseRoot>/temp/test-runs。
+  // 这个函数现在是导出的，参数由调用方传入——不约束的话，
+  // 误用可能把边界锚定到另一棵树上。
+  const expectedScanRoot = path.join(baseRoot, 'temp', 'test-runs');
+  if (path.resolve(scanRoot) !== path.resolve(expectedScanRoot)) {
+    return { error: `扫描根必须是 <项目根>/temp/test-runs，实际：${scanRoot}` };
+  }
+
   const repoReal = await realpathOf(baseRoot);
   if (!repoReal) return { error: '仓库根的真实路径无法解析，无法确认删除边界' };
 
@@ -199,6 +224,12 @@ export async function resolveBoundary(
   if (!tempSt) return { error: '项目 temp/ 目录不存在或不可读' };
   if (tempSt.isSymbolicLink()) {
     return { error: '项目 temp/ 是符号链接或 Junction，拒绝以它作为删除边界' };
+  }
+  // 锚点也要过一遍全类型重解析点查询：
+  // lstat 只认 symlink / Junction，挂载点与云端占位符要靠这一层。
+  const tempReparse = await reparsePoints([tempRoot]);
+  if (tempReparse.has(tempRoot)) {
+    return { error: '项目 temp/ 是重解析点，拒绝以它作为删除边界' };
   }
   const tempReal = await realpathOf(tempRoot);
   if (!tempReal) return { error: '项目 temp/ 的真实路径无法解析' };
@@ -210,6 +241,10 @@ export async function resolveBoundary(
   if (!runsSt) return { error: '扫描根 temp/test-runs/ 不存在或不可读' };
   if (runsSt.isSymbolicLink()) {
     return { error: '扫描根 temp/test-runs/ 是符号链接或 Junction，拒绝以它作为删除边界' };
+  }
+  const runsReparse = await reparsePoints([scanRoot]);
+  if (runsReparse.has(scanRoot)) {
+    return { error: '扫描根 temp/test-runs/ 是重解析点，拒绝以它作为删除边界' };
   }
   const runsRootReal = await realpathOf(scanRoot);
   if (!runsRootReal) return { error: '扫描根 temp/test-runs/ 的真实路径无法解析' };
@@ -369,7 +404,9 @@ async function collect(suiteFilter: string | null, runsRootReal: string): Promis
     try {
       entries = await fs.readdir(suiteDir);
     } catch (err) {
-      unreadable.push({ path: suiteDir, reason: `套件目录读取失败（${errorCode(err)}）` });
+      if (!isVanished(err)) {
+        unreadable.push({ path: suiteDir, reason: `套件目录读取失败（${errorCode(err)}）` });
+      }
       continue;
     }
 
@@ -394,7 +431,9 @@ async function collect(suiteFilter: string | null, runsRootReal: string): Promis
         try {
           children = await fs.readdir(dir);
         } catch (err) {
-          unreadable.push({ path: dir, reason: `运行目录读取失败（${errorCode(err)}）` });
+          if (!isVanished(err)) {
+            unreadable.push({ path: dir, reason: `运行目录读取失败（${errorCode(err)}）` });
+          }
           continue;
         }
         for (const child of children) {
@@ -585,6 +624,10 @@ async function main(): Promise<void> {
     if (safe.length > 40) console.log(`  …… 另有 ${safe.length - 40} 个`);
   }
 
+  // 读不到的目录必须让退出码反映出来，不能以 0 退出假装一切正常。
+  // 判定放在 dry-run 提前返回之前，否则 --dry-run 下权限故障仍会被伪装成成功。
+  if (unreadable.length) process.exitCode = 1;
+
   if (dryRun) {
     console.log('--dry-run：未执行任何删除');
     return;
@@ -650,11 +693,26 @@ async function main(): Promise<void> {
   console.log(`已删除 ${removed} 个；失败 ${failures.length} 个`);
   for (const f of failures.slice(0, 20)) console.log(`  失败 ${f.dir}：${f.error}`);
   if (failures.length) process.exitCode = 1;
-  // 读不到的目录必须让退出码反映出来，不能以 0 退出假装一切正常
-  if (unreadable.length) process.exitCode = 1;
 }
 
-void main().catch((err) => {
-  console.error(err);
-  process.exitCode = 1;
-});
+/**
+ * 只有作为**命令行入口**被直接运行时才执行清理逻辑。
+ *
+ * 这个模块导出 `resolveBoundary()` 给测试用；如果导入就跑 `main()`，
+ * 测试进程里会**顺带真跑一次清理**——那既不是测试想要的，
+ * 也可能因为一次无关的清理失败把「用例全过」的测试进程置成退出码 1。
+ */
+function isCliEntry(): boolean {
+  const invoked = process.argv[1];
+  if (!invoked) return false;
+  const self = fileURLToPath(import.meta.url);
+  const norm = (p: string) => (process.platform === 'win32' ? p.toLowerCase() : p);
+  return norm(path.resolve(invoked)) === norm(path.resolve(self));
+}
+
+if (isCliEntry()) {
+  void main().catch((err) => {
+    console.error(err);
+    process.exitCode = 1;
+  });
+}

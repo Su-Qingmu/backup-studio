@@ -725,12 +725,33 @@ async function main() {
     }
   });
 
+  await test('TL-S15 导入清理器模块不得在测试进程里顺带执行清理', async () => {
+    // 回归 NEW-1：clean-temp.ts 导出 resolveBoundary() 供测试使用。
+    // 如果它在导入期就 void main()，测试进程里会顺带真跑一次清理——
+    // 那次清理一旦失败就会把「用例全过」的测试进程置成退出码 1（假红）。
+    //
+    // 验证方式：直接以「被导入」的方式加载该模块，检查它没有产生清理输出。
+    const probe = [
+      "import { resolveBoundary } from './test/helpers/clean-temp.ts';",
+      "process.stdout.write('IMPORTED_OK ' + (typeof resolveBoundary === 'function'));",
+    ].join('\n');
+    const { stdout, stderr } = await execFileAsync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', probe], {
+      cwd: repoRoot,
+    });
+    assert.ok(stdout.includes('IMPORTED_OK'), '导入应当成功，实际 stdout=' + stdout);
+    assert.ok(
+      !/扫描到 \d+ 个目录|将要删除|已删除 \d+ 个/.test(stdout + stderr),
+      '导入不得顺带执行清理逻辑，实际输出：' + (stdout + stderr).slice(0, 300),
+    );
+  });
+
   await test('TL-S7 边界锚点校验：扫描根或 temp/ 是链接时必须拒绝（确定性构造）', async () => {
     // 这是 P0 回归：五道防线全都相对「扫描根的真实路径」成立，
     // 若扫描根本身（或 temp/）是指向仓库外的 Junction，边界锚点会整体外移，
     // --all 下无标记目录会被判定为 safe 并递归删除外部内容。
     //
     // 这里用一份**独立的假仓库**构造，避免动到真正在用的 temp/test-runs。
+    // resolveBoundary 要求扫描根必须是 <项目根>/temp/test-runs，假仓库也遵守这个约定。
     const base = path.join(genuineSystemTemp(), 'm72-safety-fakerepo-' + uniqueSuffix());
     const outside = path.join(genuineSystemTemp(), 'm72-safety-fakeoutside-' + uniqueSuffix());
     try {
