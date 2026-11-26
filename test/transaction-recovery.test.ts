@@ -10,6 +10,9 @@ import type { CopyResult } from '../electron/engine/pool';
 import { BackupTransaction } from '../electron/engine/transaction';
 import { CASE_INSENSITIVE_PATHS } from '../electron/engine/path-identity';
 import type { AppState, SyncMode } from '../shared/types';
+import { registerTempCleanup, trackTempDir } from './harness';
+
+registerTempCleanup();
 
 // The service launches copyWorker.js alongside itself. Use the existing Electron build.
 const { BackupService } = require('../dist-electron/electron/engine/service.js') as typeof import('../electron/engine/service');
@@ -22,7 +25,7 @@ const oldPayload = Buffer.from('last complete version');
 const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 
 async function fixture(t: TestContext) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'bs-transaction-'));
+  const root = trackTempDir(await fs.mkdtemp(path.join(os.tmpdir(), 'bs-transaction-')));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const source = path.join(root, 'source');
   const target = path.join(root, 'target');
@@ -460,7 +463,7 @@ interface ArchiveFixture {
 }
 
 async function archiveFixture(t: TestContext): Promise<ArchiveFixture> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'bs-archive-'));
+  const root = trackTempDir(await fs.mkdtemp(path.join(os.tmpdir(), 'bs-archive-')));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const transaction = new BackupTransaction(root, randomUUID(), async () => {});
   const source = path.join(root, 'source');
@@ -589,12 +592,17 @@ test('清理事务历史：受保护目录与文件跨大小写都必须保留�
     const parent = path.dirname(path.dirname(keep));
     const first = path.join(parent, 'Sibling');
     const second = path.join(parent, swapCase('Sibling'));
+    await fs.mkdir(first);
     try {
-      await fs.mkdir(first);
       await fs.mkdir(second);
-    } catch {
-      t.skip('当前文件系统大小写不敏感，无法构造只差大小写的兄弟目录');
-      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? '';
+      if (code === 'EEXIST') {
+        // 第二次创建撞名：说明该卷不区分大小写，本例无从构造
+        t.skip('当前文件系统大小写不敏感，无法构造只差大小写的兄弟目录');
+        return;
+      }
+      throw err;
     }
     await fs.writeFile(path.join(first, 'keep.bin'), 'keep');
     await fs.writeFile(path.join(second, 'other.bin'), 'other');

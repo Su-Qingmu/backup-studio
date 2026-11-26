@@ -7,6 +7,7 @@ import type { RevealFileSystem } from '../electron/engine/reveal-authority';
 import { historyDir } from '../electron/engine/manifest';
 import type { PlanAction } from '../shared/types';
 import type { BackupRevealErrorCode, BackupRevealResult } from '../shared/reveal-types';
+import { createRunner, registerTempCleanup, trackTempDir } from './harness';
 
 /**
  * 「定位文件」的服务端路径授权回归用例。
@@ -18,20 +19,13 @@ import type { BackupRevealErrorCode, BackupRevealResult } from '../shared/reveal
  * - 拒绝一律断言精确错误码，不接受「反正失败了」。
  */
 
-let passed = 0;
-let failed = 0;
+const runner = createRunner({ label: '定位授权', indent: '', stack: true, errorStream: true });
 
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
-  try {
-    await fn();
-    passed += 1;
-    console.log(`PASS ${name}`);
-  } catch (err) {
-    failed += 1;
-    console.error(`FAIL ${name}`);
-    console.error(`     ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
-  }
+  await runner.test(name, fn);
 }
+
+registerTempCleanup();
 
 // ---------------------------------------------------------------- 夹具工具
 
@@ -47,7 +41,7 @@ interface Roots {
 }
 
 async function withRoots(fn: (roots: Roots) => Promise<void>): Promise<void> {
-  const base = await fs.mkdtemp(path.join(FIXTURE_ROOT, 'bs-reveal-'));
+  const base = trackTempDir(await fs.mkdtemp(path.join(FIXTURE_ROOT, 'bs-reveal-')));
   const source = path.join(base, 'source');
   const target = path.join(base, 'target');
   await fs.mkdir(source, { recursive: true });
@@ -894,8 +888,8 @@ async function main(): Promise<void> {
     }
   });
 
-  console.log(`定位授权：${passed} 通过，${failed} 失败`);
-  if (failed) process.exitCode = 1;
+  console.log(runner.summary());
+  if (runner.failed) process.exitCode = 1;
 }
 
 void main().catch((err) => {
