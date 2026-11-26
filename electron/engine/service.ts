@@ -1108,6 +1108,8 @@ export class BackupService extends EventEmitter {
         syncMode: job.syncMode,
         allowMassDelete: false,
         resume: true,
+        // 恢复卡片的「确认并重扫」就是需确认时的回执，必须一路带进实际写入路径。
+        acknowledgeRisk: recoveryPermit?.revision,
       }, job);
     } finally {
       this.recoveryDeleteScope = null;

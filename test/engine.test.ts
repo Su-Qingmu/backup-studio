@@ -1288,7 +1288,7 @@ async function main(): Promise<void> {
 
       const service = new BackupService(userData);
       await service.plan(source, target, 'mirror');
-      await service.start({
+      await startWithPermit(service, {
         sourceRoot: source,
         targetRoot: target,
         syncMode: 'mirror',
