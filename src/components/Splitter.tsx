@@ -1,16 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
 import { animateSpring, SNAP_SPRING } from '../lib/spring';
-
-const HANDLE = 10;
-const MIN_RATIO = 0.24;
-/**
- * 拖拽上限必须高于 COLLAPSE_RATIO，否则用户永远拖不到 82%，
- * 「左栏超过 82% 自动收起右栏」就成了不可达分支。
- */
-const MAX_RATIO = 0.94;
-/** 左栏超过 82% 自动收起右栏 */
-const COLLAPSE_RATIO = 0.82;
-const DEFAULT_RATIO = 0.56;
+import {
+  COLLAPSE_RATIO,
+  DEFAULT_RATIO,
+  ratioFromPointer,
+  trackSizes,
+} from '../lib/splitter-layout';
+import { IconChevronRight } from './Icons';
 
 interface Props {
   containerRef: RefObject<HTMLDivElement>;
@@ -26,10 +22,18 @@ interface Props {
  *  - 松手越过 82%：右栏自动收起，弹簧零回弹咬死
  *  - 拖拽中按 Esc：恢复拖拽前的比例
  *  - 双击手柄：回到 50/50
+ *  - 收起后右缘常驻展开入口：右栏宽度为 0 时必须还有办法把它拉回来
+ *
+ * 轨道一律以 fr 表达（见 lib/splitter-layout）：固定像素的轨道会把工作区的
+ * 最小内容宽度钉死在最大化时的旧像素总和上，窗口还原后网格无法收缩，
+ * 右栏与分隔条被顶到窗口之外（#4）。fr 轨道不依赖任何尺寸重算，
+ * 容器怎么变都不会溢出。
  */
 export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) {
   const [dragging, setDragging] = useState(false);
   const ratioRef = useRef(DEFAULT_RATIO);
+  // 收起前的比例：展开时恢复，用户不必每次重新拖。
+  const expandedRatioRef = useRef(DEFAULT_RATIO);
   const dragRef = useRef({ active: false, startX: 0, startRatio: DEFAULT_RATIO, prevRatio: DEFAULT_RATIO });
   const animRef = useRef<(() => void) | null>(null);
   const collapsedRef = useRef(collapsed);
@@ -38,14 +42,19 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) 
     collapsedRef.current = collapsed;
   }, [collapsed]);
 
+  /**
+   * 把比例写成两条 fr 轨道。
+   *
+   * 轨道份额之和恒为 1，因此无论容器多宽，网格都不会溢出容器，
+   * 窗口还原后右栏必定回到可视区内。
+   */
   const applyRatio = useCallback(
     (ratio: number) => {
       const container = containerRef.current;
       if (!container) return;
-      const total = Math.max(0, container.clientWidth - HANDLE);
-      const left = Math.round(total * ratio);
-      container.style.setProperty('--left-w', `${left}px`);
-      container.style.setProperty('--right-w', `${Math.max(0, total - left)}px`);
+      const { left, right } = trackSizes(ratio, collapsedRef.current);
+      container.style.setProperty('--left-w', left);
+      container.style.setProperty('--right-w', right);
     },
     [containerRef],
   );
@@ -74,17 +83,15 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) 
     [applyRatio],
   );
 
-  // 初始比例与窗口尺寸变化时保持比例
+  /**
+   * 收起/展开状态变化时重写轨道。
+   *
+   * 比例是唯一事实，轨道只是它的投影：状态一变就重新投影一次，
+   * 不需要监听窗口尺寸——fr 轨道本身就随容器自动伸缩。
+   */
   useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return undefined;
-    applyRatio(ratioRef.current);
-    const observer = new ResizeObserver(() => {
-      if (!dragRef.current.active) applyRatio(ratioRef.current);
-    });
-    observer.observe(container);
-    return () => observer.disconnect();
-  }, [applyRatio, containerRef]);
+    applyRatio(collapsed ? 1 : ratioRef.current);
+  }, [collapsed, applyRatio]);
 
   // 拖拽过程中的 Esc 复位
   useEffect(() => {
@@ -154,13 +161,9 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) 
     const container = containerRef.current;
     if (!drag.active || !container) return;
 
-    const total = Math.max(1, container.clientWidth - HANDLE);
-    const ratio = drag.startRatio + (event.clientX - drag.startX) / total;
-    // 收起态的起点是 1，上限必须保持 1，否则第一帧就被夹回 0.94 而跳变
-    const upper = collapsedRef.current ? 1 : MAX_RATIO;
-    const clamped = Math.max(MIN_RATIO, Math.min(upper, ratio));
-    ratioRef.current = clamped;
-    applyRatio(clamped);
+    const ratio = ratioFromPointer(drag.startRatio, event.clientX - drag.startX, container.clientWidth, collapsedRef.current);
+    ratioRef.current = ratio;
+    applyRatio(ratio);
   };
 
   const handlePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -181,13 +184,18 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) 
     const ratio = ratioRef.current;
 
     if (ratio >= COLLAPSE_RATIO) {
+      // 收起前记住当前比例，展开时恢复。
+      if (!collapsedRef.current) expandedRatioRef.current = drag.startRatio;
       springTo(1);
       if (!collapsedRef.current) onCollapsedChange(true);
       return;
     }
     if (collapsedRef.current) {
       onCollapsedChange(false);
-      springTo(ratio);
+      // 收起态拖出来的位置就是用户想要的比例；没拖动（仍是 1）才回到收起前的比例。
+      const target = ratio < 0.999 ? ratio : expandedRatioRef.current;
+      expandedRatioRef.current = target;
+      springTo(target);
       return;
     }
     // 常规松手：零延迟咬死在当前位置
@@ -196,24 +204,47 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) 
   };
 
   const handleDoubleClick = () => {
+    expandedRatioRef.current = 0.5;
     onCollapsedChange(false);
     springTo(0.5);
   };
 
   return (
-    <div
-      className="splitter"
-      role="separator"
-      aria-orientation="vertical"
-      aria-label="调整分栏比例"
-      data-dragging={dragging}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
-      onPointerCancel={handlePointerUp}
-      onDoubleClick={handleDoubleClick}
-    >
-      <span className="splitter-grip" />
-    </div>
+    <>
+      <div
+        className="splitter"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="调整分栏比例"
+        data-dragging={dragging}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        onDoubleClick={handleDoubleClick}
+      >
+        <span className="splitter-grip" />
+      </div>
+
+      {/*
+        收起后的展开入口：右栏宽度为 0 时它是唯一的出路，
+        必须常驻在窗口右缘，不能随右栏一起消失。
+        绝对定位让它脱离网格流，不会挤占分栏轨道。
+      */}
+      {collapsed ? (
+        <button
+          type="button"
+          className="splitter-expand"
+          aria-label="展开右侧栏"
+          title="展开右侧栏"
+          onClick={() => {
+            onCollapsedChange(false);
+            springTo(expandedRatioRef.current);
+          }}
+        >
+          <IconChevronRight size={14} />
+        </button>
+      ) : null}
+    </>
   );
 }
