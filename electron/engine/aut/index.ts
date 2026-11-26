@@ -264,7 +264,13 @@ export class AutoSync implements AutoSyncApi {
   private async hydrate(st: PairState, ledger: PairLedger): Promise<void> {
     let remote;
     try { remote = await ledger.read(); }
-    catch { return; }
+    catch (err) {
+      // 读不出来就必须让用户知道：账本读不出来时本机视图不会从介质重建，
+      // 用户看到的会是一份「少了很多记录」的假象。静默返回等于骗人。
+      const reason = err instanceof Error ? err.message : String(err);
+      this.event(st, '历史账本读取失败', `账本读不出来：${reason}；本机视图未从介质重建`);
+      return;
+    }
     // 账本读不出来时不能装作没事：那份记录可能仍指向对象库里的历史对象。
     // 损坏情况会在同步流程里被修复并上报；这里先把事实记下来。
     if (remote.corruption.length) {

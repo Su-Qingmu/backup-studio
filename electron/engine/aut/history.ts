@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { promises as fs } from 'node:fs';
+import { promises as fs, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { AutoChange, AutoCommit, AutoPair, AutoRecycleEntry, AutoVersion } from '../../../shared/aut-types';
 import { writeJsonAtomic } from '../manifest';
@@ -41,6 +41,34 @@ export interface LedgerSnapshot {
 }
 
 interface Tombstone { t: 'v' | 'c'; id: string }
+
+/**
+ * 账本行的结构校验。
+ *
+ * 语法合法 ≠ 这一行有效：字段缺失、哈希不是 64 位十六进制的行一旦混进
+ * 账本，下游按它去取对象就会抛错，一行坏记录足以让整份账本读不出来。
+ * 这类行按损坏处理（跳过 + 留证），不会拖垮整份账本。
+ */
+function isTombstoneRow(row: unknown): boolean {
+  if (!row || typeof row !== 'object') return false;
+  const t = row as Record<string, unknown>;
+  return (t.t === 'v' || t.t === 'c') && typeof t.id === 'string';
+}
+
+function isVersionRow(row: unknown): boolean {
+  if (!row || typeof row !== 'object') return false;
+  const v = row as Record<string, unknown>;
+  return typeof v.id === 'string'
+    && typeof v.relPath === 'string'
+    && typeof v.hash === 'string'
+    && /^[a-f0-9]{64}$/.test(v.hash);
+}
+
+function isCommitRow(row: unknown): boolean {
+  if (!row || typeof row !== 'object') return false;
+  const c = row as Record<string, unknown>;
+  return typeof c.id === 'string' && Array.isArray(c.changes);
+}
 
 /**
  * 账本里读不出来的内容。
@@ -110,8 +138,25 @@ class KeyedMutex {
  */
 const objectLocks = new Map<string, KeyedMutex>();
 
+/**
+ * 锁键的规范形式。
+ *
+ * `path.resolve` 只做路径规范化，**不折叠大小写**：同一个目录写成
+ * `D:\Media` 与 `d:\media` 在 Windows 上是同一个地方，却会算出两个不同的
+ * 锁键——两个写者各自拿到自己的锁，照样在同一个暂存件上撞车
+ * （`.aut-part-<hash>` 是按哈希固定的，撞上去就是 EEXIST）。
+ * 介质可达时用真实路径（realpath）规范化，Windows 上再折叠大小写；
+ * 介质不可达时退回解析路径——那时没有写入，不存在撞车。
+ */
+function canonicalRoot(targetRoot: string): string {
+  const resolved = path.resolve(targetRoot);
+  let real = resolved;
+  try { real = realpathSync(resolved); } catch { /* 介质不可达：用解析路径 */ }
+  return process.platform === 'win32' ? real.toLowerCase() : real;
+}
+
 function lockFor(targetRoot: string, pairId: string): KeyedMutex {
-  const key = `${path.resolve(targetRoot)}\u0000${pairId}`;
+  const key = `${canonicalRoot(targetRoot)}\u0000${pairId}`;
   let lock = objectLocks.get(key);
   if (!lock) {
     lock = new KeyedMutex();
@@ -150,7 +195,7 @@ export class PairLedger {
    * 再往后的记录都是完整的。之前在这里 `break`，等于把半行之后的历史
    * 全部静默丢掉。
    */
-  private async readJsonl<T>(file: string): Promise<{ rows: T[]; corruption: LedgerCorruption | null }> {
+  private async readJsonl<T>(file: string, isValid?: (row: unknown) => boolean): Promise<{ rows: T[]; corruption: LedgerCorruption | null }> {
     let buf: Buffer;
     try { buf = await fs.readFile(file); }
     catch (err) { if (code(err) === 'ENOENT') return { rows: [], corruption: null }; throw err; }
@@ -160,6 +205,7 @@ export class PairLedger {
     let goodBytes = 0;
     let sawBad = false;
     let goodAfterBad = false;
+    let badIsLastLine = false;
     let pos = 0;
     while (pos < buf.length) {
       const nl = buf.indexOf(0x0a, pos);
@@ -173,7 +219,12 @@ export class PairLedger {
         continue;
       }
       try {
-        rows.push(JSON.parse(trimmed) as T);
+        const parsed = JSON.parse(trimmed) as unknown;
+        // 语法合法不代表这一行有效：字段缺失、哈希不是 64 位十六进制的行
+        // 混进账本后，下游按它去取对象就会抛错——一行坏记录足以让整份账本
+        // 读不出来。这类行按损坏处理：跳过 + 留证，不让它拖垮整份账本。
+        if (isValid && !isValid(parsed)) throw new Error('行结构不合法');
+        rows.push(parsed as T);
         // 坏行之后还有读得出来的记录 → 中段损坏，不是尾部半行。
         if (sawBad) goodAfterBad = true;
         else goodBytes = next;
@@ -181,14 +232,18 @@ export class PairLedger {
         sawBad = true;
         bad.push(raw);
         slices.push({ start: pos, end });
+        badIsLastLine = next === buf.length;
       }
       pos = next;
     }
     if (!sawBad) return { rows, corruption: null };
-    // 尾部半行：只有一处坏行、它在最后、且文件末尾没有换行符——
-    // 这正是追加途中崩溃留下的形状（换行符是追加内容的最后一个字节）。
-    const endsWithNewline = buf.length > 0 && buf[buf.length - 1] === 0x0a;
-    const tornTail = bad.length === 1 && !goodAfterBad && !endsWithNewline;
+    // 尾部半行：只有一处坏行，且它就在文件最后一行。
+    //
+    // 判据是「坏行是不是最后一行」，**不是**「文件末尾有没有换行符」：
+    // 追加前补换行的逻辑会在崩溃残留后面补一个 \n，于是同一份残留下一次
+    // 再读时末尾就有换行符了——若拿换行符当判据，同一份残留会被从
+    // 「尾部半行，可自愈」改判成「中段损坏，磁盘坏了」，白白误导用户。
+    const tornTail = bad.length === 1 && !goodAfterBad && badIsLastLine;
     return {
       rows,
       corruption: {
@@ -231,9 +286,9 @@ export class PairLedger {
    * 用户必须知道——否则容量清理会按「不存在的引用」删掉历史对象。
    */
   async read(): Promise<LedgerSnapshot> {
-    const tomb = await this.readJsonl<Tombstone>(this.tombstonesFile);
-    const ver = await this.readJsonl<AutoVersion>(this.versionsFile);
-    const com = await this.readJsonl<AutoCommit>(this.commitsFile);
+    const tomb = await this.readJsonl<Tombstone>(this.tombstonesFile, isTombstoneRow);
+    const ver = await this.readJsonl<AutoVersion>(this.versionsFile, isVersionRow);
+    const com = await this.readJsonl<AutoCommit>(this.commitsFile, isCommitRow);
     const droppedVersions = new Set(tomb.rows.filter(t => t.t === 'v').map(t => t.id));
     const droppedCommits = new Set(tomb.rows.filter(t => t.t === 'c').map(t => t.id));
     const versions = ver.rows.filter(v => !droppedVersions.has(v.id));
@@ -285,10 +340,24 @@ export class PairLedger {
       const quarantine = `${file}.corrupt-${Date.now()}-${randomUUID().slice(0, 8)}`;
       const qh = await fs.open(quarantine, 'w');
       try {
+        // 留证是人工核对的唯一依据，「哪几个字节是坏的」必须可查：
+        // 头部按字节区间记录每一片的位置。
+        const header = [
+          '# backup-studio 账本损坏留证 v1',
+          `# file=${corruption.file}`,
+          `# lines=${corruption.lines}`,
+          `# tornTail=${corruption.tornTail}`,
+          ...corruption.slices.map((s, i) => `# slice[${i}]=${s.start}..${s.end}`),
+          '',
+        ].join('\n');
+        await qh.writeFile(header, 'utf8');
+        // 逐片按**原始字节**写入，每片带上自己的行终止符：
+        // 两处坏行必须仍然是两行，粘在一起就分不清是哪几行坏了。
         for (const slice of corruption.slices) {
-          await qh.writeFile(buf.subarray(slice.start, slice.end));
+          const terminated = slice.end < buf.length && buf[slice.end] === 0x0a;
+          await qh.writeFile(buf.subarray(slice.start, terminated ? slice.end + 1 : slice.end));
+          if (!terminated) await qh.writeFile('\n');
         }
-        await qh.writeFile('\n');
         await qh.sync();
       } finally { await qh.close(); }
       if (corruption.tornTail) {

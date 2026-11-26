@@ -222,6 +222,103 @@ async function main() {
     assert.equal(quarantined.length, 1, '损坏内容必须留证');
     assert.ok(await ledger.hasQuarantine(), '留证还在时清理必须继续停手');
   }));
+
+  // —— 复审要求的「有鉴别力」回归测试 ——
+  // 下面每一条在对应的修复落地之前都会失败：它们锁住的正是此前没有测试
+  // 覆盖的那几个缺陷（半行之后的追加被整条丢弃、锁只在实例内生效、
+  // 留证粘成一行、墓碑损坏后冒出幽灵回收项）。
+  await test('历史账本：半行之后追加的记录不得被修复整条丢弃', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    const commit = (id: string) => JSON.stringify({ id, pairId: pair.id, at: 1, changes: [] });
+    await fs.mkdir(path.dirname(ledger.commitsFile), { recursive: true });
+    // 两条完好记录 + 追加途中崩溃留下的半行（末尾没有换行符）
+    await fs.writeFile(ledger.commitsFile, commit('c1') + '\n' + commit('c2') + '\n' + '{"id":"c3"', 'utf8');
+    // 下一轮同步在**还没修复**的情况下直接追加：记录紧跟在半行后面。
+    // 若追加时不补换行，这条新记录会被粘成一条坏行，随后被整条丢弃——
+    // 用户这一轮的恢复点就此从账本上消失。
+    await ledger.appendCommit({ id: 'c4', pairId: pair.id, at: 4, changes: [] }, noop);
+
+    await ledger.repairLedger(noop);
+    const after = await ledger.read();
+    assert.equal(after.corruption.length, 0, '修复后不得再有损坏');
+    const ids = after.commits.map(c => c.id);
+    assert.ok(ids.includes('c1') && ids.includes('c2'), '已有记录必须保留');
+    assert.ok(ids.includes('c4'), '半行之后追加的记录必须活下来，不得被整条丢弃');
+  }));
+
+  await test('历史对象：两个账本实例并发写同一对象必须互斥', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const a = new PairLedger(pair);
+    const b = new PairLedger(pair);
+    const payload = 'E'.repeat(64 * 1024);
+    const hash = sha256(payload);
+    const src = path.join(input.sourceRoot, 'a.txt');
+    await fs.writeFile(src, payload, 'utf8');
+    // 锁必须跨实例共享：同一个配对在代码里会被反复用新的 PairLedger 包起来，
+    // 实例级锁彼此不排斥，两个写者会撞在同一个 .aut-part-<hash> 上。
+    const results = await Promise.all([
+      a.storeObject(hash, src, noop),
+      b.storeObject(hash, src, noop),
+    ]);
+    assert.equal(await fs.readFile(a.objectPath(hash), 'utf8'), payload, '并发写入后对象内容必须完整');
+    assert.equal(results.filter(Boolean).length, 1, '两个写者中只有一个真正写入，另一个应当走去重');
+  }));
+
+  await test('历史账本：多处坏行必须逐行留证，字节与偏移都要能查', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    const commit = (id: string) => JSON.stringify({ id, pairId: pair.id, at: 1, changes: [] });
+    await fs.mkdir(path.dirname(ledger.commitsFile), { recursive: true });
+    // 第一处坏行是坏 JSON，第二处含非法 UTF-8 字节
+    const raw = Buffer.concat([
+      Buffer.from(commit('c1') + '\n', 'utf8'),
+      Buffer.from('{坏行一}\n', 'utf8'),
+      Buffer.from([0xff, 0xfe, 0x00, 0x41]),
+      Buffer.from('\n' + commit('c2') + '\n', 'utf8'),
+    ]);
+    await fs.writeFile(ledger.commitsFile, raw);
+
+    const snap = await ledger.read();
+    assert.equal(snap.commits.length, 2, '两条完好记录都要读出来');
+    assert.equal(snap.corruption.length, 1);
+    assert.equal(snap.corruption[0].lines, 2, '两处坏行都要如实报告');
+
+    await ledger.repairLedger(noop);
+    const dir = path.dirname(ledger.commitsFile);
+    const quarantined = (await fs.readdir(dir)).filter(f => f.includes('.corrupt-'));
+    assert.equal(quarantined.length, 1, '损坏内容必须留证');
+    const evidence = await fs.readFile(path.join(dir, quarantined[0]));
+    assert.ok(evidence.toString('utf8').includes('{坏行一}\n'), '两处坏行必须仍然是两行，不能粘在一起');
+    assert.ok(evidence.includes(Buffer.from([0xff, 0xfe, 0x00, 0x41])), '非法 UTF-8 字节必须原样保留，不得换成替换字符');
+    assert.match(evidence.toString('utf8'), /slice\[0\]=\d+\.\.\d+/, '留证必须记录坏行的字节区间');
+    const after = await ledger.read();
+    assert.equal(after.corruption.length, 0);
+    assert.equal(after.commits.length, 2, '修复不得动完好记录');
+  }));
+
+  await test('历史账本：墓碑账本损坏时，对象已消失的版本不得被当成可回收项', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    const alive = sha256('alive');
+    const ghost = sha256('ghost');
+    await fs.mkdir(ledger.objectsDir, { recursive: true });
+    await fs.writeFile(ledger.objectPath(alive), 'alive', 'utf8');
+    await fs.mkdir(path.dirname(ledger.versionsFile), { recursive: true });
+    const version = (id: string, hash: string) => JSON.stringify({
+      id, pairId: pair.id, relPath: 'x.txt', hash, size: 4, at: 1, commitId: 'c1', kind: 'replace',
+    });
+    await fs.writeFile(ledger.versionsFile, version('v-alive', alive) + '\n' + version('v-ghost', ghost) + '\n', 'utf8');
+    // 墓碑账本损坏 → 淘汰状态未知
+    await fs.writeFile(ledger.tombstonesFile, '{坏掉的墓碑}\n', 'utf8');
+
+    const snap = await ledger.read();
+    assert.equal(snap.corruption.length, 1, '墓碑账本损坏必须如实报告');
+    const ids = snap.versions.map(v => v.id);
+    assert.ok(ids.includes('v-alive'), '对象还在的版本必须保留');
+    assert.ok(!ids.includes('v-ghost'), '对象已消失的版本不得暴露为可回收项（幽灵项）');
+  }));
+
   await test('拒绝源内目标和反向包含', () => fixture({}, async (aut, input) => {
     const nested = path.join(input.sourceRoot, 'nested'); await fs.mkdir(nested);
     await assert.rejects(aut.addPair({ ...input, targetRoot: nested }), /互相包含/);
