@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import { animateSpring, SNAP_SPRING } from '../lib/spring';
 import {
   COLLAPSE_RATIO,
-  DEFAULT_RATIO,
   ratioFromPointer,
   trackSizes,
 } from '../lib/splitter-layout';
@@ -12,6 +11,10 @@ interface Props {
   containerRef: RefObject<HTMLDivElement>;
   collapsed: boolean;
   onCollapsedChange: (collapsed: boolean) => void;
+  /** 当前分栏比例：由上层持有，工作区切换后重新挂载也能恢复 */
+  ratio: number;
+  /** 比例稳定下来后回报给上层（回报的是「展开后」的比例） */
+  onRatioChange: (ratio: number) => void;
 }
 
 /**
@@ -29,12 +32,12 @@ interface Props {
  * 右栏与分隔条被顶到窗口之外（#4）。fr 轨道不依赖任何尺寸重算，
  * 容器怎么变都不会溢出。
  */
-export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) {
+export function Splitter({ containerRef, collapsed, onCollapsedChange, ratio, onRatioChange }: Props) {
   const [dragging, setDragging] = useState(false);
-  const ratioRef = useRef(DEFAULT_RATIO);
+  const ratioRef = useRef(ratio);
   // 收起前的比例：展开时恢复，用户不必每次重新拖。
-  const expandedRatioRef = useRef(DEFAULT_RATIO);
-  const dragRef = useRef({ active: false, startX: 0, startRatio: DEFAULT_RATIO, prevRatio: DEFAULT_RATIO });
+  const expandedRatioRef = useRef(ratio);
+  const dragRef = useRef({ active: false, startX: 0, startRatio: ratio, prevRatio: ratio });
   const animRef = useRef<(() => void) | null>(null);
   const collapsedRef = useRef(collapsed);
 
@@ -49,10 +52,13 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) 
    * 窗口还原后右栏必定回到可视区内。
    */
   const applyRatio = useCallback(
-    (ratio: number) => {
+    (value: number) => {
       const container = containerRef.current;
       if (!container) return;
-      const { left, right } = trackSizes(ratio, collapsedRef.current);
+      // 拖拽与弹簧过程中按**实时比例**投影，右栏才跟手；
+      // 只有「已收起且静止」时才投影成 1fr / 0fr。
+      const live = dragRef.current.active || animRef.current !== null;
+      const { left, right } = trackSizes(value, collapsedRef.current && !live);
       container.style.setProperty('--left-w', left);
       container.style.setProperty('--right-w', right);
     },
@@ -69,18 +75,19 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) 
         1,
         SNAP_SPRING,
         (t) => {
-          const ratio = from + (targetRatio - from) * t;
-          ratioRef.current = ratio;
-          applyRatio(ratio);
+          const value = from + (targetRatio - from) * t;
+          ratioRef.current = value;
+          applyRatio(value);
         },
         () => {
           animRef.current = null;
           ratioRef.current = targetRatio;
           applyRatio(targetRatio);
+          onRatioChange(expandedRatioRef.current);
         },
       );
     },
-    [applyRatio],
+    [applyRatio, onRatioChange],
   );
 
   /**
@@ -93,6 +100,16 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) 
     applyRatio(collapsed ? 1 : ratioRef.current);
   }, [collapsed, applyRatio]);
 
+  // 上层保存的比例与本地不一致时以它为准：
+  // 工作区切换会重新挂载本组件，收起前的比例必须跨挂载保留下来。
+  useEffect(() => {
+    if (ratio !== ratioRef.current) {
+      ratioRef.current = ratio;
+      expandedRatioRef.current = ratio;
+      applyRatio(collapsed ? 1 : ratio);
+    }
+  }, [ratio, collapsed, applyRatio]);
+
   // 拖拽过程中的 Esc 复位
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -103,6 +120,7 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) 
       containerRef.current?.classList.remove('is-resizing');
       document.body.style.cursor = '';
       setDragging(false);
+      expandedRatioRef.current = prev;
       springTo(prev);
     };
     window.addEventListener('keydown', onKeyDown);
@@ -161,9 +179,9 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) 
     const container = containerRef.current;
     if (!drag.active || !container) return;
 
-    const ratio = ratioFromPointer(drag.startRatio, event.clientX - drag.startX, container.clientWidth, collapsedRef.current);
-    ratioRef.current = ratio;
-    applyRatio(ratio);
+    const value = ratioFromPointer(drag.startRatio, event.clientX - drag.startX, container.clientWidth, collapsedRef.current);
+    ratioRef.current = value;
+    applyRatio(value);
   };
 
   const handlePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -181,26 +199,30 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) 
       // 指针捕获可能已失效
     }
 
-    const ratio = ratioRef.current;
+    const value = ratioRef.current;
 
-    if (ratio >= COLLAPSE_RATIO) {
+    if (value >= COLLAPSE_RATIO) {
       // 收起前记住当前比例，展开时恢复。
       if (!collapsedRef.current) expandedRatioRef.current = drag.startRatio;
       springTo(1);
       if (!collapsedRef.current) onCollapsedChange(true);
+      onRatioChange(expandedRatioRef.current);
       return;
     }
     if (collapsedRef.current) {
       onCollapsedChange(false);
       // 收起态拖出来的位置就是用户想要的比例；没拖动（仍是 1）才回到收起前的比例。
-      const target = ratio < 0.999 ? ratio : expandedRatioRef.current;
+      const target = value < 0.999 ? value : expandedRatioRef.current;
       expandedRatioRef.current = target;
       springTo(target);
+      onRatioChange(target);
       return;
     }
     // 常规松手：零延迟咬死在当前位置
-    ratioRef.current = ratio;
-    applyRatio(ratio);
+    expandedRatioRef.current = value;
+    ratioRef.current = value;
+    applyRatio(value);
+    onRatioChange(value);
   };
 
   const handleDoubleClick = () => {
@@ -229,7 +251,8 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange }: Props) 
       {/*
         收起后的展开入口：右栏宽度为 0 时它是唯一的出路，
         必须常驻在窗口右缘，不能随右栏一起消失。
-        绝对定位让它脱离网格流，不会挤占分栏轨道。
+        绝对定位让它脱离网格流，不会挤占分栏轨道；
+        靠上摆放，避开分隔条中部的抓手与命中区。
       */}
       {collapsed ? (
         <button
