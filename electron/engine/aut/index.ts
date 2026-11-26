@@ -24,7 +24,7 @@ import { copyAtomic, fault, stamp, type Gate } from './copy';
 import { Blocked, denial, type WritePermit } from './permit';
 import { MAX_ATTEMPTS, queueState, retryDelay, type QueueState } from './queue';
 import { recycleBytes, recyclePath } from './recycle';
-import { PairLedger, findLedgerPair, pruneHistory, recycleView, writeCommit, writeVersion, type LedgerIndexEntry } from './history';
+import { PairLedger, findLedgerPair, pruneHistory, recycleView, writeCommit, writeVersion, type LedgerCorruption, type LedgerIndexEntry, type LedgerSnapshot } from './history';
 import { captureVersion, keyFor, reconcile, type IndexEntry } from './sync';
 import { watchPair } from './watcher';
 
@@ -66,9 +66,15 @@ interface PairRuntime {
   /** 会话基线：本次软件运行期间观察到的源端文件集合。 */
   baseline: Set<string>;
   session: { deletes: number; unmanaged: number; counted: Set<string> };
+  /** 上一次上报过的账本损坏指纹：同一份损坏只该报一次。 */
+  corruptionFingerprint?: string;
 }
 
 const blank = (): Local => ({ version: 2, pairs: [] });
+
+/** 账本损坏的指纹：同一份损坏只该报一次，否则事件流会被重复条目淹没。 */
+const corruptionFingerprint = (list: readonly LedgerCorruption[]) =>
+  list.map(c => `${c.file}:${c.lines}:${c.tornTail}:${c.slices.map(s => `${s.start}-${s.end}`).join(',')}`).join('|');
 
 const reasonFor = (err: unknown) => {
   const labels: Record<string, string> = { ENOENT: '目录或文件不可用', EACCES: '权限不足', EPERM: '操作被拒绝或文件被占用', EBUSY: '文件被占用', ENOSPC: '磁盘空间不足', ENAMETOOLONG: '路径过长', EIO: '读写设备失败' };
@@ -275,7 +281,12 @@ export class AutoSync implements AutoSyncApi {
     // 损坏情况会在同步流程里被修复并上报；这里先把事实记下来。
     if (remote.corruption.length) {
       const detail = remote.corruption.map(c => `${c.file}(${c.lines} 行)`).join('、');
-      this.event(st, '历史账本损坏', `读不出来的内容：${detail}；本轮会先修复再继续`);
+      const rt = this.runtime(st.pair.id);
+      // 同一份损坏每一轮都会被读出来，不该每一轮都报一遍：事件流里重复的
+      // 同一条只会淹没真正的新变化。
+      if (rt.corruptionFingerprint !== corruptionFingerprint(remote.corruption)) {
+        this.event(st, '历史账本损坏', `读不出来的内容：${detail}；正在修复，修不好的会另行告知`);
+      }
     }
     if (!remote.commits.length && !remote.versions.length && !Object.keys(remote.index).length) return;
     st.history = { commits: remote.commits, versions: remote.versions };
@@ -297,11 +308,25 @@ export class AutoSync implements AutoSyncApi {
    */
   private async repairLedger(st: PairState, ledger: PairLedger, gate: Gate): Promise<void> {
     const corruption = await ledger.repairLedger(gate);
-    if (!corruption.length) return;
-    const detail = corruption
-      .map(c => `${c.file}${c.tornTail ? '（尾部半行，已截回）' : '（中段损坏，坏行已隔离留证）'}`)
-      .join('、');
-    this.event(st, '历史账本损坏', `${detail}；损坏内容已留证在账本目录的 .corrupt-* 文件中`);
+    const rt = this.runtime(st.pair.id);
+    if (corruption.length) {
+      const detail = corruption
+        .map(c => `${c.file}${c.tornTail ? '（尾部半行，已截回）' : '（中段损坏，坏行已隔离留证）'}`)
+        .join('、');
+      this.event(st, '历史账本损坏', `${detail}；损坏内容已留证在账本目录的 .corrupt-* 文件中`);
+      rt.corruptionFingerprint = undefined;
+      return;
+    }
+    // 修完还是坏：说明有自动修复处理不了的损坏。如实告诉用户需要人工核对，
+    // 而不是永远挂着同一句「会先修复再继续」。
+    let after: LedgerSnapshot | undefined;
+    try { after = await ledger.read(); } catch { after = undefined; }
+    if (!after || !after.corruption.length) { rt.corruptionFingerprint = undefined; return; }
+    const fingerprint = corruptionFingerprint(after.corruption);
+    if (rt.corruptionFingerprint === fingerprint) return;
+    rt.corruptionFingerprint = fingerprint;
+    const detail = after.corruption.map(c => `${c.file}(${c.lines} 行)`).join('、');
+    this.event(st, '历史账本需要人工核对', `读不出来的内容：${detail}；自动修复未能处理，请人工核对介质上的账本文件`);
   }
 
   /** 把索引与历史写回介质，并按容量上限清理（不删唯一完整恢复点）。 */
@@ -705,7 +730,12 @@ export class AutoSync implements AutoSyncApi {
         st.history = { commits: remote.commits, versions: remote.versions };
         await this.save();
       }
-    } catch { /* 介质不可达：使用本机缓存视图 */ }
+    } catch (err) {
+      // 读不出来不能装作没事：用户看到的是本机缓存视图，介质上的历史其实
+      // 读不到。至少如实说一声，别让「看起来有历史」变成假象。
+      const reason = err instanceof Error ? err.message : String(err);
+      this.event(st, '历史账本读取失败', `账本读不出来：${reason}；当前显示的是本机缓存视图`);
+    }
     return { commits: [...st.history.commits], versions: [...st.history.versions] } satisfies AutoHistory;
   });
 

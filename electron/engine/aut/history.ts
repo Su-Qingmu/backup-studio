@@ -58,10 +58,13 @@ function isTombstoneRow(row: unknown): boolean {
 function isVersionRow(row: unknown): boolean {
   if (!row || typeof row !== 'object') return false;
   const v = row as Record<string, unknown>;
+  // 空哈希是合法的「这个版本没有对象」形态：删除类变更就没有内容哈希
+  // （见 index.ts 的 recordChange：`hash: change.hash ?? ''`）。
+  // 把空哈希当成损坏会把正常的删除记录误判成坏行。
   return typeof v.id === 'string'
     && typeof v.relPath === 'string'
     && typeof v.hash === 'string'
-    && /^[a-f0-9]{64}$/.test(v.hash);
+    && (v.hash === '' || /^[a-f0-9]{64}$/.test(v.hash));
 }
 
 function isCommitRow(row: unknown): boolean {
@@ -329,8 +332,15 @@ export class PairLedger {
    */
   async repairLedger(gate: Gate): Promise<LedgerCorruption[]> {
     const found: LedgerCorruption[] = [];
-    for (const file of [this.commitsFile, this.versionsFile, this.tombstonesFile]) {
-      const { rows, corruption } = await this.readJsonl<unknown>(file);
+    // 校验器必须与 read() 用的是同一套：否则「read() 认定的损坏」在修复时
+    // 根本看不见——记录被报告成损坏，却既不被留证、也不被剔除，重建后还在。
+    const targets: Array<{ file: string; isValid: (row: unknown) => boolean }> = [
+      { file: this.commitsFile, isValid: isCommitRow },
+      { file: this.versionsFile, isValid: isVersionRow },
+      { file: this.tombstonesFile, isValid: isTombstoneRow },
+    ];
+    for (const { file, isValid } of targets) {
+      const { rows, corruption } = await this.readJsonl<unknown>(file, isValid);
       if (!corruption) continue;
       found.push(corruption);
       await gate();
@@ -347,7 +357,12 @@ export class PairLedger {
           `# file=${corruption.file}`,
           `# lines=${corruption.lines}`,
           `# tornTail=${corruption.tornTail}`,
-          ...corruption.slices.map((s, i) => `# slice[${i}]=${s.start}..${s.end}`),
+          // 区间是**半开**的 [start, end)，且指向**修复前**的原文件；
+          // term=added 表示原文件里这一行没有终止符，留证时补了一个换行。
+          ...corruption.slices.map((s, i) => {
+            const terminated = s.end < buf.length && buf[s.end] === 0x0a;
+            return `# slice[${i}]=${s.start}..${s.end} (half-open, original file)${terminated ? '' : ';term=added'}`;
+          }),
           '',
         ].join('\n');
         await qh.writeFile(header, 'utf8');

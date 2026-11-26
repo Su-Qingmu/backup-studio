@@ -319,6 +319,47 @@ async function main() {
     assert.ok(!ids.includes('v-ghost'), '对象已消失的版本不得暴露为可回收项（幽灵项）');
   }));
 
+  await test('历史账本：结构非法的记录必须被留证并剔除，不得留在账本里', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    await fs.mkdir(path.dirname(ledger.versionsFile), { recursive: true });
+    // 语法合法、但哈希不是 64 位十六进制：下游按它去取对象就会抛错，
+    // 一行坏记录足以让整份账本读不出来。这类行必须按损坏处理。
+    await fs.writeFile(ledger.versionsFile, JSON.stringify({
+      id: 'v-bad', pairId: pair.id, relPath: 'x.txt', hash: 'NOTHEX', size: 1, at: 1, commitId: 'c1', kind: 'replace',
+    }) + '\n', 'utf8');
+
+    const snap = await ledger.read();
+    assert.equal(snap.corruption.length, 1, '结构非法的记录必须如实报告为损坏');
+    assert.equal(snap.versions.length, 0, '结构非法的记录不得被当成历史版本');
+
+    const repaired = await ledger.repairLedger(noop);
+    assert.equal(repaired.length, 1, '必须报告修过一处');
+    const dir = path.dirname(ledger.versionsFile);
+    const quarantined = (await fs.readdir(dir)).filter(f => f.includes('.corrupt-'));
+    assert.equal(quarantined.length, 1, '结构非法的记录必须留证');
+    const evidence = await fs.readFile(path.join(dir, quarantined[0]), 'utf8');
+    assert.ok(evidence.includes('NOTHEX'), '留证必须含这一行的原始内容');
+    const after = await ledger.read();
+    assert.equal(after.corruption.length, 0, '修复后账本必须干净');
+    assert.equal(after.versions.length, 0, '非法记录不得留在账本里');
+    assert.ok(await ledger.hasQuarantine(), '留证在时容量清理必须停手');
+  }));
+
+  await test('历史账本：没有对象的版本记录不得被当成损坏', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    await fs.mkdir(path.dirname(ledger.versionsFile), { recursive: true });
+    // 删除类变更没有内容哈希（recordChange 写的是 hash: change.hash ?? ''），
+    // 这是合法的「没有对象」形态，不是坏行。
+    await fs.writeFile(ledger.versionsFile, JSON.stringify({
+      id: 'v-nohash', pairId: pair.id, relPath: 'x.txt', hash: '', size: 0, at: 1, commitId: 'c1', kind: 'delete',
+    }) + '\n', 'utf8');
+    const snap = await ledger.read();
+    assert.equal(snap.corruption.length, 0, '没有对象的版本记录不是损坏');
+    assert.equal(snap.versions.length, 1, '没有对象的版本记录必须保留');
+  }));
+
   await test('拒绝源内目标和反向包含', () => fixture({}, async (aut, input) => {
     const nested = path.join(input.sourceRoot, 'nested'); await fs.mkdir(nested);
     await assert.rejects(aut.addPair({ ...input, targetRoot: nested }), /互相包含/);
