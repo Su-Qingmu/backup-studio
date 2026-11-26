@@ -204,6 +204,19 @@ async function main() {
     assert.notEqual(service.getState().writePermits[target]?.verdict, 'blocked', '撤销隔离后不得继续阻断');
   });
 
+  await test('目标不可达时不得拿所在卷的健康状况背书', async () => {
+    const service = new BackupService(await makeTemp('bs-permit-unreachable-'));
+    const missing = path.join(os.tmpdir(), 'bs-permit-missing-' + Date.now());
+    const gate = await service.writeGate(missing);
+    assert.equal(gate.reachable, false, '不存在的路径必须判为不可达');
+    assert.equal(gate.allowed, false, '不可达时禁止写入');
+    assert.equal(
+      gate.volumeHealth,
+      'unknown',
+      '目标不可达时拿不到该介质的卷级事实：即使所在卷健康也不得判为 healthy',
+    );
+  });
+
   console.log(`\n通过 ${passed}，失败 ${failed}`);
   if (failed > 0) process.exitCode = 1;
 }

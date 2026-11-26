@@ -61,8 +61,15 @@ import type {
  * 只拿到盘符**不等于**健康：卷记录读到、且健康状态不是「未报告」才算确认，
  * 否则一律标成 unknown——宁可要求人工确认，也不伪造健康结论。
  */
-function volumeHealthOf(report: { volume: string | null; diskReadOnly?: boolean | null; volumeHealthKnown?: boolean }, repairNeeded: boolean): WriteGate['volumeHealth'] {
+function volumeHealthOf(
+  report: { volume: string | null; diskReadOnly?: boolean | null; volumeHealthKnown?: boolean },
+  repairNeeded: boolean,
+  reachable: boolean,
+): WriteGate['volumeHealth'] {
   if (repairNeeded) return 'repair-required';
+  // 目标不可达时，拿不到**这个介质**的卷级事实：所在卷（哪怕是系统盘）健康与否
+  // 都不能拿来替一个够不着的目标背书，否则等于伪造健康结论。
+  if (!reachable) return 'unknown';
   if (report.volume === null || report.diskReadOnly === true || report.volumeHealthKnown !== true) return 'unknown';
   return 'healthy';
 }
@@ -1165,7 +1172,7 @@ export class BackupService extends EventEmitter {
     const reachable = report.condition !== 'unreachable';
     const readOnly = report.diskReadOnly === true;
     const repairNeeded = report.condition === 'filesystem-repair' || this.blockedTargets.has(riskKey);
-    const volumeHealth = volumeHealthOf(report, repairNeeded);
+    const volumeHealth = volumeHealthOf(report, repairNeeded, reachable);
     // 目录级可写性：卷可写不等于该目录可写。null 表示能力缺失，按不阻断处理，
     // 真正开写前引擎还会再做一次现场探测。
     const targetWritable = report.targetWritable !== false;
@@ -1215,7 +1222,7 @@ export class BackupService extends EventEmitter {
       level: report?.assessment.level ?? 'L1',
       readOnly: report?.diskReadOnly === true,
       repairNeeded,
-      volumeHealth: report ? volumeHealthOf(report, repairNeeded) : 'unknown',
+      volumeHealth: report ? volumeHealthOf(report, repairNeeded, probe.reachable) : 'unknown',
       targetWritable: probe.writable,
     };
     const { verdict, reason } = deriveWritePermit(facts, 'user-directed');
