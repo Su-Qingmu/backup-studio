@@ -606,6 +606,8 @@ export default function App() {
                   <button
                     className="btn btn-sm btn-primary"
                     type="button"
+                    // 与「开始备份」共用同一道门：许可未就绪或未确认时不得执行。
+                    disabled={!canStart || busy}
                     onClick={() => {
                       setAllowMassDelete(true);
                       setConfirming(false);

@@ -286,7 +286,12 @@ fs.unlink = async (file) => {
   if (mode === 'start') {
     const plan = await service.plan(source, target, syncMode);
     deletePlan.push(...plan.actions.filter(({ type }) => type === 'delete').map(({ relPath }) => relPath));
-    await startWithPermit(service, { sourceRoot: source, targetRoot: target, syncMode, allowMassDelete: true, resume: true });
+    // 这个子进程是 --eval 片段，没有模块作用域：回执逻辑必须内联。
+    const permit = service.getState().writePermits[target];
+    await service.start({
+      sourceRoot: source, targetRoot: target, syncMode, allowMassDelete: true, resume: true,
+      acknowledgeRisk: permit && permit.verdict === 'confirm' ? permit.revision : undefined,
+    });
   } else if (mode === 'recover') {
     checkpoint = (await service.findRecoverableJob())?.jobId ?? null;
     assert.ok(checkpoint, '重启后仍应能发现中断任务');

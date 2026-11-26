@@ -212,13 +212,14 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
   assessment.writable = assessment.level === 'L0';
   // 判定条件随结论一起下发：同为 L1，「文件系统需人工检查」与「仅是证据不足」
   // 对写入的含义完全不同，界面据此区分「必须保持只读」与「证据不足待复查」。
-  assessment.condition = condition;
   // 「证据不足」的措辞在这里收口：无论结论来自哪条判定路径都不再自称「保持只读」，
   // 避免界面同时表达「不要写入」与「可以开始写入」两个相反结论。
   if (condition === 'uncertain' && assessment.level === 'L1') assessment.suggestion = UNCERTAIN_SUGGESTION;
   // L2 绝不能被标成「证据不足」：等级与条件必须一致，否则界面会同时
   // 显示「L2」和「证据不足」两个互相矛盾的结论。
   if (condition === 'uncertain' && assessment.level === 'L2') condition = 'media-unavailable';
+  // 条件归一之后再下发，保证 assessment.condition 与 report.condition 永不打架。
+  assessment.condition = condition;
   return {
     assessment,
     condition,
@@ -230,6 +231,11 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
     diskReadOnly: typeof volume?.readOnly === 'boolean' ? volume.readOnly : null,
     // 目录级可写性：卷可写不等于该目录可写，写入闸门两者都要看。
     targetWritable: probe.writable,
+    // 卷级健康是否真的取到了：卷记录读到、且健康状态不是「未报告」才算确认。
+    // 只拿到盘符不算健康结论。
+    volumeHealthKnown: Boolean(volume) && state !== '未报告',
+    // 介质身份：写入许可的回执要绑定它——同一路径换了介质就得重新确认。
+    mediaIdentity: probe.identity ? `${probe.identity.dev}:${probe.identity.ino}:${probe.identity.birth}` : null,
   };
 }
 

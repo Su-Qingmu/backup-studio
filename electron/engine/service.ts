@@ -56,6 +56,18 @@ import type {
  * 因此仅放宽「卷健康未知」。两种模式仍拦截不可达、隔离、L2、只读和需修复的介质。
  */
 /**
+ * 卷级健康口径。
+ *
+ * 只拿到盘符**不等于**健康：卷记录读到、且健康状态不是「未报告」才算确认，
+ * 否则一律标成 unknown——宁可要求人工确认，也不伪造健康结论。
+ */
+function volumeHealthOf(report: { volume: string | null; diskReadOnly?: boolean | null; volumeHealthKnown?: boolean }, repairNeeded: boolean): WriteGate['volumeHealth'] {
+  if (repairNeeded) return 'repair-required';
+  if (report.volume === null || report.diskReadOnly === true || report.volumeHealthKnown !== true) return 'unknown';
+  return 'healthy';
+}
+
+/**
  * 写入闸门的事实集合。
  *
  * 闸门、许可与界面提示都从同一份事实推导，避免出现第二套安全规则。
@@ -254,6 +266,8 @@ export interface StartOptions {
 export interface RecoverOptions {
   /** 用户已确认在当前介质上继续（隔离解除或 L1 放行） */
   confirmed: boolean;
+  /** 「需人工确认」回执：携带用户确认时的许可修订号 */
+  acknowledgeRisk?: number;
 }
 
 /**
@@ -301,6 +315,8 @@ export class BackupService extends EventEmitter {
   private permitRevision = 0;
   /** 已做过完整分层判定的目标：它们的许可比计划期的廉价探测更权威 */
   private fullyAssessed = new Set<string>();
+  /** 最近一次完整分层判定结果（按目标缓存）：计划期的廉价许可要沿用其中的分层事实 */
+  private reports = new Map<string, HealthReport>();
   private cancelled = false;
   private mediaLost = false;
   private journalDirty = false;
@@ -740,12 +756,10 @@ export class BackupService extends EventEmitter {
       // 许可必须跟着计划一起出现：界面据此决定能不能开始写入，
       // 主进程据此强制「需人工确认」回执。这里只用计划本来就要做的只读探测，
       // 完整的分层判定留给「只读检查/重新检测」与写前现场复核。
-      // 目标做过完整分层判定时，那份结论更权威，不要被廉价探测降级。
-      if (!this.fullyAssessed.has(targetRoot)) {
-        const probePermit = await this.buildProbePermit(targetRoot, probe);
-        this.permits.set(targetRoot, probePermit);
-        this.publishPermit(targetRoot, probePermit);
-      }
+      const probePermit = await this.buildProbePermit(targetRoot, probe);
+      this.permits.set(targetRoot, probePermit);
+      this.publishPermit(targetRoot, probePermit);
+      this.trimCaches();
 
       const [source, target, manifest] = await Promise.all([
         scanTree(sourceRoot, { excludeMetaDir: false }),
@@ -1023,6 +1037,15 @@ export class BackupService extends EventEmitter {
     if (this.blockedTargets.has(await this.targetRiskKey(job.targetRoot))) {
       throw new Error('卷需人工检查，仍须保持只读；中断账本已保留。');
     }
+    // 恢复路径的写入同样受写入许可约束。
+    // 恢复卡片上的「确认并重扫」本来就是「用户已确认在当前介质上继续」的显式授权，
+    // 因此它可以充当需确认时的回执；调用方另外带回执时以回执为准。
+    const recoveryPermit = this.permits.get(job.targetRoot) ?? null;
+    checkRiskAcknowledgement(
+      recoveryPermit,
+      options.acknowledgeRisk ?? (options.confirmed ? recoveryPermit?.revision : undefined),
+    );
+
     // 恢复前先按删除账本对账：把「已删除但未登记」的条目补进回收索引，
     // 把状态不明的条目标成 uncertain。对账是幂等的，可重复执行。
     //
@@ -1118,8 +1141,10 @@ export class BackupService extends EventEmitter {
     // 许可与判定同源：界面只消费主进程的裁决，不再自行推导安全规则。
     const permit = await this.buildWritePermit(targetRoot, report);
     this.permits.set(targetRoot, permit);
+    this.reports.set(targetRoot, report);
     this.publishPermit(targetRoot, permit);
     this.fullyAssessed.add(targetRoot);
+    this.trimCaches();
     this.emitState();
     return report;
   }
@@ -1138,8 +1163,7 @@ export class BackupService extends EventEmitter {
     const reachable = report.condition !== 'unreachable';
     const readOnly = report.diskReadOnly === true;
     const repairNeeded = report.condition === 'filesystem-repair' || this.blockedTargets.has(riskKey);
-    const volumeChecked = reachable && report.volume !== null && !readOnly && !repairNeeded;
-    const volumeHealth: WriteGate['volumeHealth'] = repairNeeded ? 'repair-required' : volumeChecked ? 'healthy' : 'unknown';
+    const volumeHealth = volumeHealthOf(report, repairNeeded);
     // 目录级可写性：卷可写不等于该目录可写。null 表示能力缺失，按不阻断处理，
     // 真正开写前引擎还会再做一次现场探测。
     const targetWritable = report.targetWritable !== false;
@@ -1163,6 +1187,7 @@ export class BackupService extends EventEmitter {
       condition: report.condition,
       volumeHealth: facts.volumeHealth,
       evidence,
+      mediaIdentity: report.mediaIdentity ?? null,
     });
   }
 
@@ -1178,13 +1203,17 @@ export class BackupService extends EventEmitter {
     const riskKey = await this.targetRiskKey(targetRoot);
     const mark = this.state.quarantine;
     const isolated = Boolean(mark && !mark.released && (await this.targetRiskKey(mark.targetRoot)) === riskKey);
+    // 分层事实沿用最近一次完整判定（若做过），可达性与目录可写性用**本次**探测：
+    // 目录可能刚刚变成只读，旧判定不会知道。
+    const report = this.reports.get(targetRoot);
+    const repairNeeded = report?.condition === 'filesystem-repair' || this.blockedTargets.has(riskKey);
     const facts: WriteGateFacts = {
       reachable: probe.reachable,
       isolated,
-      level: 'L1',
-      readOnly: false,
-      repairNeeded: this.blockedTargets.has(riskKey),
-      volumeHealth: 'unknown',
+      level: report?.assessment.level ?? 'L1',
+      readOnly: report?.diskReadOnly === true,
+      repairNeeded,
+      volumeHealth: report ? volumeHealthOf(report, repairNeeded) : 'unknown',
       targetWritable: probe.writable,
     };
     const { verdict, reason } = deriveWritePermit(facts, 'user-directed');
@@ -1193,10 +1222,11 @@ export class BackupService extends EventEmitter {
       `可写性：${probe.writable ? '目标根可写' : '目标根只读'}`,
     ];
     return this.makePermit(targetRoot, verdict, reason, {
-      level: 'L1',
-      condition: 'uncertain',
-      volumeHealth: 'unknown',
+      level: report?.assessment.level ?? 'L1',
+      condition: report?.condition ?? 'uncertain',
+      volumeHealth: facts.volumeHealth,
       evidence,
+      mediaIdentity: probe.identity ? `${probe.identity.dev}:${probe.identity.ino}:${probe.identity.birth}` : null,
     });
   }
 
@@ -1210,10 +1240,13 @@ export class BackupService extends EventEmitter {
     targetRoot: string,
     verdict: WritePermit['verdict'],
     reason: string | null,
-    extra: { level: WritePermit['level']; condition: WritePermit['condition']; volumeHealth: WritePermit['volumeHealth']; evidence: string[] },
+    extra: { level: WritePermit['level']; condition: WritePermit['condition']; volumeHealth: WritePermit['volumeHealth']; evidence: string[]; mediaIdentity?: string | null },
   ): WritePermit {
     const previous = this.permits.get(targetRoot);
-    const revision = previous && previous.verdict === verdict && previous.reason === reason
+    // 结论、理由与介质身份三者都没变时，才沿用旧修订号：
+    // 同一路径换了介质也算换了对象，旧的确认回执必须失效。
+    const sameObject = previous?.mediaIdentity === (extra.mediaIdentity ?? null);
+    const revision = previous && previous.verdict === verdict && previous.reason === reason && sameObject
       ? previous.revision
       : ++this.permitRevision;
     const base = {
@@ -1222,6 +1255,7 @@ export class BackupService extends EventEmitter {
       level: extra.level,
       condition: extra.condition,
       volumeHealth: extra.volumeHealth,
+      mediaIdentity: extra.mediaIdentity ?? null,
       revision,
       at: now(),
     };
@@ -1237,11 +1271,26 @@ export class BackupService extends EventEmitter {
    * 否则界面会拿着别的目标的许可去放行当前目标。
    */
   private publishPermit(targetRoot: string, permit: WritePermit): void {
-    const next = { ...this.state.writePermits, [targetRoot]: permit };
+    // 重新插入到末尾 = 最近使用；被挤出去的应该是最久没用的那条，
+    // 而不是当前选中的目标。
+    const next = { ...this.state.writePermits };
+    delete next[targetRoot];
+    next[targetRoot] = permit;
     const keys = Object.keys(next);
-    // 只保留最近的若干条：许可按目标缓存，但不必无限增长。
     for (const key of keys.slice(0, Math.max(0, keys.length - 8))) delete next[key];
     this.state.writePermits = next;
+  }
+
+  /** 内部缓存有界：许可与判定报告按目标缓存，但不必无限增长。 */
+  private trimCaches(): void {
+    const limit = 16;
+    for (const cache of [this.permits, this.reports]) {
+      const keys = [...cache.keys()];
+      for (const key of keys.slice(0, Math.max(0, keys.length - limit))) cache.delete(key);
+    }
+    if (this.fullyAssessed.size > limit) {
+      for (const key of [...this.fullyAssessed].slice(0, this.fullyAssessed.size - limit)) this.fullyAssessed.delete(key);
+    }
   }
 
   /**
@@ -1254,9 +1303,15 @@ export class BackupService extends EventEmitter {
     try {
       await this.inspectTarget(targetRoot, true);
     } catch (err) {
+      // 判定失败时的兜底：隔离中一律阻断，其余情况要求人工确认——
+      // 绝不能把「没判定出来」当成「可以写」。
+      const quarantined = Boolean(this.state.quarantine && !this.state.quarantine.released
+        && this.state.quarantine.targetRoot === targetRoot);
       const permit: WritePermit = {
-        verdict: 'confirm',
-        reason: `未能完成目标介质判定（${errorText(err)}）：当前未发现明确写入阻断，继续前请自行确认目标介质状态。`,
+        verdict: quarantined ? 'blocked' : 'confirm',
+        reason: quarantined
+          ? '介质处于隔离观察，禁止写入'
+          : `未能完成目标介质判定（${errorText(err)}）：当前未发现明确写入阻断，继续前请自行确认目标介质状态。`,
         evidence: [],
         targetRoot,
         level: 'L1',
@@ -1268,6 +1323,7 @@ export class BackupService extends EventEmitter {
       this.permits.set(targetRoot, permit);
       this.publishPermit(targetRoot, permit);
       this.fullyAssessed.add(targetRoot);
+      this.emitState();
       return permit;
     }
     return this.permits.get(targetRoot) as WritePermit;

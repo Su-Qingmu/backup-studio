@@ -37,7 +37,8 @@ export function MediaDiagnostics({ api, root, disabled, permit }: { api: BackupA
     {report && <>
       <p><strong>{report.assessment.level} / {labels[report.condition]}</strong>（置信度 {Math.round(report.assessment.confidence * 100)}%）</p>
       <p>{report.assessment.suggestion}</p>
-      {permit && permit.targetRoot === root && permit.at >= report.assessment.at ? (
+      {permit && permit.targetRoot === root && permit.at >= report.assessment.at
+        && permit.level === report.assessment.level && permit.condition === report.condition ? (
         <p role="status">
           <strong>写入许可：{permit.verdict === 'blocked' ? '已阻断' : permit.verdict === 'confirm' ? '需人工确认' : '允许写入'}</strong>
           {permit.reason ? `（${permit.reason}）` : ''}

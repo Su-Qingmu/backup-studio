@@ -208,6 +208,15 @@ export interface HealthReport {
    * 两者都要进入写入闸门，否则许可可能放行一个根本写不进去的目录。
    */
   targetWritable?: boolean | null;
+  /**
+   * 卷级健康是否**真的取到**了。
+   *
+   * 只拿到盘符不等于健康：卷记录读到了、健康状态不是「未报告」才算确认。
+   * 未确认时不得假装健康。
+   */
+  volumeHealthKnown?: boolean;
+  /** 本次判定对应的介质身份指纹；换介质后旧结论不再适用 */
+  mediaIdentity?: string | null;
 }
 
 /**
@@ -266,6 +275,8 @@ export interface WritePermitBase {
    * 免得「确认过一次」被复用到另一份判定上。
    */
   revision: number;
+  /** 本次判定对应的介质身份指纹；回执绑定它，换介质后须重新确认 */
+  mediaIdentity?: string | null;
   /** 判定时间 */
   at: number;
 }
