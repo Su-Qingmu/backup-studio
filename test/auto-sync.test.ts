@@ -6,7 +6,8 @@ import { setTimeout as wait } from 'node:timers/promises';
 import { AutoSync, type WriteDecision, type WritePermit } from '../electron/engine/aut';
 import { Debounce, retryDelay } from '../electron/engine/aut/queue';
 import { ensureRoom, recyclePath } from '../electron/engine/aut/recycle';
-import type { AutoPairInput, AutoRecycleEntry, AutoStatus } from '../shared/aut-types';
+import { PairLedger } from '../electron/engine/aut/history';
+import type { AutoPair, AutoPairInput, AutoRecycleEntry, AutoStatus } from '../shared/aut-types';
 
 let passed = 0, failed = 0;
 async function test(name: string, fn: () => Promise<void>) {
@@ -47,7 +48,165 @@ const idle = (aut: AutoSync, id: string) => until(aut, s => {
   return p.state === 'idle' && !!p.lastSync && p.pending === 0;
 });
 
+/** 构造一个完整的配对对象（账本类测试直接用它，不经过 AutoSync）。 */
+const makePair = (input: AutoPairInput, id = 'pair-ledger-test'): AutoPair => ({
+  id,
+  enabled: true,
+  sourceRoot: input.sourceRoot,
+  targetRoot: input.targetRoot,
+  excludes: input.excludes ?? [],
+  syncDeletes: input.syncDeletes ?? false,
+  retentionDays: input.retentionDays ?? 7,
+  recycleMaxBytes: input.recycleMaxBytes ?? 1024 * 1024,
+  externalChanges: input.externalChanges ?? 'pause',
+  pollOnly: input.pollOnly ?? false,
+  pollMs: input.pollMs ?? 30_000,
+  stableMs: input.stableMs ?? 500,
+  allowSnapshotFiles: input.allowSnapshotFiles ?? false,
+  historyMaxBytes: input.historyMaxBytes ?? 1024 * 1024,
+  historyMaxVersionsPerPath: input.historyMaxVersionsPerPath ?? 20,
+});
+const noop = async () => {};
+
 async function main() {
+  await test('历史账本：尾部半行属崩溃残留，可自愈且不丢已有记录', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    const commit = (id: string) => JSON.stringify({ id, pairId: pair.id, at: 1, changes: [] });
+    await fs.mkdir(path.dirname(ledger.commitsFile), { recursive: true });
+    // 两条完好记录 + 一条追加途中崩溃留下的半行（末尾没有换行符）
+    await fs.writeFile(ledger.commitsFile, commit('c1') + '\n' + commit('c2') + '\n' + '{"id":"c3","pairId":"' + pair.id + '"', 'utf8');
+
+    const snap = await ledger.read();
+    assert.equal(snap.commits.length, 2, '两条完好记录必须读出来');
+    assert.equal(snap.corruption.length, 1, '必须如实报告损坏，不得静默丢弃');
+    assert.equal(snap.corruption[0].tornTail, true, '末尾半行属于可自愈的崩溃残留');
+
+    const repaired = await ledger.repairLedger(noop);
+    assert.equal(repaired.length, 1, '必须报告修过一处');
+    const after = await ledger.read();
+    assert.equal(after.corruption.length, 0, '修复后不得再有损坏');
+    assert.equal(after.commits.length, 2, '修复不得丢掉已有记录');
+    // 修复后还能继续追加：账本重新变成一条可追加的一致日志
+    await ledger.appendCommit({ id: 'c3', pairId: pair.id, at: 3, changes: [] }, noop);
+    const final = await ledger.read();
+    assert.equal(final.commits.length, 3, '修复后追加必须接得上');
+    assert.equal(final.corruption.length, 0);
+  }));
+
+  await test('历史账本：中段损坏时坏行之后的完好记录必须保留并留证', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    const commit = (id: string) => JSON.stringify({ id, pairId: pair.id, at: 1, changes: [] });
+    await fs.mkdir(path.dirname(ledger.commitsFile), { recursive: true });
+    await fs.writeFile(ledger.commitsFile, commit('c1') + '\n{坏掉的 json}\n' + commit('c2') + '\n', 'utf8');
+
+    const snap = await ledger.read();
+    assert.equal(snap.commits.length, 2, '坏行之后的完好记录不得被一起丢掉');
+    assert.equal(snap.corruption.length, 1, '必须如实报告损坏');
+    assert.equal(snap.corruption[0].tornTail, false, '中段损坏不是尾部半行');
+    assert.equal(snap.corruption[0].lines, 1);
+
+    await ledger.repairLedger(noop);
+    const dir = path.dirname(ledger.commitsFile);
+    const quarantined = (await fs.readdir(dir)).filter(f => f.includes('.corrupt-'));
+    assert.equal(quarantined.length, 1, '损坏内容必须留证，不得静默丢弃');
+    assert.match(await fs.readFile(path.join(dir, quarantined[0]), 'utf8'), /坏掉的 json/);
+    const after = await ledger.read();
+    assert.equal(after.corruption.length, 0, '修复后账本必须重新干净');
+    assert.equal(after.commits.length, 2, '隔离不得动完好记录');
+  }));
+
+  await test('历史对象：修复期间掉盘必须中止，源文件不得被删', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    const payload = 'payload';
+    const hash = sha256(payload);
+    const src = path.join(input.sourceRoot, 'a.txt');
+    await fs.writeFile(src, payload, 'utf8');
+    // 介质上一个内容已损坏的既有对象（文件名仍是旧哈希）
+    await fs.mkdir(ledger.objectsDir, { recursive: true });
+    await fs.writeFile(ledger.objectPath(hash), 'CORRUPT', 'utf8');
+
+    let calls = 0;
+    const gate = async () => {
+      calls += 1;
+      if (calls >= 2) throw Object.assign(new Error('介质掉线'), { code: 'ENODEV' });
+    };
+    await assert.rejects(ledger.storeObject(hash, src, gate), /介质掉线/);
+    // 修复失败 → 调用方据此中止同步：备份目录里的完好文件不能被删
+    assert.equal(await fs.readFile(src, 'utf8'), payload, '修复失败时源文件必须保留');
+    // 对象不得被当成已修好
+    assert.notEqual(await fs.readFile(ledger.objectPath(hash), 'utf8'), payload, '掉盘时不得声称对象已修好');
+  }));
+
+  await test('历史对象：崩溃留下的半截暂存件必须被接续修好', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    const payload = 'A'.repeat(4096);
+    const hash = sha256(payload);
+    const src = path.join(input.sourceRoot, 'a.txt');
+    await fs.writeFile(src, payload, 'utf8');
+    await fs.mkdir(ledger.objectsDir, { recursive: true });
+    // 上一次运行崩在复制途中：暂存件只写了一半
+    await fs.writeFile(path.join(ledger.objectsDir, `.aut-part-${hash}`), payload.slice(0, 100), 'utf8');
+
+    await ledger.storeObject(hash, src, noop);
+    assert.equal(await fs.readFile(ledger.objectPath(hash), 'utf8'), payload, '崩溃残留的暂存件必须被接续修好');
+  }));
+
+  await test('历史对象：崩溃留下的完整暂存件必须被正确发布', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    const payload = 'B'.repeat(4096);
+    const hash = sha256(payload);
+    const src = path.join(input.sourceRoot, 'a.txt');
+    await fs.writeFile(src, payload, 'utf8');
+    await fs.mkdir(ledger.objectsDir, { recursive: true });
+    // 上一次运行崩在「暂存件已写完、还没改名发布」：暂存件内容是完整的
+    await fs.writeFile(path.join(ledger.objectsDir, `.aut-part-${hash}`), payload, 'utf8');
+
+    await ledger.storeObject(hash, src, noop);
+    assert.equal(await fs.readFile(ledger.objectPath(hash), 'utf8'), payload, '完整的暂存件必须被正确发布');
+  }));
+
+  await test('历史对象：同一对象被并发访问时必须互斥，不得留下「名字对内容错」的对象', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    const payload = 'C'.repeat(64 * 1024);
+    const hash = sha256(payload);
+    const src = path.join(input.sourceRoot, 'a.txt');
+    await fs.writeFile(src, payload, 'utf8');
+
+    // 两个写者同时处理同一个哈希：暂存名是按哈希固定的，不互斥就会互相截断
+    const results = await Promise.all([
+      ledger.storeObject(hash, src, noop),
+      ledger.storeObject(hash, src, noop),
+    ]);
+    assert.equal(await fs.readFile(ledger.objectPath(hash), 'utf8'), payload, '并发写入后对象内容必须完整');
+    assert.equal(results.filter(Boolean).length, 1, '两个写者中只有一个真正写入了对象，另一个应当走去重');
+  }));
+
+  await test('历史账本损坏时不得做容量清理：丢了记录引用的对象不能被当成孤儿删掉', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    const payload = 'D'.repeat(1024);
+    const hash = sha256(payload);
+    await fs.mkdir(ledger.objectsDir, { recursive: true });
+    await fs.writeFile(ledger.objectPath(hash), payload, 'utf8');
+    await fs.mkdir(path.dirname(ledger.versionsFile), { recursive: true });
+    // 一条读不出来的版本记录：它引用的对象在账本里「不存在」了
+    await fs.writeFile(ledger.versionsFile, '{坏掉的版本记录}\n', 'utf8');
+
+    const snap = await ledger.read();
+    assert.equal(snap.corruption.length, 1, '必须报告账本损坏');
+    // 清理的依据是账本：账本坏了就不能按「无人引用」删对象
+    const versions = snap.versions;
+    const liveHashes = new Set<string>();
+    const orphan = new Set(versions.filter(v => !liveHashes.has(v.hash)).map(v => v.hash));
+    assert.equal(orphan.size, 0, '读不出记录时不得凭空得出「孤儿对象」结论');
+    assert.ok(await fs.stat(ledger.objectPath(hash)), '账本损坏期间对象必须留着');
+  }));
   await test('拒绝源内目标和反向包含', () => fixture({}, async (aut, input) => {
     const nested = path.join(input.sourceRoot, 'nested'); await fs.mkdir(nested);
     await assert.rejects(aut.addPair({ ...input, targetRoot: nested }), /互相包含/);

@@ -284,6 +284,20 @@ export class AutoSync implements AutoSyncApi {
     }
     await ledger.writeIndex(index, gate);
     await ledger.writeMeta(gate);
+    // 账本读不出来时先修复，并把损坏内容留证。
+    const corruption = await ledger.repairLedger(gate);
+    if (corruption.length) {
+      // 账本坏过：容量清理必须停手。
+      //
+      // 被读不出来的那几行可能仍然指向对象库里的历史对象——那些版本记录
+      // 已经不在账本里了，清理会把它们当成「无人引用的对象」删掉。
+      // 用户的恢复点就此消失，而且再也找不回来。账本修好之前一个对象都不删。
+      const detail = corruption
+        .map(c => `${c.file}${c.tornTail ? '（尾部半行，已截回）' : '（中段损坏，已隔离留证）'}`)
+        .join('、');
+      this.event(st, '历史账本损坏', `${detail}；本轮不做历史容量清理`);
+      return;
+    }
     const liveHashes = new Set(Object.values(st.index).map(entry => entry.hash));
     const window = st.pair.retentionDays * 86_400_000;
     const pruned = await pruneHistory({
