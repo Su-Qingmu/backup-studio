@@ -1329,6 +1329,174 @@ async function main(): Promise<void> {
       '目标保持为空时新增照常完成');
   });
 
+  await test('可靠性：降级复制中途中断不得在目标留下半截文件', async () => {
+    const source = await makeTemp('bs-degrade-int-src-');
+    const target = await makeTemp('bs-degrade-int-dst-');
+    const userData = await makeTemp('bs-degrade-int-ud-');
+    // 大于一次写入的块（1 MB），保证写到一半被打断时确有内容落在目标上。
+    await writeFile(source, 'payload.bin', 'P'.repeat(3 * 1024 * 1024));
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'copy');
+
+    const destPath = path.join(target, 'payload.bin');
+    const originalLink = fs.link;
+    const originalOpen = fs.open;
+    const patched = fs as unknown as { link: typeof fs.link; open: typeof fs.open };
+    // 模拟 exFAT / FAT32：硬链接不可用，提交走降级分支。
+    patched.link = (async () => {
+      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    }) as typeof fs.link;
+    // 模拟降级复制写到一半被中断（写盘错误）。
+    patched.open = (async (file: any, flags: any, mode?: any) => {
+      const handle = await originalOpen(file, flags, mode);
+      if (String(file) === destPath && typeof flags === 'string' && flags.includes('wx')) {
+        const originalWrite = handle.write.bind(handle) as (
+          buffer: Buffer, offset: number, length: number, position: number,
+        ) => Promise<{ bytesWritten: number }>;
+        let chunks = 0;
+        (handle as unknown as {
+          write: (buffer: Buffer, offset: number, length: number, position: number) => Promise<{ bytesWritten: number }>;
+        }).write = async (buffer: Buffer, offset: number, length: number, position: number) => {
+          chunks += 1;
+          if (chunks > 1) {
+            // ENOSPC：介质空间在复制途中耗尽。这不是介质掉线
+            //（EIO 那一类会被引擎按掉盘处理），是普通的写失败，
+            // 用来验证「写了一半失败」这条路径的清理行为。
+            throw Object.assign(new Error('simulated write interruption'), { code: 'ENOSPC' });
+          }
+          return originalWrite(buffer, offset, length, position);
+        };
+      }
+      return handle;
+    }) as typeof fs.open;
+
+    try {
+      await service.start({
+        sourceRoot: source,
+        targetRoot: target,
+        syncMode: 'copy',
+        allowMassDelete: true,
+        resume: true,
+      });
+    } finally {
+      patched.link = originalLink;
+      patched.open = originalOpen;
+    }
+
+    assert.equal(service.getState().phase, 'failed', '降级复制中断后任务不得报完成');
+    assert.equal(await exists(target, 'payload.bin'), false,
+      '复制中断后不得在目标路径留下半截文件：那会被下一次规划当成已存在的目标');
+  });
+
+  await test('可靠性：降级复制期间目标被并发替换时不得删除替换进来的文件', async () => {
+    const source = await makeTemp('bs-degrade-repl-src-');
+    const target = await makeTemp('bs-degrade-repl-dst-');
+    const userData = await makeTemp('bs-degrade-repl-ud-');
+    await writeFile(source, 'payload.bin', 'P'.repeat(3 * 1024 * 1024));
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'copy');
+
+    const destPath = path.join(target, 'payload.bin');
+    const originalLink = fs.link;
+    const originalOpen = fs.open;
+    const originalUnlink = fs.unlink;
+    const originalWriteFile = fs.writeFile;
+    const patched = fs as unknown as { link: typeof fs.link; open: typeof fs.open };
+    patched.link = (async () => {
+      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    }) as typeof fs.link;
+    // 在降级写入刚落下第一批数据后，外部把目标路径换成另一个文件：
+    // 那是用户自己的内容，备份既不得覆盖它，也不得把它当成自己的删掉。
+    patched.open = (async (file: any, flags: any, mode?: any) => {
+      const handle = await originalOpen(file, flags, mode);
+      if (String(file) === destPath && typeof flags === 'string' && flags.includes('wx')) {
+        const originalWrite = handle.write.bind(handle) as (
+          buffer: Buffer, offset: number, length: number, position: number,
+        ) => Promise<{ bytesWritten: number }>;
+        let chunks = 0;
+        (handle as unknown as {
+          write: (buffer: Buffer, offset: number, length: number, position: number) => Promise<{ bytesWritten: number }>;
+        }).write = async (buffer: Buffer, offset: number, length: number, position: number) => {
+          chunks += 1;
+          const result = await originalWrite(buffer, offset, length, position);
+          if (chunks === 1) {
+            await originalUnlink(destPath).catch(() => undefined);
+            await originalWriteFile(destPath, 'FOREIGN-CONTENT', 'utf8');
+          }
+          return result;
+        };
+      }
+      return handle;
+    }) as typeof fs.open;
+
+    try {
+      await service.start({
+        sourceRoot: source,
+        targetRoot: target,
+        syncMode: 'copy',
+        allowMassDelete: true,
+        resume: true,
+      });
+    } finally {
+      patched.link = originalLink;
+      patched.open = originalOpen;
+    }
+
+    assert.equal(await fs.readFile(destPath, 'utf8'), 'FOREIGN-CONTENT',
+      '并发替换进来的文件是用户的内容：不得被覆盖，也不得被当成自己的删掉');
+    assert.equal(service.getState().phase, 'failed',
+      '目标被并发替换后这次提交并不成立，任务不得报完成');
+  });
+
+  await test('可靠性：降级复制期间目标目录被替换时不得写进替换后的路径', async () => {
+    const source = await makeTemp('bs-degrade-dir-src-');
+    const target = await makeTemp('bs-degrade-dir-dst-');
+    const userData = await makeTemp('bs-degrade-dir-ud-');
+    await writeFile(source, 'sub/payload.bin', 'P'.repeat(1024));
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'copy');
+
+    const destDir = path.join(target, 'sub');
+    const destPath = path.join(destDir, 'payload.bin');
+    const originalLink = fs.link;
+    const originalOpen = fs.open;
+    const originalRm = fs.rm;
+    const originalWriteFile = fs.writeFile;
+    const patched = fs as unknown as { link: typeof fs.link; open: typeof fs.open };
+    patched.link = (async () => {
+      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    }) as typeof fs.link;
+    // 目标目录在提交前被换成一个普通文件：备份必须发现写不进去并如实报失败，
+    // 而不是把这个「目录」当成可写目标、把数据落到别处。
+    patched.open = (async (file: any, flags: any, mode?: any) => {
+      if (String(file) === destPath) {
+        await originalRm(destDir, { recursive: true, force: true });
+        await originalWriteFile(destDir, 'NOT-A-DIRECTORY', 'utf8');
+      }
+      return originalOpen(file, flags, mode);
+    }) as typeof fs.open;
+
+    try {
+      await service.start({
+        sourceRoot: source,
+        targetRoot: target,
+        syncMode: 'copy',
+        allowMassDelete: true,
+        resume: true,
+      });
+    } finally {
+      patched.link = originalLink;
+      patched.open = originalOpen;
+    }
+
+    assert.equal(service.getState().phase, 'failed', '目标目录被替换后任务不得报完成');
+    assert.equal(await fs.readFile(destDir, 'utf8'), 'NOT-A-DIRECTORY',
+      '被替换掉的目标目录不得被写坏');
+  });
+
   await test('可靠性：介质不支持硬链接时仍不覆盖预览之后出现的同名文件', async () => {
     const source = await makeTemp('bs-stale2-src-');
     const target = await makeTemp('bs-stale2-dst-');

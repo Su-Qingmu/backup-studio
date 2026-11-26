@@ -144,6 +144,30 @@ type FileHandle = Awaited<ReturnType<typeof fs.open>>;
  * 另一个实体之后，句柄读到的仍然是刚打开的那一份。若改用「按路径重新打开」
  * 来哈希，校验的就会是**替换之后**的新版本——新版本从未被归档，删掉它等于丢数据。
  */
+/**
+ * 把源文件的内容写进一个**已打开的句柄**。
+ *
+ * 句柄绑定的是实体（inode / file index），不是路径：写到一半失败或期间
+ * 路径被别人换掉时，我们写的仍然是手里这一个实体，不会误伤别人的文件。
+ * 走「按路径重新打开再复制」则没有这个保证。
+ */
+async function copyIntoHandle(srcPath: string, handle: FileHandle): Promise<number> {
+  const source = await fs.open(srcPath, 'r');
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  let position = 0;
+  try {
+    for (;;) {
+      const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      await handle.write(buffer, 0, bytesRead, position);
+      position += bytesRead;
+    }
+  } finally {
+    await source.close();
+  }
+  return position;
+}
+
 async function hashOpenHandle(handle: FileHandle): Promise<string> {
   const hash = createHash('sha256');
   const buffer = Buffer.allocUnsafe(1024 * 1024);
@@ -1554,39 +1578,78 @@ export class BackupService extends EventEmitter {
       const code = errorCode(err);
       if (code === 'EEXIST') return true;
       if (!code || !HARDLINK_UNSUPPORTED_CODES.has(code)) throw err;
-      // 降级：硬链接不可用（exFAT / FAT32 等）→ 独占复制（同样不覆盖）。
-      try {
-        await fs.copyFile(srcPath, destPath, fs.constants.COPYFILE_EXCL);
-      } catch (copyErr) {
-        if (errorCode(copyErr) === 'EEXIST') return true;
-        throw copyErr;
-      }
-      // 独占复制不是原子发布：内容是边拷边落的，落盘之前目标路径上
-      // 已经是一份可能不完整的数据。必须落盘并回读校验，否则「已发布」
-      // 可能只是一份没写完的内容。
-      //
+      // 降级：硬链接不可用（exFAT / FAT32 等）→ 独占写入（同样不覆盖）。
+      return this.commitByExclusiveWrite(srcPath, destPath, expectedHash);
+    }
+  }
+
+  /**
+   * 降级提交：独占创建 + 句柄写入 + 句柄校验。
+   *
+   * 为什么不能用 `fs.copyFile(..., COPYFILE_EXCL)`：
+   * 1. 它把内容**边拷边落在最终路径上**，落盘完成之前，目标路径上已经
+   *    是一份可能不完整的数据；中途失败或掉电，半截文件就留在那里。
+   * 2. 它不返回句柄，我们**无法证明**最终路径上那份文件是我们写的。
+   *    于是「回读校验发现内容不对」时，只能靠路径比对来猜是不是自己的；
+   *    而路径上如果已经被外部并发替换成了另一个文件，那份替换进来的文件
+   *    就会被当成自己的删掉——用户的唯一副本被误删。
+   *
+   * 现在的做法：先用 `'wx'` 独占创建目标路径。独占创建成功即证明这个
+   * 实体是我们创建的（别人不可能同时创建同名文件），句柄从此绑定该实体。
+   * 内容经句柄写入，回读校验也经句柄完成。收尾时再按 dev/ino 比对，
+   * 确认路径仍指向我们的实体；期间若被并发替换，我们**不碰**替换进来的
+   * 文件，只如实报失败。
+   *
+   * 任何失败都只撤销**我们自己**创建的那一份：路径上如果已经换成别人的
+   * 文件，绝不删除。
+   *
+   * 返回 true 表示目标路径已被占用（别人抢先创建），false 表示提交成功。
+   */
+  private async commitByExclusiveWrite(srcPath: string, destPath: string, expectedHash?: string): Promise<boolean> {
+    let handle: FileHandle;
+    try {
+      // 'x' = 独占创建：已存在就 EEXIST，绝不覆盖别人的文件。
+      handle = await fs.open(destPath, 'wx+');
+    } catch (err) {
+      if (errorCode(err) === 'EEXIST') return true;
+      throw err;
+    }
+    try {
+      await copyIntoHandle(srcPath, handle);
+      await handle.sync();
       // 回读用**句柄**：句柄绑定的是实体而不是路径——按路径重新打开读到的
       // 可能是替换之后的新版本，那份内容从未被归档，删掉它等于丢数据。
-      const handle = await fs.open(destPath, 'r+');
-      try {
-        await handle.sync();
-        if (expectedHash && await hashOpenHandle(handle) !== expectedHash) {
-          // 只撤销自己写的那一份：路径可能已经被别人换掉了。
-          const mine = await handle.stat().catch(() => undefined);
-          const current = await fs.stat(destPath).catch(() => undefined);
-          const ours = Boolean(mine && current && mine.ino !== 0
-            && mine.dev === current.dev && mine.ino === current.ino);
-          if (ours) await fs.unlink(destPath).catch(() => undefined);
-          throw Object.assign(
-            new Error(ours
-              ? '提交内容校验失败，已撤销未完成的目标文件'
-              : '提交内容校验失败，目标文件已被外部替换，未做删除'),
-            { code: 'VERIFY_FAILED' },
-          );
-        }
-      } finally { await handle.close(); }
+      const actual = await hashOpenHandle(handle);
+      if (expectedHash && actual !== expectedHash) {
+        throw Object.assign(new Error('提交内容校验失败'), { code: 'VERIFY_FAILED' });
+      }
+      // 收尾前确认路径仍指向我们创建的实体。
+      // 期间被并发替换的话，替换进来的文件不能被我们当成自己的删掉，
+      // 也不能把这次提交当成成功——备份并没有落到目标上。
+      const mine = await handle.stat();
+      const current = await fs.stat(destPath).catch(() => undefined);
+      if (!current || current.dev !== mine.dev || current.ino !== mine.ino) {
+        throw Object.assign(
+          new Error('提交期间目标文件已被外部替换，未做删除'),
+          { code: 'TARGET_REPLACED' },
+        );
+      }
       await syncDirectory(path.dirname(destPath));
       return false;
+    } catch (err) {
+      // 只撤销自己写的那一份：路径可能已经被别人换掉了。
+      const mine = await handle.stat().catch(() => undefined);
+      const current = await fs.stat(destPath).catch(() => undefined);
+      const ours = Boolean(mine && current && mine.dev === current.dev && mine.ino === current.ino);
+      if (ours) await fs.unlink(destPath).catch(() => undefined);
+      throw Object.assign(
+        new Error(ours
+          ? `提交失败，已撤销未完成的目标文件：${errorText(err)}`
+          : `提交失败，目标文件已被外部替换，未做删除：${errorText(err)}`),
+        { code: errorCode(err) ?? 'COMMIT_FAILED' },
+      );
+    } finally {
+      await handle.close();
     }
   }
 
