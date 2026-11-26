@@ -19,7 +19,7 @@ import type {
 import { writeJsonAtomic } from '../manifest';
 import { hashFile } from '../hash';
 import { scanTree } from '../scan';
-import { checkRoot, code, exclusion, historyLimits, makePair, safePath, statFollowing, statMaybe, validatePairInput } from './config';
+import { checkRoot, code, exclusion, historyLimits, makePair, safePath, statMaybe, validatePairInput } from './config';
 import { copyAtomic, fault, stamp, type Gate } from './copy';
 import { Blocked, denial, type WritePermit } from './permit';
 import { MAX_ATTEMPTS, queueState, retryDelay, type QueueState } from './queue';
@@ -70,6 +70,8 @@ interface PairRuntime {
   corruptionFingerprint?: string;
   /** 已经向用户报过的损坏指纹：同一份损坏不得每轮重复上报。 */
   reportedCorruption?: string;
+  /** 已经报过的那份损坏的具体记录：判定「账本是否真的回来了」要用。 */
+  reportedCorruptionDetail?: LedgerCorruption[];
 }
 
 const blank = (): Local => ({ version: 2, pairs: [] });
@@ -315,26 +317,30 @@ export class AutoSync implements AutoSyncApi {
       // 损坏再次出现时，它会被当成「已经报过」而静默吞掉——用户刚修好的账本
       // 又坏了，却什么提示都收不到。
       if (rt.reportedCorruption) {
+        // 判定「先前那份坏掉的账本是不是真的回来了」必须有**正面证据**：
+        // 光看「根目录下有没有目录」是不够的 —— 目录在但里面是另一份
+        // （甚至是空的）账本时，读出来照样是干净的；而探测本身失败时，
+        // 更是什么都没验证成。两种情况下都宣布「已恢复」都是没有依据的。
+        // 证据不足时只说「无法确认」，把话说到能说到的那一步为止。
+        const verdict = await ledger.verifyRecovered(rt.reportedCorruptionDetail ?? []);
+
         rt.reportedCorruption = undefined;
-        // 作废这件事要让用户看得见：否则「账本已经好了」和「程序还在记着
-        // 一份旧账」在界面上完全一样。
-        //
-        // 这里**只说已经确定发生的事**：账本要么能完整读出，要么已经不存在。
-        // 容量清理能不能恢复取决于留证文件还在不在——它可能这一刻才被写下、
-        // 也可能下一刻被人工删掉——提前替它表态，说的就是假的。清理是否停手
-        // 由另一条事件（历史账本曾损坏）如实交代。
-        let vanished = false;
-        try {
-          // 跟随链接看真实形态：lstat 把 Windows 的目录联接报成「不是目录」，
-          // 而它指向的账本目录明明正常存在。照 lstat 判会说「账本已消失」——
-          // 那是凭空造出来的假警报，用户会以为历史真的没了。
-          const st = await statFollowing(ledger.root);
-          vanished = !st?.isDirectory();
-        } catch { vanished = false; }
-        this.event(st, vanished ? '历史账本已消失' : '历史账本已恢复',
-          vanished
-            ? '账本目录已不存在，先前报告的损坏已无处核对；介质上的历史请自行确认'
-            : '账本已能完整读出，先前报告的损坏已不存在');
+        rt.reportedCorruptionDetail = undefined;
+        if (verdict === 'recovered') {
+          // 作废这件事要让用户看得见：否则「账本已经好了」和「程序还在记着
+          // 一份旧账」在界面上完全一样。
+          //
+          // 这里**只说已经确定发生的事**：先前损坏的那份账本已经回来了。
+          // 容量清理能不能恢复取决于留证文件还在不在——它可能这一刻才被写下、
+          // 也可能下一刻被人工删掉——提前替它表态，说的就是假的。清理是否停手
+          // 由另一条事件（历史账本曾损坏）如实交代。
+          this.event(st, '历史账本已恢复', '账本已能完整读出，先前报告的损坏已不存在');
+        } else if (verdict === 'vanished') {
+          this.event(st, '历史账本已消失', '账本目录已不存在，先前报告的损坏已无处核对；介质上的历史请自行确认');
+        } else {
+          // 验证没成功就如实说没成功：不能替用户下「已经好了」的结论。
+          this.event(st, '历史账本无法确认', '无法确认先前损坏的账本是否已经回来（账本读不出来或内容对不上）；先前的损坏仍然有效，下一轮再核对');
+        }
       }
     }
     if (!remote.commits.length && !remote.versions.length && !Object.keys(remote.index).length) return;
@@ -379,6 +385,8 @@ export class AutoSync implements AutoSyncApi {
       }
       rt.corruptionFingerprint = undefined;
       rt.reportedCorruption = undefined;
+      // 修好了就没有「先前那份损坏」可言了，别留着过期证据。
+      rt.reportedCorruptionDetail = undefined;
       return;
     }
     // 还坏着：如告诉用户需要人工核对。同一份损坏不重复上报——
@@ -387,6 +395,8 @@ export class AutoSync implements AutoSyncApi {
     rt.corruptionFingerprint = fingerprint;
     if (rt.reportedCorruption === fingerprint) return;
     rt.reportedCorruption = fingerprint;
+    // 把明细也留一份：下一轮判定「这份账本是不是真的回来了」需要拿它做比对。
+    rt.reportedCorruptionDetail = [...remaining];
     const detail = remaining.map(c => `${c.file}(${c.lines} 行)`).join('、');
     this.event(st, '历史账本需要人工核对', `读不出来的内容：${detail}；自动修复未能处理，请人工核对介质上的账本文件`);
   }

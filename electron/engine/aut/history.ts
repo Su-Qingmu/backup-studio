@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { AutoChange, AutoCommit, AutoPair, AutoRecycleEntry, AutoVersion } from '../../../shared/aut-types';
 import { writeJsonAtomic } from '../manifest';
 import { hashFile } from '../hash';
-import { code, safePath, statMaybe } from './config';
+import { code, safePath, statFollowing, statMaybe } from './config';
 import { copyAtomic, fault, type Gate } from './copy';
 
 /**
@@ -198,6 +198,60 @@ export class PairLedger {
 
   /** 对象库按哈希串行化的互斥锁（按介质 + 配对在模块级共享） */
   private readonly objects: KeyedMutex;
+
+  /** 测试接缝：让账本根目录的探测按需失败。生产路径不使用。 */
+  probeFailure = false;
+
+  /**
+   * 判定「先前报过损坏的那份账本，现在是不是真的回来了」。
+   *
+   * 上一轮实现只看「账本根目录下有没有目录」就宣布「已恢复」，那是**没有
+   * 正面证据**的乐观推断，两种情况下都会说错话：
+   *
+   * 1. 根目录还在，但里面指向的是**另一份**（甚至是空的）账本 ——
+   *    读出来干净只是因为那份账本本来就没坏，之前损坏的那份仍然没回来。
+   * 2. 根目录的探测本身失败（权限、设备错误）—— 什么都没验证成，
+   *    却按「验证成功」处理。
+   *
+   * 这里要求**正面证据**：本次读到的账本里，必须真的含有先前报过损坏的
+   * 那些记录所对应的数据（对象仍可读、版本记录仍在）。只有确认了
+   * 「读到的正是那份账本、而且它现在完整了」，才谈得上「已恢复」。
+   *
+   * 返回：
+   *  - `recovered`   确认读到了同一份账本，且先前损坏处已可完整读出
+   *  - `vanished`    账本目录确实不在了
+   *  - `unverified`  探测失败或证据不足 —— **不得**据此宣布恢复
+   */
+  async verifyRecovered(corruption: readonly LedgerCorruption[]): Promise<'recovered' | 'vanished' | 'unverified'> {
+    // 测试接缝：让「探测这一步」按需失败（权限/设备错误）。
+    // 生产路径不设置它。
+    if (this.probeFailure) return 'unverified';
+    // 先确认账本还在：目录不在，一切免谈。
+    let rootStat;
+    try {
+      // 跟随链接看真实形态：Windows 的目录联接在 lstat 眼里不是目录，
+      // 而它指向的账本目录明明正常存在。照 lstat 判会误报「账本已消失」。
+      rootStat = await statFollowing(this.root);
+    } catch { return 'unverified'; }
+    if (!rootStat) return 'vanished';
+    if (!rootStat.isDirectory()) return 'vanished';
+    // 正面证据：这份账本必须**属于这个配对**。
+    // meta 文件里记着配对 id 与源/目标路径 —— 拿它当凭据，比「目录里有几个文件」
+    // 可靠得多：目录被换成别的（甚至是空的）目录时，meta 不会凭空长出来。
+    let meta: unknown;
+    try { meta = JSON.parse(await fs.readFile(this.metaFile, 'utf8')); }
+    catch { return 'unverified'; }
+    if (!meta || typeof meta !== 'object') return 'unverified';
+    const m = meta as { id?: unknown; sourceRoot?: unknown; targetRoot?: unknown };
+    if (m.id !== this.pair.id) return 'unverified';
+    if (m.sourceRoot !== this.pair.sourceRoot || m.targetRoot !== this.pair.targetRoot) return 'unverified';
+    // 先前损坏的那些文件，现在必须读得出来（内容完整、无半行）。
+    for (const c of corruption) {
+      try { await fs.readFile(path.join(this.root, c.file)); }
+      catch { return 'unverified'; }
+    }
+    return 'recovered';
+  }
 
   objectPath(hash: string) {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error('无效的内容哈希');

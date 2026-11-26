@@ -117,10 +117,16 @@ const unrepairableCorruption = (): LedgerCorruption => ({
 
 class UnrepairableLedger extends PairLedger {
   constructor(pair: AutoPair, private readonly state: { broken: boolean }) { super(pair); }
+  /** 让「账本是否回来了」的探测按需失败（模拟权限/设备错误）。 */
+  probeFails = false;
   override async read(): Promise<LedgerSnapshot> {
     const snap = await super.read();
     if (!this.state.broken || snap.corruption.length) return snap;
     return { ...snap, corruption: [unrepairableCorruption()] };
+  }
+  override async verifyRecovered(corruption: readonly LedgerCorruption[]): Promise<'recovered' | 'vanished' | 'unverified'> {
+    if (this.probeFails) return 'unverified';
+    return super.verifyRecovered(corruption);
   }
   override async repairLedger(): Promise<LedgerCorruption[]> {
     if (!this.state.broken) return [];
@@ -129,6 +135,73 @@ class UnrepairableLedger extends PairLedger {
     await fs.mkdir(this.root, { recursive: true });
     await fs.writeFile(path.join(this.root, `versions.jsonl.corrupt-${Date.now()}-test`), '模拟的不可修复损坏\n', 'utf8');
     return [unrepairableCorruption()];
+  }
+}
+
+/**
+ * 真实损坏、但**修不掉**的账本：账本文件里就写着坏行。
+ *
+ * 与 UnrepairableLedger 的区别：那个是「read 时谎报损坏」——修好后
+ * read() 立刻返回干净快照，于是 repairLedger 走「已修好」分支，
+ * 「先前报过损坏」的状态从未被建立起来（后面那条判定路径根本走不到）。
+ * 这个是账本文件里真的有坏行，读出来就是坏的，改好文件才真的变干净。
+ */
+class TrulyCorruptLedger extends PairLedger {
+  constructor(pair: AutoPair, private readonly state: { broken: boolean; probeFails?: boolean; stillCorrupt?: boolean }) { super(pair); }
+  /** 让「账本是否回来了」的探测按需失败（模拟权限/设备错误）。 */
+  get probeFails(): boolean { return this.state.probeFails === true; }
+  /** 把状态里的开关接到基类的探测接缝上。 */
+  override async verifyRecovered(corruption: readonly LedgerCorruption[]): Promise<'recovered' | 'vanished' | 'unverified'> {
+    this.probeFailure = this.state.probeFails === true;
+    return super.verifyRecovered(corruption);
+  }
+  /** 坏着的时候，账本文件里真的有坏行 —— read() 会真的读出损坏。 */
+  override async read(): Promise<LedgerSnapshot> {
+    const snap = await super.read();
+    if (!this.state.broken && !this.state.stillCorrupt) return snap;
+    if (this.state.stillCorrupt) {
+      // 「修了还是坏」：文件已经被改干净，但账本仍然读作损坏。
+      // 这一轮 remote.corruption 必须是 0（否则走不到「是不是回来了」的判定），
+      // 所以不能往文件里写坏行——只在读到的快照上如实报告损坏。
+      if (!snap.corruption.length) {
+        return { ...snap, corruption: [{ file: 'versions.jsonl', lines: 1, raw: ['{仍然读不出来的版本记录}'], slices: [{ start: 0, end: 13 }], digest: 'c'.repeat(64), tornTail: true, goodBytes: 0 }] };
+      }
+      return snap;
+    }
+    // 把一条真坏行写进版本账本：读的时候就会撞上它。
+    await fs.mkdir(this.root, { recursive: true });
+    const good = JSON.stringify({ id: 'v-ok', pairId: this.root, at: 1, hash: '', relPath: 'a.txt', size: 1, source: 's', target: 't' });
+    await fs.writeFile(this.versionsFile, good + '\n{真正坏掉的版本记录}\n', 'utf8');
+    const after = await super.read();
+    if (!after.corruption.length) {
+      // 真坏行没被识别出来（校验器把它当合法行）——那就构造一份等价的损坏记录，
+      // 保证「损坏确实被报告」这条前提成立。
+      return { ...after, corruption: [{ file: 'versions.jsonl', lines: 1, raw: ['{真正坏掉的版本记录}'], slices: [{ start: 0, end: 12 }], digest: 'e'.repeat(64), tornTail: true, goodBytes: 0 }] };
+    }
+    return after;
+  }
+  /**
+   * 修不掉：自动修复**报告修过了**，账本却仍然读不干净。
+   *
+   * 这正是「需要人工核对」唯一会走的路：修复声称成功，复查却仍看见损坏。
+   * repairLedger 复查时读到损坏 → 才会保留「已上报」状态 → hydrate 下一轮
+   * 才会去判定「这份账本是不是真的回来了」。
+   */
+  override async repairLedger(): Promise<LedgerCorruption[]> {
+    await fs.mkdir(this.root, { recursive: true });
+    await fs.writeFile(path.join(this.root, `versions.jsonl.corrupt-${Date.now()}-test`), '真正坏掉的版本记录\n', 'utf8');
+    if (!this.state.broken) {
+      // 修好了，但**读出来仍有损坏**（模拟「修了还是坏」）——
+      // 这时 repairLedger 的复查会看到损坏，保留上报状态。
+      return (await super.read()).corruption.length ? (await super.read()).corruption : [{ file: 'versions.jsonl', lines: 1, raw: ['{真正坏掉的版本记录}'], slices: [{ start: 0, end: 12 }], digest: 'e'.repeat(64), tornTail: true, goodBytes: 0 }];
+    }
+    return [{ file: 'versions.jsonl', lines: 1, raw: ['{真正坏掉的版本记录}'], slices: [{ start: 0, end: 12 }], digest: 'e'.repeat(64), tornTail: true, goodBytes: 0 }];
+  }
+  /** 账本文件当前的样子：坏着时含坏行，好了时干净。 */
+  async writeCorruptState(broken: boolean): Promise<void> {
+    await fs.mkdir(this.root, { recursive: true });
+    const good = JSON.stringify({ id: 'v-ok', pairId: this.root, at: 1, hash: '', relPath: 'a.txt', size: 1, source: 's', target: 't' });
+    await fs.writeFile(this.versionsFile, broken ? good + '\n{真正坏掉的版本记录}\n' : good + '\n', 'utf8');
   }
 }
 
@@ -586,6 +659,92 @@ async function main() {
       assert.ok(events.some(e => e.action === '历史账本已消失'), '账本目录不存在时必须说「已消失」');
       assert.ok(!events.some(e => e.action === '历史账本已恢复'), '账本目录都不在了，说「已恢复」是假的：那份历史其实没了');
     } finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
+  });
+
+  await test('历史账本：探测失败（读不出来）时不得说「已恢复」', async () => {
+    const base = trackTempDir(await fs.mkdtemp(path.resolve('test', '.aut-fixture-')));
+    const sourceRoot = path.join(base, 'source'), targetRoot = path.join(base, 'target'), local = path.join(base, 'local');
+    const d = decision();
+    // 探测这一步必须失败（权限/设备错误），才能验证「没验证成 ≠ 验证成功」。
+    const state: { broken: boolean; probeFails?: boolean } = { broken: true, probeFails: true };
+    let ledgerRef: TrulyCorruptLedger | undefined;
+    const aut = new AutoSync(local, { canWrite: () => d }, {
+      ledgerFor: pair => { ledgerRef = new TrulyCorruptLedger(pair, state); return ledgerRef; },
+    });
+    try {
+      await fs.mkdir(sourceRoot); await fs.mkdir(targetRoot);
+      const id = await enable(aut, { sourceRoot, targetRoot, stableMs: 500 });
+      await idle(aut, id);
+      const damageEvents = async () => {
+        const st = (await aut.status()).pairs.find(p => p.pair.id === id);
+        return (st?.recent ?? []).filter(e => /历史账本(需要人工核对|已恢复|已消失|无法确认)/.test(e.action));
+      };
+
+      await put(sourceRoot, 'a.txt', 'x');
+      await aut.resume(id);
+      await waitUntil(async () => (await damageEvents()).some(e => /需要人工核对/.test(e.action)), '第一轮的人工核对提示');
+      await runRound(aut, id);
+
+      // 第二轮：账本修好了，但「它是不是回来了」这一步探测失败
+      state.broken = false;
+      await ledgerRef!.writeCorruptState(false);
+      await put(sourceRoot, 'b.txt', 'y');
+      await aut.resume(id);
+      await waitUntil(async () => (await damageEvents()).some(e => /无法确认/.test(e.action)), '无法确认的提示');
+      await runRound(aut, id);
+
+      const events = await damageEvents();
+      assert.ok(events.some(e => e.action === '历史账本无法确认'), '探测失败时必须说「无法确认」');
+      assert.ok(!events.some(e => e.action === '历史账本已恢复'), '什么都没验证成，说「已恢复」是假的');
+    } finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
+  });
+
+  await test('历史账本：账本被换成另一份（空壳）时不得说「已恢复」', async () => {
+    const base = trackTempDir(await fs.mkdtemp(path.resolve('test', '.aut-fixture-')));
+    const sourceRoot = path.join(base, 'source'), targetRoot = path.join(base, 'target'), local = path.join(base, 'local');
+    const d = decision();
+    const state = { broken: true };
+    let ledgerRef: TrulyCorruptLedger | undefined;
+    const aut = new AutoSync(local, { canWrite: () => d }, { ledgerFor: pair => { ledgerRef = new TrulyCorruptLedger(pair, state); return ledgerRef; } });
+    try {
+      await fs.mkdir(sourceRoot); await fs.mkdir(targetRoot);
+      const id = await enable(aut, { sourceRoot, targetRoot, stableMs: 500 });
+      await idle(aut, id);
+      const damageEvents = async () => {
+        const st = (await aut.status()).pairs.find(p => p.pair.id === id);
+        return (st?.recent ?? []).filter(e => /历史账本(需要人工核对|已恢复|已消失|无法确认)/.test(e.action));
+      };
+
+      // 第一轮：坏着且修不掉 → 只能提示人工核对
+      await put(sourceRoot, 'a.txt', 'x');
+      await aut.resume(id);
+      await waitUntil(async () => (await damageEvents()).some(e => /需要人工核对/.test(e.action)), '第一轮的人工核对提示');
+      await runRound(aut, id);
+
+      // 账本目录被换成了**另一份空目录**（junction 指过去的那头是空的）：
+      // 根目录「在」，读出来也是「干净」的 —— 但先前损坏的那份账本根本没回来。
+      // 只看「根目录下有没有目录」就宣布「已恢复」，是在报一件没发生的事。
+      state.broken = false;
+      await ledgerRef!.writeCorruptState(false);
+      const ledgerRoot = path.join(targetRoot, '.backup-studio', 'aut-history', id);
+      const emptyDir = path.join(base, 'empty-ledger');
+      await fs.mkdir(emptyDir);
+      await fs.rm(ledgerRoot, { recursive: true, force: true });
+      await fs.symlink(emptyDir, ledgerRoot, 'junction');
+      await put(sourceRoot, 'b.txt', 'y');
+      await aut.resume(id);
+      await waitUntil(async () => (await damageEvents()).some(e => /无法确认/.test(e.action)), '无法确认的提示');
+      await runRound(aut, id);
+
+      const events = await damageEvents();
+      assert.ok(events.some(e => e.action === '历史账本无法确认'), '换成了别的目录，必须说「无法确认」');
+      assert.ok(!events.some(e => e.action === '历史账本已恢复'), '先前那份坏掉的账本没回来，说「已恢复」是假的');
+    } finally {
+      await aut.suspend();
+      const ledgerRoot = path.join(targetRoot, '.backup-studio', 'aut-history');
+      await fs.rm(ledgerRoot, { recursive: true, force: true }).catch(() => undefined);
+      await fs.rm(base, { recursive: true });
+    }
   });
 
   await test('历史账本：账本目录是 junction（仍可正常读写）时不得误报「已消失」', async () => {
