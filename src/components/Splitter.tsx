@@ -2,19 +2,24 @@ import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import { animateSpring, SNAP_SPRING } from '../lib/spring';
 import {
   COLLAPSE_RATIO,
+  DEFAULT_RATIO,
+  MAX_RATIO,
   ratioFromPointer,
-  trackSizes,
 } from '../lib/splitter-layout';
-import { IconChevronRight } from './Icons';
 
 interface Props {
   containerRef: RefObject<HTMLDivElement>;
   collapsed: boolean;
   onCollapsedChange: (collapsed: boolean) => void;
-  /** 当前分栏比例：由上层持有，工作区切换后重新挂载也能恢复 */
-  ratio: number;
+  /**
+   * 当前分栏比例，由上层持有。
+   *
+   * 切到「查重」工作区时整个工作区会卸载重建，本组件的内部状态随之归零，
+   * 用户拖过的比例会被打回默认。比例交给上层持有，重建后仍能恢复。
+   */
+  ratio?: number;
   /** 比例稳定下来后回报给上层（回报的是「展开后」的比例） */
-  onRatioChange: (ratio: number) => void;
+  onRatioChange?: (ratio: number) => void;
 }
 
 /**
@@ -25,42 +30,46 @@ interface Props {
  *  - 松手越过 82%：右栏自动收起，弹簧零回弹咬死
  *  - 拖拽中按 Esc：恢复拖拽前的比例
  *  - 双击手柄：回到 50/50
- *  - 收起后右缘常驻展开入口：右栏宽度为 0 时必须还有办法把它拉回来
- *
- * 轨道一律以 fr 表达（见 lib/splitter-layout）：固定像素的轨道会把工作区的
- * 最小内容宽度钉死在最大化时的旧像素总和上，窗口还原后网格无法收缩，
- * 右栏与分隔条被顶到窗口之外（#4）。fr 轨道不依赖任何尺寸重算，
- * 容器怎么变都不会溢出。
+ *  - 收起后：手柄本身常驻一个可见的展开把柄，点一下即恢复
  */
 export function Splitter({ containerRef, collapsed, onCollapsedChange, ratio, onRatioChange }: Props) {
   const [dragging, setDragging] = useState(false);
-  const ratioRef = useRef(ratio);
-  // 收起前的比例：展开时恢复，用户不必每次重新拖。
-  const expandedRatioRef = useRef(ratio);
-  const dragRef = useRef({ active: false, startX: 0, startRatio: ratio, prevRatio: ratio });
+  // 上层给了比例就以它为准（重建后恢复），否则从默认值起步。
+  const initialRatio = ratio ?? DEFAULT_RATIO;
+  const ratioRef = useRef(initialRatio);
+  const dragRef = useRef({ active: false, startX: 0, startRatio: initialRatio, prevRatio: initialRatio });
   const animRef = useRef<(() => void) | null>(null);
   const collapsedRef = useRef(collapsed);
 
+  /** 收起前的比例：展开把柄要用它把右栏放回原来的宽度，而不是 1（=全收起） */
+  const restoreRatioRef = useRef(initialRatio);
+
   useEffect(() => {
+    // 收起态下 ratioRef 保持 1 是刻意约定：拖拽起点、展开恢复都依赖
+    // 「收起 == ratio 1」这个不变量，否则展开会把右栏又推回视口外。
+    //
+    // 收起前的比例以上层持有的为准：拖拽越过收起位的那一帧 ratioRef 已被
+    // 弹簧推到 1 附近，用它会把用户原本的比例丢掉。
+    if (collapsed) restoreRatioRef.current = ratio ?? ratioRef.current;
     collapsedRef.current = collapsed;
-  }, [collapsed]);
+  }, [collapsed, ratio]);
 
   /**
-   * 把比例写成两条 fr 轨道。
+   * 只写「比例」这一个无量纲变量，宽度交给 CSS 按当前容器宽度现算。
    *
-   * 轨道份额之和恒为 1，因此无论容器多宽，网格都不会溢出容器，
-   * 窗口还原后右栏必定回到可视区内。
+   * 旧实现把比例换算成绝对 px 写进 --left-w / --right-w：
+   * 两列 px 之和是「最后拖动那一刻」的快照；窗口最大化后再还原时，
+   * 右侧 1fr 已被绝对列宽吃掉，grid 内容就把 .workspace 撑得比视口宽，
+   * 右栏连同分隔条被推到窗口外；同时容器自身被撑宽，container.clientWidth
+   * 量到的是被撑大后的值而不是真实视口 —— 绝对像素既是症状也是自反馈循环的
+   * 一环，所以这里彻底不再落像素。
    */
   const applyRatio = useCallback(
     (value: number) => {
       const container = containerRef.current;
       if (!container) return;
-      // 拖拽与弹簧过程中按**实时比例**投影，右栏才跟手；
-      // 只有「已收起且静止」时才投影成 1fr / 0fr。
-      const live = dragRef.current.active || animRef.current !== null;
-      const { left, right } = trackSizes(value, collapsedRef.current && !live);
-      container.style.setProperty('--left-w', left);
-      container.style.setProperty('--right-w', right);
+      const clamped = Math.min(1, Math.max(0, value));
+      container.style.setProperty('--split-ratio', String(clamped));
     },
     [containerRef],
   );
@@ -75,40 +84,29 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange, ratio, on
         1,
         SNAP_SPRING,
         (t) => {
-          const value = from + (targetRatio - from) * t;
-          ratioRef.current = value;
-          applyRatio(value);
+          const ratio = from + (targetRatio - from) * t;
+          ratioRef.current = ratio;
+          applyRatio(ratio);
         },
         () => {
           animRef.current = null;
           ratioRef.current = targetRatio;
           applyRatio(targetRatio);
-          onRatioChange(expandedRatioRef.current);
         },
       );
     },
-    [applyRatio, onRatioChange],
+    [applyRatio],
   );
 
-  /**
-   * 收起/展开状态变化时重写轨道。
-   *
-   * 比例是唯一事实，轨道只是它的投影：状态一变就重新投影一次，
-   * 不需要监听窗口尺寸——fr 轨道本身就随容器自动伸缩。
-   */
+  // 挂载时落地一次初始比例即可：列宽完全由 CSS 跟随容器宽度推导，
+  // 窗口最大化/还原不再需要 JS 重算像素，也就没有「过期宽度」可留。
   useEffect(() => {
-    applyRatio(collapsed ? 1 : ratioRef.current);
-  }, [collapsed, applyRatio]);
-
-  // 上层保存的比例与本地不一致时以它为准：
-  // 工作区切换会重新挂载本组件，收起前的比例必须跨挂载保留下来。
-  useEffect(() => {
-    if (ratio !== ratioRef.current) {
-      ratioRef.current = ratio;
-      expandedRatioRef.current = ratio;
-      applyRatio(collapsed ? 1 : ratio);
-    }
-  }, [ratio, collapsed, applyRatio]);
+    applyRatio(ratioRef.current);
+    return () => {
+      animRef.current?.();
+      animRef.current = null;
+    };
+  }, [applyRatio]);
 
   // 拖拽过程中的 Esc 复位
   useEffect(() => {
@@ -120,12 +118,12 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange, ratio, on
       containerRef.current?.classList.remove('is-resizing');
       document.body.style.cursor = '';
       setDragging(false);
-      expandedRatioRef.current = prev;
       springTo(prev);
+      onRatioChange?.(prev);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [containerRef, springTo]);
+  }, [containerRef, springTo, onRatioChange]);
 
   // 指针抬起兜底：指针被移出窗口或捕获失效时，仍要正确结束拖拽态，
   // 否则分栏会永远停在「正在拖拽」状态，右侧遮罩撤不掉。
@@ -179,7 +177,13 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange, ratio, on
     const container = containerRef.current;
     if (!drag.active || !container) return;
 
-    const value = ratioFromPointer(drag.startRatio, event.clientX - drag.startX, container.clientWidth, collapsedRef.current);
+    // 每次移动都读「此刻」的容器宽度，位移换算成比例，窗口中途缩放也不会漂
+    const value = ratioFromPointer(
+      drag.startRatio,
+      event.clientX - drag.startX,
+      container.clientWidth,
+      collapsedRef.current,
+    );
     ratioRef.current = value;
     applyRatio(value);
   };
@@ -202,72 +206,74 @@ export function Splitter({ containerRef, collapsed, onCollapsedChange, ratio, on
     const value = ratioRef.current;
 
     if (value >= COLLAPSE_RATIO) {
-      // 收起前记住当前比例，展开时恢复。
-      if (!collapsedRef.current) expandedRatioRef.current = drag.startRatio;
       springTo(1);
-      if (!collapsedRef.current) onCollapsedChange(true);
-      onRatioChange(expandedRatioRef.current);
+      if (!collapsedRef.current) {
+        onCollapsedChange(true);
+        // 收起不改变「展开后应恢复到的比例」：保住拖拽开始前的那一档。
+        onRatioChange?.(drag.startRatio);
+      }
       return;
     }
     if (collapsedRef.current) {
       onCollapsedChange(false);
-      // 收起态拖出来的位置就是用户想要的比例；没拖动（仍是 1）才回到收起前的比例。
-      const target = value < 0.999 ? value : expandedRatioRef.current;
-      expandedRatioRef.current = target;
-      springTo(target);
-      onRatioChange(target);
+      springTo(value);
+      onRatioChange?.(value);
       return;
     }
     // 常规松手：零延迟咬死在当前位置
-    expandedRatioRef.current = value;
     ratioRef.current = value;
     applyRatio(value);
-    onRatioChange(value);
+    onRatioChange?.(value);
   };
 
   const handleDoubleClick = () => {
-    expandedRatioRef.current = 0.5;
     onCollapsedChange(false);
     springTo(0.5);
+    onRatioChange?.(0.5);
+  };
+
+  /** 收起态常驻展开入口：不依赖拖拽手势也能把右栏放回来 */
+  const handleExpand = (event: React.SyntheticEvent) => {
+    // 按钮上的按压不能再冒泡成「开始拖拽」，否则一点就被拖拽态吃掉
+    event.stopPropagation();
+    animRef.current?.();
+    animRef.current = null;
+    onCollapsedChange(false);
+    // 恢复到收起前的比例；若那时正好在 1（拖满收起），退到 MAX_RATIO 保证右栏可见
+    const target = restoreRatioRef.current >= MAX_RATIO ? 0.5 : restoreRatioRef.current;
+    springTo(target);
+    onRatioChange?.(target);
   };
 
   return (
-    <>
-      <div
-        className="splitter"
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="调整分栏比例"
-        data-dragging={dragging}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerUp}
-        onDoubleClick={handleDoubleClick}
-      >
-        <span className="splitter-grip" />
-      </div>
-
-      {/*
-        收起后的展开入口：右栏宽度为 0 时它是唯一的出路，
-        必须常驻在窗口右缘，不能随右栏一起消失。
-        绝对定位让它脱离网格流，不会挤占分栏轨道；
-        靠上摆放，避开分隔条中部的抓手与命中区。
-      */}
+    <div
+      className="splitter"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="调整分栏比例"
+      aria-expanded={!collapsed}
+      data-dragging={dragging}
+      data-collapsed={collapsed}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
+      onDoubleClick={handleDoubleClick}
+    >
+      {/* 收起态才出现的常驻展开入口：状态驱动，避免用户找不到恢复方式 */}
       {collapsed ? (
         <button
           type="button"
           className="splitter-expand"
           aria-label="展开右侧栏"
           title="展开右侧栏"
-          onClick={() => {
-            onCollapsedChange(false);
-            springTo(expandedRatioRef.current);
-          }}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={handleExpand}
         >
-          <IconChevronRight size={14} />
+          ‹
         </button>
       ) : null}
-    </>
+      <span className="splitter-grip" />
+    </div>
   );
 }

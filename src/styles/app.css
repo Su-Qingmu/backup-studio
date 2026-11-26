@@ -152,43 +152,19 @@
 .workspace {
   position: relative;
   display: grid;
-  /* 轨道用 fr 表达：固定像素轨道会把工作区的最小内容宽度钉死在最大化时的
-     旧像素总和上，窗口还原后网格无法收缩，右栏与分隔条被顶到窗口之外，
-     继续拉宽到超过该总和才重新出现，且分栏比例已经算错（#4）。
-     fr 轨道的份额之和恒为容器宽度，窗口怎么变都不会溢出。 */
-  grid-template-columns: minmax(0, var(--left-w, 0.56fr)) 10px minmax(0, var(--right-w, 0.44fr));
+  /* 轨道只写比例，不写像素（#4）。
+     像素轨道（旧的 var(--left-w, 560px) 10px var(--right-w, 1fr)）会把工作区的
+     最小内容宽度钉死在「最大化那一刻」的像素总和上：窗口还原后网格无法收缩，
+     右栏与分隔条被顶到窗口之外。基础规则里必须与文件末尾的 issue #4 段落同口径，
+     否则后写的覆盖一旦被删掉，#4 就会原样复发。 */
+  grid-template-columns:
+    minmax(0, calc((100% - 10px) * var(--split-ratio, 0.56)))
+    10px
+    minmax(0, 1fr);
+  /* 工作区是 .app 网格里的条目，默认 min-width: auto 会让它按 min-content 定宽；
+     显式归零后，容器宽度只由视口决定。 */
   min-width: 0;
   min-height: 0;
-}
-
-/*
- * 收起右栏后的展开入口：右栏宽度为 0 时它是唯一的出路，
- * 必须常驻在窗口右缘，不能随右栏一起消失。
- * 绝对定位让它脱离网格流，不会挤占分栏轨道。
- */
-.splitter-expand {
-  position: absolute;
-  /* 靠上摆放：分隔条的抓手与命中区在中部，不能被入口按钮盖住。 */
-  top: 10px;
-  right: 0;
-  z-index: 3;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 34px;
-  padding: 0;
-  border: 1px solid var(--hairline-strong);
-  border-right: none;
-  border-radius: var(--radius-control) 0 0 var(--radius-control);
-  background: var(--bg-panel);
-  color: var(--text-secondary);
-  cursor: pointer;
-}
-
-.splitter-expand:hover {
-  background: var(--accent-soft);
-  color: var(--accent);
 }
 
 .pane {
@@ -1336,4 +1312,155 @@
 .banner[data-tone='danger'] .banner-hint {
   color: var(--danger);
   opacity: 0.85;
+}
+
+/* ============ 禁用态与交互态视觉区分（issue #3） ============ */
+/*
+ * 口径（颜色一律取自 tokens.css 令牌，明暗主题通用，不写死色值）：
+ *  1. 禁用 = 半透明 + 去饱和：opacity 压低整体亮度，filter: saturate() 抽掉
+ *     强调色相，禁用态与启用态在两个维度同时拉开距离；
+ *  2. 禁用态不保留 hover/active 反馈：既有反馈规则均已用 :not(:disabled)
+ *     排除（.btn 系、.aut-panel、.recycle-actions），此处不重复排除，
+ *     只补禁用本体的覆盖规则；
+ *  3. 禁用原因由组件层以 title / aria-describedby / 常驻提示文字提供，
+ *     CSS 层保证禁用控件保留 not-allowed 光标（悬停 title 仍可读）。
+ * 本段全部为文件末尾追加的更高特异性覆盖规则，不改动任何既有规则行。
+ */
+
+/* ---- 按钮禁用态（覆盖 .btn:disabled 与 .aut-panel button:disabled 两套口径）---- */
+
+.btn.btn:disabled {
+  opacity: 0.5;
+  filter: saturate(0.35);
+  color: var(--text-secondary);
+  cursor: not-allowed;
+}
+
+/* 主按钮禁用：保留 on-accent 文字色，由整体半透明 + 去饱和承担区分，
+   避免「accent 底 + 三级灰字」的混色观感 */
+.btn.btn-primary.btn-primary:disabled {
+  color: var(--on-accent);
+}
+
+/* 危险按钮（彻底删除等）禁用后保留危险色相线索（saturate 0.35 仅存一点红），
+   便于与普通禁用按钮区分「这个操作本来是危险的」 */
+.recycle-actions .btn[data-tone='danger']:disabled {
+  color: var(--danger);
+}
+
+/* ---- 开关与表单控件禁用态（此前完全缺失）---- */
+
+input:disabled,
+textarea:disabled,
+select:disabled {
+  opacity: 0.5;
+  filter: saturate(0.3);
+  cursor: not-allowed;
+}
+
+/* 开关（role='switch' 的 checkbox）：与 auto-sync.css 既有 cursor 规则叠加生效 */
+input[role='switch']:disabled {
+  opacity: 0.5;
+  filter: saturate(0.3);
+}
+
+/* ---- 可用控件交互态补全 ---- */
+
+/* 主按钮按下态：.btn:active 的灰色底特异性更高会盖过 accent 底，
+   按下时改回强调色 hover 档，保证按下反馈不改变按钮身份 */
+.btn.btn-primary:active:not(:disabled) {
+  background: var(--accent-hover);
+  color: var(--on-accent);
+}
+
+/* ============ issue #4：分栏按真实视口比例重算（追加规则，特异度覆盖上方同名声明） ============
+ *
+ * 根因（不是 ResizeObserver 没响应，而是它测量的对象本身已被污染）：
+ *   Splitter.applyRatio() 曾把比例换算成绝对像素写入 --left-w / --right-w，
+ *   grid 轨道是 [绝对px] 10px [绝对px]。绝对像素轨道不可被压缩，右栏内容的
+ *   最小宽度一旦大于剩余空间，grid 就会把容器撑得比视口更宽；而 .workspace
+ *   是 grid 容器，它的 clientWidth 于是变成「被撑大后的值」，
+ *   ResizeObserver 即便触发也是拿这个被污染的值去重算 —— 自反馈循环。
+ *   结果：最大化→还原后像素和仍是最大化时的量，右栏被排到视口之外；
+ *   继续拉宽窗口只是把视口追赶到旧像素和附近，右栏才在某个阈值后
+ *   「从窗口外」重新冒出来，且比例已经不对。
+ *
+ * 修法：JS 不再 snapshot 任何像素，只写无量纲的 --split-ratio（0..1）；
+ *   列宽在 CSS 里以容器行内尺寸的百分比现算，两列都用 minmax(0, …)
+ *   锁住内容基线，容器不可能被子项撑得比真实视口宽。
+ *   窗口缩放是纯 CSS 被动响应，不存在「过期宽度」需要重算。
+ */
+
+.workspace {
+  /* 默认 0.56 与 Splitter.tsx 的 DEFAULT_RATIO 同源；JS 未写入时也能正确布局 */
+  --split-ratio: 0.56;
+  /* 左列 = (容器宽度 - 手柄宽度) × 比例，百分比相对 grid 区域行内尺寸解析，随时跟随窗口 */
+  grid-template-columns:
+    minmax(0, calc((100% - 10px) * var(--split-ratio)))
+    10px
+    minmax(0, 1fr);
+}
+
+/*
+ * 收起态由 Splitter 在手柄上写 data-collapsed 驱动（JS 在同一个组件里同时负责
+ * 状态与视觉，不依赖外部 DOM 选择器命中 .pane-right）。
+ * 左栏吃满宽度，10px 手柄轨与 .splitter 元素保留在末列 —— 这就是「始终可见的展开入口」。
+ */
+.workspace:has(> .splitter[data-collapsed='true']) {
+  grid-template-columns: minmax(0, 1fr) 10px minmax(0, 0px);
+}
+
+/* 展开把柄的定位上下文：原 .splitter 只有 cursor/touch-action，没有 position */
+.splitter[data-collapsed='true'] {
+  position: relative;
+}
+
+/* 收起态的展开把柄：不靠 hover 才显形，默认就是可点、可见、可聚焦的 */
+.splitter-expand {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 12px;
+  height: 64px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, opacity 0.16s ease;
+}
+
+.splitter[data-collapsed='true'] {
+  /* 收起态手柄固定在最右列，给一条可见的定位痕迹，避免用户以为界面丢了控件 */
+  background: var(--accent-soft);
+}
+
+.splitter-expand:hover {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/*
+ * 焦点态保留可见描边。
+ *
+ * base.css 明令「严禁全局 outline: none」：键盘用户必须能一眼看出焦点落在
+ * 展开把手上。把柄本身在焦点态已经变成 accent 底色，描边改用 on-accent，
+ * 与底色拉开明度差，避免描边糊在底色里看不见。
+ */
+.splitter-expand:focus-visible {
+  background: var(--accent);
+  color: var(--on-accent);
+  outline: 2px solid var(--on-accent);
+  outline-offset: 2px;
+}
+
+/* 收起态下把柄已有自己的悬停反馈，手柄不再叠加横向高亮条 */
+.splitter[data-collapsed='true']:hover::before {
+  background: transparent;
 }
