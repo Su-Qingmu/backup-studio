@@ -8,15 +8,17 @@ import { Debounce, retryDelay } from '../electron/engine/aut/queue';
 import { ensureRoom, recyclePath } from '../electron/engine/aut/recycle';
 import { PairLedger } from '../electron/engine/aut/history';
 import type { AutoPair, AutoPairInput, AutoRecycleEntry, AutoStatus } from '../shared/aut-types';
+import { createRunner, registerTempCleanup, trackTempDir } from './harness';
 
-let passed = 0, failed = 0;
-async function test(name: string, fn: () => Promise<void>) {
-  try { await fn(); passed++; console.log(`PASS ${name}`); }
-  catch (error) { failed++; console.error(`FAIL ${name}`, error); }
+const runner = createRunner({ label: '自动同步', indent: '', errorStream: true });
+async function test(name: string, fn: () => Promise<void>): Promise<void> {
+  await runner.test(name, fn);
 }
+
+registerTempCleanup();
 const decision = (): WriteDecision => ({ allowed: true, reachable: true, isolated: false, level: 'L0', volumeHealth: 'healthy', epoch: 'test-medium', evidence: [] });
 async function fixture(options: Partial<AutoPairInput>, fn: (aut: AutoSync, input: AutoPairInput, decision: WriteDecision, local: string) => Promise<void>) {
-  const base = await fs.mkdtemp(path.resolve('test', '.aut-fixture-'));
+  const base = trackTempDir(await fs.mkdtemp(path.resolve('test', '.aut-fixture-')));
   const sourceRoot = path.join(base, 'source'), targetRoot = path.join(base, 'target'), local = path.join(base, 'local');
   const d = decision();
   const aut = new AutoSync(local, { canWrite: () => d });
@@ -469,7 +471,7 @@ async function main() {
 
   // —— 多配对隔离 ——
   await test('多配对的索引、回收站、历史与开关互相隔离', async () => {
-    const base = await fs.mkdtemp(path.resolve('test', '.aut-multi-'));
+    const base = trackTempDir(await fs.mkdtemp(path.resolve('test', '.aut-multi-')));
     const srcA = path.join(base, 'a'), srcB = path.join(base, 'b');
     const dstA = path.join(base, 'backupA'), dstB = path.join(base, 'backupB');
     const local = path.join(base, 'local');
@@ -572,7 +574,7 @@ async function main() {
 
   // —— 状态迁移 ——
   await test('v1 单配对状态迁移为 v2 多配对格式', async () => {
-    const base = await fs.mkdtemp(path.resolve('test', '.aut-migrate-'));
+    const base = trackTempDir(await fs.mkdtemp(path.resolve('test', '.aut-migrate-')));
     const local = path.join(base, 'local');
     const sourceRoot = path.join(base, 'source'), targetRoot = path.join(base, 'target');
     await fs.mkdir(local); await fs.mkdir(sourceRoot); await fs.mkdir(targetRoot);
@@ -595,7 +597,7 @@ async function main() {
     } finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
   });
   await test('v1 状态损坏时迁移明确报错，不静默丢状态', async () => {
-    const base = await fs.mkdtemp(path.resolve('test', '.aut-migrate-'));
+    const base = trackTempDir(await fs.mkdtemp(path.resolve('test', '.aut-migrate-')));
     const local = path.join(base, 'local');
     await fs.mkdir(local);
     await fs.writeFile(path.join(local, 'auto-sync.json'), JSON.stringify({ version: 1, pair: null, recent: [], recycle: [] }));
@@ -627,7 +629,7 @@ async function main() {
     }
   }));
 
-  console.log(`自动同步：${passed} 通过，${failed} 失败`);
-  if (failed) process.exitCode = 1;
+  console.log(runner.summary());
+  if (runner.failed) process.exitCode = 1;
 }
 void main().catch(e => { console.error(e); process.exitCode = 1; });
