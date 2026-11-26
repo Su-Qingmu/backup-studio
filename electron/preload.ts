@@ -24,6 +24,61 @@ import type {
   BackupRevealResult,
   BackupRevealState,
 } from '../shared/reveal-types';
+import type { ThemeMode, ThemeState } from '../shared/theme-types';
+
+/**
+ * 建窗那一刻主进程解析出的实际亮暗（issue #11）。
+ *
+ * 主进程把值放进 webPreferences.additionalArguments，preload 在页面脚本之前
+ * 就能读到：渲染层第一帧就用正确主题渲染，不必等异步的 app:get-theme 往返，
+ * 也就不存在「窗口底色一个色、界面另一个色」的闪烁。
+ *
+ * 取不到就当没有（initialTheme 为 undefined）：渲染层会退回 localStorage 与
+ * 系统偏好，和本次改动之前的行为一致，不会因此坏掉。
+ */
+const RESOLVED_THEME_FLAG = '--bs-resolved-theme=';
+function readResolvedTheme(): 'light' | 'dark' | undefined {
+  try {
+    const argv = process.argv;
+    if (!Array.isArray(argv)) return undefined;
+    const hit = argv.find((arg) => arg.startsWith(RESOLVED_THEME_FLAG));
+    const value = hit ? hit.slice(RESOLVED_THEME_FLAG.length) : '';
+    return value === 'light' || value === 'dark' ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const initialTheme = readResolvedTheme();
+
+/**
+ * preload 里能用到的 document 最小面。
+ *
+ * Electron 的 tsconfig 不带 DOM lib（主进程没有 DOM），所以这里自己声明
+ * 需要的两个成员，而不是给 tsconfig 加 lib 改全局编译目标。
+ */
+interface PreloadDocument {
+  documentElement?: { dataset?: Record<string, string> };
+  addEventListener?: (type: string, listener: () => void) => void;
+}
+
+function getDocument(): PreloadDocument | undefined {
+  return (globalThis as unknown as { document?: PreloadDocument }).document;
+}
+
+/**
+ * 把主题写到 <html> 上，必须早于页面首帧。
+ *
+ * preload 在文档解析早期执行，<html> 元素已存在、属性尚未被解析器写入，
+ * 所以 index.html 里刻意不预置 data-theme——否则解析器会用写死的值覆盖这里。
+ */
+function applyResolvedTheme(): void {
+  if (!initialTheme) return;
+  const root = getDocument()?.documentElement;
+  if (root?.dataset) root.dataset.theme = initialTheme;
+}
+applyResolvedTheme();
+getDocument()?.addEventListener?.('DOMContentLoaded', applyResolvedTheme);
 
 /**
  * 主进程返回的结构化失败 → 渲染层可见的 Error。
@@ -179,8 +234,34 @@ const api = {
   reveal: (request: BackupRevealRequest): Promise<BackupRevealResult> =>
     ipcRenderer.invoke('app:reveal', request),
 
-  setTheme: (mode: 'light' | 'dark' | 'system'): Promise<'light' | 'dark'> =>
+  /**
+   * 查询当前生效的主题（用户偏好 + 实际解析出的亮暗）。
+   *
+   * 渲染层只在启动时调一次：它自己的 localStorage 是同源缓存，AppImage 每次
+   * 挂载路径不同时可能读空，主进程 userData 里的配置才是权威（issue #11）。
+   */
+  getTheme: (): Promise<ThemeState> => ipcRenderer.invoke('app:get-theme'),
+
+  /**
+   * 建窗那一刻主进程解析出的实际亮暗（issue #11）。
+   *
+   * 同步可得，渲染层第一帧就用它渲染：不用等异步的 app:get-theme 往返，
+   * 也就不会出现「窗口底色一个色、界面另一个色」的闪烁。
+   */
+  initialTheme,
+
+  setTheme: (mode: ThemeMode): Promise<'light' | 'dark'> =>
     ipcRenderer.invoke('app:theme', mode),
+
+  /**
+   * 首屏已挂载：主进程等到这一刻才显示窗口（issue #10）。
+   *
+   * ready-to-show 早于 React 首帧，早显示就等于给用户一块黑屏；
+   * 渲染层挂载完再通知，主进程才把窗口亮出来。
+   */
+  notifyBootReady: (): void => {
+    void ipcRenderer.invoke('app:boot-ready');
+  },
 
   onState: (cb: (state: BackupRevealState) => void): (() => void) => subscribe('backup:state', cb),
   onPlan: (cb: (payload: PlanPayload) => void): (() => void) => subscribe('backup:plan', cb),

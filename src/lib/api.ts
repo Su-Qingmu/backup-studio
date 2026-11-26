@@ -11,6 +11,7 @@ import type {
 import type { AutoSyncApi } from '../../shared/aut-types';
 import type { DupApi } from '../../shared/dup-types';
 import type { BackupRevealRequest, BackupRevealResult, BackupRevealState } from '../../shared/reveal-types';
+import type { ThemeMode, ThemeState } from '../../shared/theme-types';
 
 export interface PlanPayload {
   actions: PlanAction[];
@@ -108,7 +109,26 @@ export interface BackupAPI {
    * 业务拒绝以 `{ ok: false, code, message }` 返回，不抛异常。
    */
   reveal(request: BackupRevealRequest): Promise<BackupRevealResult>;
-  setTheme(mode: 'light' | 'dark' | 'system'): Promise<'light' | 'dark'>;
+  setTheme(mode: ThemeMode): Promise<'light' | 'dark'>;
+  /**
+   * 读取主进程当前生效的主题：渲染层 localStorage 只是首帧缓存，
+   * 权威值在主进程 userData 的主题配置里（issue #11）。
+   * mock（浏览器开发兜底）没有主进程可问，未实现该方法，调用前需判存在。
+   */
+  getTheme?(): Promise<ThemeState>;
+  /**
+   * 建窗那一刻主进程解析出的实际亮暗，用于渲染层第一帧就用正确主题。
+   *
+   * 由 preload 从 additionalArguments 里读出并同步给出；浏览器开发兜底的
+   * mock 没有主进程，未实现该字段，调用前需判存在。
+   */
+  initialTheme?: 'light' | 'dark';
+  /**
+   * 通知主进程「首屏已挂载」，主进程据此决定何时显示窗口（issue #10）。
+   *
+   * mock（浏览器开发兜底）没有主进程可通知，未实现该方法，调用前需判存在。
+   */
+  notifyBootReady?(): void;
   onState(cb: (state: BackupRevealState) => void): () => void;
   onPlan(cb: (payload: PlanPayload) => void): () => void;
   onProgress(cb: (payload: ProgressPayload) => void): () => void;

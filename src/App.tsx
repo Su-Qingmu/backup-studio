@@ -112,11 +112,26 @@ export default function App() {
     [api, targetRoot],
   );
 
+  // 首帧主题优先用主进程在建窗那一刻解析出的实际亮暗。
+  //
+  // 那个值已经反映了持久化的偏好（issue #11），是权威值：直接拿它渲染，
+  // 不会出现「窗口底色一个色、界面另一个色」的闪烁。
+  //
+  // 拿不到时才退回 localStorage 缓存与系统偏好——这两者按 origin 隔离，
+  // AppImage 每次挂载路径不同、随时可能读空，只能当兜底。
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    if (api.initialTheme) return api.initialTheme;
     const saved = localStorage.getItem('backup-studio-theme');
     if (saved === 'light' || saved === 'dark') return saved;
     return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
   });
+
+  // 区分「用户主动切换」与「启动时按主进程权威值回正」：只有前者才把偏好
+  // 写回主进程，否则「跟随系统」会被悄悄改写成固定亮暗，重启后不再跟随系统。
+  const themeFromUser = useRef(false);
+  // 用户每次切换递增序号：异步核对返回时序号已变，说明用户在等待期间做了
+  // 新选择，迟到的旧值不得覆盖它。
+  const themeEpoch = useRef(0);
 
   const { value: checkValue, animate: animateCheck } = useSpringValue(POP_SPRING);
   const [showCheck, setShowCheck] = useState(false);
@@ -124,8 +139,31 @@ export default function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem('backup-studio-theme', theme);
-    void api.setTheme(theme);
+    if (themeFromUser.current) {
+      themeFromUser.current = false;
+      void api.setTheme(theme);
+    }
   }, [theme, api]);
+
+  // 启动时与主进程核对一次：窗口背景与原生标题栏早已按持久化偏好绘制好，
+  // 渲染层必须跟上，不能出现「窗口一个色、内容一个色」。刻意只依赖 api：
+  // 核对结果用函数式更新读取最新值，theme 变化不需要让这里重跑。
+  useEffect(() => {
+    if (typeof api.getTheme !== 'function') return;
+    const epoch = ++themeEpoch.current;
+    let alive = true;
+    void api
+      .getTheme()
+      .then((state) => {
+        if (!alive || themeEpoch.current !== epoch) return;
+        localStorage.setItem('backup-studio-theme', state.resolved);
+        setTheme((prev) => (prev === state.resolved ? prev : state.resolved));
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [api]);
 
   // 订阅引擎事件：所有状态都来自真实事件，不做前端计时器伪造
   useEffect(() => {
@@ -462,7 +500,11 @@ export default function App() {
           type="button"
           title={theme === 'dark' ? '切换到浅色' : '切换到深色'}
           aria-label="切换主题"
-          onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+          onClick={() => {
+            themeFromUser.current = true;
+            themeEpoch.current += 1;
+            setTheme(theme === 'dark' ? 'light' : 'dark');
+          }}
         >
           {theme === 'dark' ? <IconSun size={15} /> : <IconMoon size={15} />}
         </button>
