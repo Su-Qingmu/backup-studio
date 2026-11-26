@@ -50,7 +50,8 @@
     "files": [
       "dist/**/*",
       "dist-electron/**/*",
-      "package.json"
+      "package.json",
+      "build/icon/**"
     ],
     "win": {
       "target": [
@@ -60,7 +61,8 @@
             "x64"
           ]
         }
-      ]
+      ],
+      "icon": "build/icon/icon.ico"
     },
     "nsis": {
       "oneClick": false,
@@ -70,6 +72,7 @@
       "shortcutName": "Backup Studio"
     },
     "linux": {
+      "icon": "build/icon",
       "target": [
         {
           "target": "AppImage",
