@@ -10,27 +10,29 @@ import { CopyPool } from '../electron/engine/pool';
 import { BackupService } from '../electron/engine/service';
 import { assessMedia, identifyMedia, probeMedia, sameMedia } from '../electron/engine/media';
 import { JournalStore, crc32, partFileName } from '../electron/engine/journal';
+import { CASE_INSENSITIVE_PATHS } from '../electron/engine/path-identity';
+import { createRunner, registerTempCleanup, trackTempDir } from './harness';
+import { capabilityMismatch, probeTempFsCapability } from './fs-capability';
 import type { MediaIdentity, SyncMode } from '../shared/types';
 
 const WORKER_PATH = path.join(process.cwd(), 'dist-electron', 'electron', 'engine', 'copyWorker.js');
 
-let passed = 0;
-let failed = 0;
+const runner = createRunner({ label: '结果' });
 
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
-  try {
-    await fn();
-    passed += 1;
-    console.log(`  PASS  ${name}`);
-  } catch (err) {
-    failed += 1;
-    console.log(`  FAIL  ${name}`);
-    console.log(`        ${err instanceof Error ? err.message : String(err)}`);
-  }
+  await runner.test(name, fn);
 }
 
+/** 跳过必须单独计数：当前平台跑不了的用例不算通过 */
+function skip(name: string, reason: string): void {
+  runner.skip(name, reason);
+}
+
+registerTempCleanup();
+
 async function makeTemp(prefix: string): Promise<string> {
-  return fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  // 登记到统一清理表：测试跑完（哪怕失败）不留临时目录
+  return trackTempDir(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
 }
 
 let bigSourceCache: string | null = null;
@@ -985,7 +987,10 @@ async function main(): Promise<void> {
 
   await test('FR-06：真实样本回放，卷告警与脏位优先，SMART 不伪造', async () => {
     // 只向假执行器传递盘符，真实文件系统只访问测试目录。
-    if (process.platform !== 'win32') return;
+    if (process.platform !== 'win32') {
+      skip('FR-06：真实样本回放，卷告警与脏位优先，SMART 不伪造', '卷级采样回放依赖 Windows 的磁盘诊断接口');
+      return;
+    }
     const result = await dirtySample(await makeTemp('bs-health-'));
     assert.equal(result.assessment.level, 'L1');
     assert.equal(result.assessment.writable, false);
@@ -1573,33 +1578,44 @@ function patchDegradedReplacement(destPath: string, foreignContent: string): () 
     assert.equal(service.getState().phase, 'failed', '降级分支同样必须报失败');
   });
 
-  if (process.platform === 'win32') {
-    await test('Windows 大小写变更：并发拷贝与大量删除不误删仅大小写变化的源端文件', async () => {
-      const source = await makeTemp('bs-case-src-');
-      const target = await makeTemp('bs-case-dst-');
-      const userData = await makeTemp('bs-case-ud-');
-      await writeFile(source, 'zzz_target.txt', 'MUST-SURVIVE');
-      await writeFile(target, 'ZZZ_TARGET.txt', 'old-small');
-      for (let i = 0; i < 60; i += 1) {
-        await writeFile(target, `aaa_del_${String(i).padStart(2, '0')}.txt`, 'x');
-      }
+  await test('大小写变更：并发拷贝与大量删除不误删仅大小写变化的源端文件', async () => {
+    // 该用例依赖「文件系统不区分大小写」这一实际能力：按探测结果决定跑还是跳过，
+    // 不按 process.platform 猜——Linux 挂 NTFS/exFAT 时同样可能不区分大小写。
+    // 探测放在用例内部：探测失败必须让用例失败，不能绕过汇总。
+    const capability = await probeTempFsCapability('bs-fs-probe-');
+    if (!capability.caseInsensitive) {
+      skip('大小写变更：并发拷贝与大量删除不误删仅大小写变化的源端文件', '当前文件系统区分大小写，无法构造「仅大小写不同」的同名场景');
+      return;
+    }
+    const mismatch = capabilityMismatch(capability, CASE_INSENSITIVE_PATHS);
+    if (mismatch) {
+      skip('大小写变更：并发拷贝与大量删除不误删仅大小写变化的源端文件', mismatch);
+      return;
+    }
+    const source = await makeTemp('bs-case-src-');
+    const target = await makeTemp('bs-case-dst-');
+    const userData = await makeTemp('bs-case-ud-');
+    await writeFile(source, 'zzz_target.txt', 'MUST-SURVIVE');
+    await writeFile(target, 'ZZZ_TARGET.txt', 'old-small');
+    for (let i = 0; i < 60; i += 1) {
+      await writeFile(target, `aaa_del_${String(i).padStart(2, '0')}.txt`, 'x');
+    }
 
-      const service = new BackupService(userData);
-      await service.plan(source, target, 'mirror');
-      await service.start({
-        sourceRoot: source,
-        targetRoot: target,
-        syncMode: 'mirror',
-        allowMassDelete: true,
-        resume: true,
-      });
-      assert.equal(service.getState().phase, 'completed');
-      assert.equal(await fs.readFile(path.join(target, 'zzz_target.txt'), 'utf8'), 'MUST-SURVIVE');
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'mirror');
+    await service.start({
+      sourceRoot: source,
+      targetRoot: target,
+      syncMode: 'mirror',
+      allowMassDelete: true,
+      resume: true,
     });
-  }
+    assert.equal(service.getState().phase, 'completed');
+    assert.equal(await fs.readFile(path.join(target, 'zzz_target.txt'), 'utf8'), 'MUST-SURVIVE');
+  });
 
-  console.log(`\n结果：${passed} 通过 / ${failed} 失败\n`);
-  if (failed > 0) process.exitCode = 1;
+  console.log(`\n${runner.summary()}\n`);
+  if (runner.failed > 0) process.exitCode = 1;
 }
 
 void main();
