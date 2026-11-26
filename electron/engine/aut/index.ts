@@ -319,9 +319,16 @@ export class AutoSync implements AutoSyncApi {
         // 作废这件事要让用户看得见：否则「账本已经好了」和「程序还在记着
         // 一份旧账」在界面上完全一样。
         //
-        // 容量清理能不能恢复，取决于留证文件还在不在：留证还在（用户还没
-        // 人工核对过）就必须继续停手，这时候说「可以恢复」是假的。
-        this.event(st, '历史账本已恢复', '账本已能完整读出（或已不存在），先前报告的损坏已不存在；容量清理可以恢复');
+        // 这里**只说已经确定发生的事**：账本要么能完整读出，要么已经不存在。
+        // 容量清理能不能恢复取决于留证文件还在不在——它可能这一刻才被写下、
+        // 也可能下一刻被人工删掉——提前替它表态，说的就是假的。清理是否停手
+        // 由另一条事件（历史账本曾损坏）如实交代。
+        let vanished = false;
+        try { vanished = !(await statMaybe(ledger.root))?.isDirectory(); } catch { vanished = false; }
+        this.event(st, vanished ? '历史账本已消失' : '历史账本已恢复',
+          vanished
+            ? '账本目录已不存在，先前报告的损坏已无处核对；介质上的历史请自行确认'
+            : '账本已能完整读出，先前报告的损坏已不存在');
       }
     }
     if (!remote.commits.length && !remote.versions.length && !Object.keys(remote.index).length) return;

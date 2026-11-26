@@ -50,15 +50,43 @@ const idle = (aut: AutoSync, id: string) => until(aut, s => {
   return p.state === 'idle' && !!p.lastSync && p.pending === 0;
 });
 /**
+ * 等某个条件成立；超时抛错。
+ *
+ * 同步「跑完」不等于「这一轮想验证的动作做完了」：lastSync 可能先更新，
+ * 而修复动作还在后面。测试要断言的是事件，就该等事件，别去猜内部时序。
+ */
+async function waitUntil(pred: () => Promise<boolean>, what: string, ms = 30_000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await pred()) return;
+    await wait(30);
+  }
+  throw new Error(`等待超时：${what}`);
+}
+
+/**
  * 等**下一轮**同步真正跑完。
  *
  * resume() 之后 lastSync 还是上一轮的值，idle() 可能拿它立刻判定「已完成」，
- * 而那一轮同步其实还没开始——机器负载高的时候尤其容易踩到，表现为偶发失败。
+ * 而那一轮同步其实还没开始。
  */
 const nextIdle = async (aut: AutoSync, id: string, before: number) => until(aut, s => {
   const p = pairOf(s, id);
   return p.state === 'idle' && (p.lastSync ?? 0) > before && p.pending === 0;
 });
+
+/**
+ * 跑一轮同步并等它**彻底**结束（lastSync 变新）。
+ *
+ * 两件事必须分清：lastSync 变了只说明这一轮的主要动作做完了，reconcile
+ * 往账本里追加记录可能还在后面。测试要往账本里写坏内容，就必须等上一轮
+ * 彻底结束 —— 否则我们写的坏内容会被随后的写入冲掉，测的就不是自己想测的东西。
+ */
+async function runRound(aut: AutoSync, id: string): Promise<void> {
+  const before = (await aut.status()).pairs.find(p => p.pair.id === id)?.lastSync ?? 0;
+  await aut.resume(id);
+  await nextIdle(aut, id, before);
+}
 
 /** 构造一个完整的配对对象（账本类测试直接用它，不经过 AutoSync）。 */
 const makePair = (input: AutoPairInput, id = 'pair-ledger-test'): AutoPair => ({
@@ -455,12 +483,18 @@ async function main() {
       const st = (await aut.status()).pairs.find(p => p.pair.id === id);
       return (st?.recent ?? []).filter(e => /历史账本(损坏|需要人工核对)/.test(e.action));
     };
+    let expected = 0;
     for (const bad of ['{坏掉的版本记录一}', '{坏掉的版本记录二}']) {
+      expected += 1;
+      // 先等上一轮彻底结束，再写坏内容：否则 reconcile 随后的写入会把我们
+      // 写的坏行冲掉，账本根本没坏过。
+      await runRound(aut, id);
       await fs.writeFile(ledger.versionsFile, bad + '\n', 'utf8');
       await put(input.sourceRoot, 'later' + bad.length, 'new');
-      const before = (await aut.status()).pairs.find(p => p.pair.id === id)?.lastSync ?? 0;
       await aut.resume(id);
-      await nextIdle(aut, id, before);
+      // 等这一次的损坏真的被报出来，而不是等「同步大概跑完了」
+      await waitUntil(async () => (await damageEvents()).length >= expected, `第 ${expected} 次损坏的上报`);
+      await runRound(aut, id);
     }
     const events = await damageEvents();
     assert.equal(events.length, 2, '两次不同的损坏必须各报一次，不得被当成同一份');
@@ -483,33 +517,37 @@ async function main() {
 
       // 第一轮：坏着，且修不掉 → 只能提示人工核对
       await put(sourceRoot, 'a.txt', 'x');
-      let before = (await aut.status()).pairs.find(p => p.pair.id === id)?.lastSync ?? 0;
       await aut.resume(id);
-      await nextIdle(aut, id, before);
+      // 等这条提示真的出现：它是在修复与复查之后才发的，
+      // 出现即说明留证文件已经写好了。
+      await waitUntil(async () => (await damageEvents()).filter(e => /需要人工核对/.test(e.action)).length >= 1, '第一轮的人工核对提示');
+      await runRound(aut, id);
       assert.equal((await damageEvents()).filter(e => /需要人工核对/.test(e.action)).length, 1, '修不掉的损坏必须提示人工核对');
 
       // 第二轮：用户照提示把账本修好了（这一轮没有东西需要自动修复）
       state.broken = false;
       await put(sourceRoot, 'b.txt', 'y');
-      before = (await aut.status()).pairs.find(p => p.pair.id === id)?.lastSync ?? 0;
       await aut.resume(id);
-      await nextIdle(aut, id, before);
+      await waitUntil(async () => (await damageEvents()).some(e => /已恢复/.test(e.action)), '第二轮的恢复提示');
+      await runRound(aut, id);
 
       // 第三轮：同样的损坏又来了 —— 必须再次提示，不能被当成「已经报过」
       state.broken = true;
       await put(sourceRoot, 'c.txt', 'z');
-      before = (await aut.status()).pairs.find(p => p.pair.id === id)?.lastSync ?? 0;
       await aut.resume(id);
-      await nextIdle(aut, id, before);
+      await waitUntil(async () => (await damageEvents()).filter(e => /需要人工核对/.test(e.action)).length >= 2, '第三轮的再次提示');
+      await runRound(aut, id);
 
       const events = await damageEvents();
       const manual = events.filter(e => /需要人工核对/.test(e.action));
       assert.equal(manual.length, 2, `同样的损坏在修好之后再来一次，必须再次上报，实际报了 ${manual.length} 次`);
       const recovered = events.find(e => /已恢复/.test(e.action));
       assert.ok(recovered, '账本恢复后必须如实告知用户');
+      const evidence = await fs.readdir(path.join(targetRoot, '.backup-studio', 'aut-history', id)).catch(() => [] as string[]);
       // 留证文件还在 → 容量清理必须继续停手，这时说「可以恢复」是假的。
-      assert.match(recovered?.detail ?? '', /留证文件仍在/, '留证还在时不得声称容量清理可以恢复');
-      const evidence = await fs.readdir(path.join(targetRoot, '.backup-studio', 'aut-history', id));
+      // 恢复提示只说已经确定发生的事：容量清理能不能恢复取决于留证文件，
+      // 那一刻它可能才写下、也可能下一刻被人工删掉——替它表态说的就是假的。
+      assert.ok(!/容量清理/.test(recovered?.detail ?? ''), `恢复提示不得替容量清理做承诺；detail=${recovered?.detail ?? ''}`);
       assert.ok(evidence.some(name => name.includes('.corrupt-')), '留证文件必须还在');
     } finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
   });
