@@ -91,6 +91,19 @@ function errorCode(err: unknown): string | undefined {
   return typeof code === 'string' ? code : undefined;
 }
 
+/**
+ * 计划已过期：预览之后目标端出现了同名文件。
+ *
+ * 计划为「源端新增」的文件以「目标不存在」为前提。前提被打破时不得覆盖：
+ * 那是用户自己的内容，而且这份内容在目标盘上只有一份。
+ */
+function stalePlanError(relPath: string): Error {
+  return Object.assign(
+    new Error(`目标已被占用，计划已过期，请重新扫描后重试：${relPath}`),
+    { code: 'PLAN_STALE' },
+  );
+}
+
 /** 删除事务的幂等键：同一任务同一路径永远得到同一个 txId。 */
 function deleteTxId(jobId: string, relPath: string): string {
   return createHash('sha256').update(`${jobId}\u0000${relPath}`, 'utf8').digest('hex').slice(0, 32);
@@ -131,6 +144,38 @@ type FileHandle = Awaited<ReturnType<typeof fs.open>>;
  * 另一个实体之后，句柄读到的仍然是刚打开的那一份。若改用「按路径重新打开」
  * 来哈希，校验的就会是**替换之后**的新版本——新版本从未被归档，删掉它等于丢数据。
  */
+/**
+ * 把源文件的内容写进一个**已打开的句柄**。
+ *
+ * 句柄绑定的是实体（inode / file index），不是路径：写到一半失败或期间
+ * 路径被别人换掉时，我们写的仍然是手里这一个实体，不会误伤别人的文件。
+ * 走「按路径重新打开再复制」则没有这个保证。
+ */
+async function copyIntoHandle(srcPath: string, handle: FileHandle): Promise<number> {
+  const source = await fs.open(srcPath, 'r');
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  let position = 0;
+  try {
+    for (;;) {
+      const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      // 写入可能只落一部分（POSIX 的 pwrite 允许短写）：必须循环写满，
+      // 否则目标文件在该偏移之后会出现空洞或错位，而回读校验要到很久以后
+      // 才暴露。engine/copyWorker.ts 的写入循环用的是同一套写法。
+      let written = 0;
+      while (written < bytesRead) {
+        const { bytesWritten } = await handle.write(buffer, written, bytesRead - written, position + written);
+        if (!bytesWritten) throw Object.assign(new Error('目标文件写入失败'), { code: 'EIO' });
+        written += bytesWritten;
+      }
+      position += bytesRead;
+    }
+  } finally {
+    await source.close();
+  }
+  return position;
+}
+
 async function hashOpenHandle(handle: FileHandle): Promise<string> {
   const hash = createHash('sha256');
   const buffer = Buffer.allocUnsafe(1024 * 1024);
@@ -258,6 +303,14 @@ export class BackupService extends EventEmitter {
   /** 上次探测结果 */
   private lastProbe: MediaProbe | null = null;
   private actionIndex = new Map<string, PlanAction>();
+  /**
+   * 本次任务中因目标已被占用而无法提交的新增路径。
+   *
+   * 计划为「源端新增」的文件以「目标不存在」为前提；预览与开始之间
+   * 目标端出现同名文件时，备份不得覆盖它，任务也不得报完成——
+   * 必须如实报告计划已过期并要求重新扫描。
+   */
+  private stalePlanPaths = new Set<string>();
   private readonly recycleMaxBytes: number;
   /** 恢复期间允许执行的删除路径集合：只包含删除账本里已授权的条目。 */
   private recoveryDeleteScope: Set<string> | null = null;
@@ -815,6 +868,7 @@ export class BackupService extends EventEmitter {
     this.transaction = null;
     this.journalDirty = false;
     this.copyCallbackFailure = null;
+    this.stalePlanPaths.clear();
     try {
     const previous = await this.journal.getActive();
     if (recovering ? previous?.jobId !== recovering.jobId : previous &&
@@ -1225,6 +1279,9 @@ export class BackupService extends EventEmitter {
       if (this.copyCallbackFailure) reasons.push(this.copyCallbackFailure);
       if (directoryFailures) reasons.push(`${directoryFailures} 个目录创建失败`);
       if (plan.hashErrors.length) reasons.push(`${plan.hashErrors.length} 个文件规划期读取失败`);
+      if (this.stalePlanPaths.size) {
+        reasons.push(`计划已过期：${this.stalePlanPaths.size} 个文件的目标已被占用（未覆盖），请重新扫描后重试`);
+      }
       // 「保留」是正常结果（status 为 skipped），不算前置操作未完成。
       if (actions.some((a) => a.type !== 'delete' && a.type !== 'retain' && a.status !== 'done')) {
         reasons.push('前置文件操作未完成');
@@ -1422,13 +1479,26 @@ export class BackupService extends EventEmitter {
     const finalPath = path.join(targetRoot, relPath);
 
     try {
-      await this.transaction!.preserveTarget(finalPath);
-      await this.commitToTarget(task.partPath, finalPath);
+      if (action.type === 'copy') {
+        // 计划为「源端新增」：提交条件是「目标仍然不存在」。
+        await this.commitNewTarget(task.partPath, finalPath, relPath, sha256);
+      } else {
+        await this.transaction!.preserveTarget(finalPath);
+        await this.commitToTarget(task.partPath, finalPath);
+      }
     } catch (err) {
       const code = errorCode(err);
       if (code && MEDIA_ERROR_CODES.has(code)) {
         this.ioErrors += 1;
         await this.handleMediaLoss(errorText(err));
+        return;
+      }
+      if (code === 'PLAN_STALE') {
+        // 目标已被占用：那份文件原样保留，任务不得报完成。
+        this.stalePlanPaths.add(relPath);
+        this.updateAction(action.id, { status: 'failed', error: errorText(err) });
+        this.log('warn', `计划已过期：目标已被占用，未覆盖 ${relPath}，请重新扫描后重试`);
+        this.pendingTasks.delete(relPath);
         return;
       }
       this.updateAction(action.id, { status: 'failed', error: errorText(err) });
@@ -1466,6 +1536,151 @@ export class BackupService extends EventEmitter {
     await fs.rename(srcPath, destPath);
     await syncDirectory(path.dirname(destPath));
     if (path.dirname(srcPath) !== path.dirname(destPath)) await syncDirectory(path.dirname(srcPath));
+  }
+
+  /**
+   * 提交「源端新增」的文件：**绝不替换**计划所依据的那个目标路径。
+   *
+   * 计划里的新增动作以「目标不存在」为前提。预览与开始之间，目标端可能
+   * 已经出现同名文件——那是用户自己的内容，备份既不得覆盖它，也不得在
+   * 事务收尾时把它的唯一副本一起清掉（归档在事务历史里，收尾时会被删掉）。
+   *
+   * 因此提交要同时满足两件事：
+   *   1. 目标此刻确实不存在；
+   *   2. 检查与发布之间没有窗口——用「不覆盖」语义的原子提交收尾。
+   *
+   * `fs.rename` 在 Windows 上走 MoveFileEx(REPLACE_EXISTING)，目标存在就被
+   * 覆盖；所以这里优先用 `fs.link`（原子的，目标已存在就 EEXIST），
+   * 硬链接不可用时退化为 `fs.copyFile(..., COPYFILE_EXCL)`——同样不覆盖。
+   */
+  private async commitNewTarget(srcPath: string, destPath: string, relPath: string, expectedHash?: string): Promise<void> {
+    await this.assertTargetWritable();
+    await createDurableDirectory(path.dirname(destPath), path.resolve(this.state.targetRoot));
+    await this.assertTargetWritable();
+    const occupied = await this.commitWithoutReplace(srcPath, destPath, expectedHash);
+    if (occupied) {
+      // 计划所依据的「目标不存在」已被打破：保留那份文件的原字节，
+      // 报计划已过期并要求重新扫描。
+      //
+      // 这里没有例外。大小写不敏感卷上的同名别名由规划期认成「更新」
+      // 动作（它本来就该覆盖），不会走到新增提交这条路上来。
+      throw stalePlanError(relPath);
+    }
+    // 目标原本不存在：提交完成，暂存件随提交一起落地。
+    await fs.unlink(srcPath);
+    await syncDirectory(path.dirname(destPath));
+    if (path.dirname(srcPath) !== path.dirname(destPath)) await syncDirectory(path.dirname(srcPath));
+  }
+
+  /**
+   * 不覆盖地提交暂存件。
+   *
+   * 返回 true 表示目标路径已被占用（暂存件原封不动留在盘上），
+   * 返回 false 表示提交成功。其他错误照常抛出。
+   */
+  private async commitWithoutReplace(srcPath: string, destPath: string, expectedHash?: string): Promise<boolean> {
+    try {
+      await fs.link(srcPath, destPath);
+      return false;
+    } catch (err) {
+      const code = errorCode(err);
+      if (code === 'EEXIST') return true;
+      if (!code || !HARDLINK_UNSUPPORTED_CODES.has(code)) throw err;
+      // 降级：硬链接不可用（exFAT / FAT32 等）→ 独占写入（同样不覆盖）。
+      return this.commitByExclusiveWrite(srcPath, destPath, expectedHash);
+    }
+  }
+
+  /**
+   * 降级提交：独占创建 + 句柄写入 + 句柄校验。
+   *
+   * 为什么不能用 `fs.copyFile(..., COPYFILE_EXCL)`：
+   * 它不返回句柄，我们**无法证明**最终路径上那份文件是我们写的。
+   * 于是「回读校验发现内容不对」时，只能靠路径比对来猜是不是自己的；
+   * 而路径上如果已经被外部并发替换成了另一个文件，那份替换进来的文件
+   * 就会被当成自己的删掉——用户的唯一副本被误删。
+   *
+   * 现在的做法：先用 `'wx'` 独占创建目标路径。独占创建成功即证明这个
+   * 实体是我们创建的（别人不可能同时创建同名文件），句柄从此绑定该实体。
+   * 内容经句柄写入，回读校验也经句柄完成。收尾时再按 dev/ino 比对，
+   * 确认路径仍指向我们的实体；期间若被并发替换，我们**不碰**替换进来的
+   * 文件，只如实报失败。
+   *
+   * 任何失败都只撤销**我们自己**创建的那一份：路径上如果已经换成别人的
+   * 文件，绝不删除。
+   *
+   * 已知限制（平台固有，非本次改动引入）：
+   * exFAT/FAT32 上没有「不覆盖的原子发布」可用——`fs.rename` 会覆盖，
+   * `open(..., 'wx')` 与 `copyFile(..., COPYFILE_EXCL)` 都得先建出目标
+   * 路径。于是**掉电或进程被杀**（catch 兜不住的那类中断）仍可能在目标
+   * 路径上留下半截或 0 字节文件，下一轮规划会因「目标已存在」报计划过期，
+   * 需要人工删除该文件后才能继续。这是该文件系统的固有约束，无法在本层
+   * 消除；本实现解决的是「处理得到的中断必须不留残骸」与「绝不动外来文件」。
+   *
+   * 返回 true 表示目标路径已被占用（别人抢先创建），false 表示提交成功。
+   */
+  private async commitByExclusiveWrite(srcPath: string, destPath: string, expectedHash?: string): Promise<boolean> {
+    let handle: FileHandle;
+    try {
+      // 'x' = 独占创建：已存在就 EEXIST，绝不覆盖别人的文件。
+      handle = await fs.open(destPath, 'wx+');
+    } catch (err) {
+      if (errorCode(err) === 'EEXIST') return true;
+      throw err;
+    }
+    try {
+      await copyIntoHandle(srcPath, handle);
+      await handle.sync();
+      // 回读用**句柄**：句柄绑定的是实体而不是路径——按路径重新打开读到的
+      // 可能是替换之后的新版本，那份内容从未被归档，删掉它等于丢数据。
+      const actual = await hashOpenHandle(handle);
+      if (expectedHash && actual !== expectedHash) {
+        throw Object.assign(new Error('提交内容校验失败'), { code: 'VERIFY_FAILED' });
+      }
+      // 收尾前确认路径仍指向我们创建的实体。
+      // 期间被并发替换的话，替换进来的文件不能被我们当成自己的删掉，
+      // 也不能把这次提交当成成功——备份并没有落到目标上。
+      const mine = await handle.stat();
+      const current = await fs.stat(destPath).catch(() => undefined);
+      if (!current) {
+        // 确认不了身份（瞬时 I/O 错误、路径已消失）不等于「被替换」：
+        // 两者不能混为一谈。这里按「无法确认」处理——不删任何东西，
+        // 如实报失败，让调用方重新扫描。把它当成「被替换」会导致我们
+        // 放弃一份其实完整正确的文件，下一轮规划还会因此卡在计划过期。
+        throw Object.assign(
+          new Error('提交后无法确认目标文件身份，未做删除，请重新扫描后重试'),
+          { code: 'TARGET_UNVERIFIED' },
+        );
+      }
+      if (current.dev !== mine.dev || current.ino !== mine.ino) {
+        throw Object.assign(
+          new Error('提交期间目标文件已被外部替换，未做删除'),
+          { code: 'TARGET_REPLACED' },
+        );
+      }
+      await syncDirectory(path.dirname(destPath));
+      return false;
+    } catch (err) {
+      // 只撤销自己写的那一份：路径可能已经被别人换掉了。
+      // `ino !== 0` 是必要的守卫：某些卷（FUSE、部分网络盘）会报 ino=0，
+      // 那样身份比较会恒真，可能把外来文件当成自己的删掉。
+      const mine = await handle.stat().catch(() => undefined);
+      const current = await fs.stat(destPath).catch(() => undefined);
+      const ours = Boolean(mine && current && mine.ino !== 0
+        && mine.dev === current.dev && mine.ino === current.ino);
+      if (ours) await fs.unlink(destPath).catch(() => undefined);
+      throw Object.assign(
+        new Error(ours
+          ? `提交失败，已撤销未完成的目标文件：${errorText(err)}`
+          : `提交失败，目标文件已被外部替换或无法确认身份，未做删除：${errorText(err)}`),
+        { code: errorCode(err) ?? 'COMMIT_FAILED' },
+      );
+    } finally {
+      // close() 抛错会把上面保留好的错误码顶掉（介质掉线的 ENODEV/EIO 等
+      // 一旦丢失，引擎就不会走 handleMediaLoss，可能继续对失效介质写入）。
+      // close 失败不改变本次提交的结论，只记录。
+      await handle.close().catch(() => undefined);
+    }
   }
 
   private async onCopyError(relPath: string, message: string, code?: string): Promise<void> {
