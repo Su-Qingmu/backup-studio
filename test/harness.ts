@@ -36,12 +36,27 @@ export function trackTempDir(dir: string): string {
   const resolved = path.resolve(dir);
   const root = path.parse(resolved).root;
   if (resolved === root) throw new Error(`拒绝登记要递归删除的根目录：${resolved}`);
-  const allowed = [os.tmpdir(), path.join(process.cwd(), 'test')].flatMap((base) => {
+  // 允许的根：系统临时目录，以及仓库的 test/ 目录。
+  //
+  // 仓库根按**本文件所在位置**推导，而不是 process.cwd()：有套件明确要求
+  // 「以脚本所在目录为基准，避免从任意工作目录启动时落到仓库之外」，
+  // 从非仓库根目录启动时按 cwd 推导会把合法夹具判成越界。
+  const repoTest = path.resolve(__dirname, '..', 'test');
+  const bases = [os.tmpdir(), repoTest, path.join(process.cwd(), 'test')].flatMap((base) => {
     const abs = path.resolve(base);
     const real = (() => { try { return fs.realpathSync(abs); } catch { return abs; } })();
     return [abs, real];
   });
-  const inside = allowed.some((base) => resolved === base || resolved.startsWith(base + path.sep));
+  // Windows 路径大小写不敏感，比较时统一小写，否则同一个目录换个大小写
+  // 写法就会被误判成越界。
+  const fold = (value: string) => (process.platform === 'win32' ? value.toLowerCase() : value);
+  const target = fold(resolved);
+  // 必须是根目录**之下**的子目录：允许登记根本身等于授权递归删除整个
+  // 系统临时目录或整个 test/ 目录，那正是这道守卫要拦的手滑。
+  const inside = bases.some((base) => {
+    const b = fold(base);
+    return target !== b && target.startsWith(b + path.sep);
+  });
   if (!inside) throw new Error(`临时夹具目录必须位于系统临时目录或仓库 test/ 之下：${resolved}`);
   trackedTempDirs.add(resolved);
   return dir;
@@ -53,7 +68,7 @@ export function cleanupTrackedTempDirs(): void {
   for (const dir of trackedTempDirs) {
     try {
       // 占用类错误（Windows 上文件仍被打开）会重试几次再放弃
-      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     } catch {
       // 目录被占用等：清理失败要如实报出来。夹具生命周期本身就是本 Issue 的
       // 契约之一——残留目录会持续占用空间，也可能影响依赖临时目录状态的后续
@@ -106,8 +121,6 @@ export interface Runner {
   test(name: string, fn: () => void | Promise<void>): Promise<void>;
   /** 登记一次跳过：不得计入通过。会中止当前用例 */
   skip(name: string, reason: string): void;
-  /** 在用例体外登记一次跳过（不中止任何用例） */
-  registerSkip(name: string, reason: string): void;
   readonly passed: number;
   readonly failed: number;
   readonly skipped: number;
@@ -160,15 +173,10 @@ export function createRunner(options: RunnerOptions = {}): Runner {
       // 跳过必须中止当前用例。否则「没执行断言」和「执行并通过」会被同时记上，
       // 汇总里的「通过」就掺着根本没跑的用例——那正是本 Issue 要消灭的假通过。
       //
-      // 一律抛信号，不看当前是否在用例体内：在用例体外调用时信号会向上传播
-      // 成显式失败，而不是悄悄多记一次「跳过」。确实需要在用例体外登记时，
-      // 用 registerSkip()。
+      // 一律抛信号，不看当前是否在用例体内。在用例体外调用是编程错误：
+      // 信号会一路逃出去变成未处理异常并让本轮显式失败，而不是悄悄多记
+      // 一次「跳过」。
       throw new SkipSignal(reason);
-    },
-    registerSkip(name, reason) {
-      // 显式的「在用例体外登记一次跳过」入口。
-      skipped += 1;
-      console.log(`${indent}SKIP  ${name} — ${reason}`);
     },
     get passed() {
       return passed;
