@@ -360,6 +360,39 @@ async function main() {
     assert.equal(snap.versions.length, 1, '没有对象的版本记录必须保留');
   }));
 
+  await test('历史账本：同一份损坏不得每轮重复上报', () => fixture({}, async (aut, input) => {
+    const id = await enable(aut, input);
+    await idle(aut, id);
+    const realPair = pairOf(await aut.status(), id).pair;
+    const ledger = new PairLedger(realPair);
+    await fs.mkdir(path.dirname(ledger.versionsFile), { recursive: true });
+    await fs.writeFile(ledger.versionsFile, '{坏掉的版本记录}\n', 'utf8');
+
+    await put(input.sourceRoot, 'later', 'new');
+    await aut.resume(id);
+    await idle(aut, id);
+
+    // 只数「损坏」这一类事件：'历史账本曾损坏' 是留证还在、清理停手的常规提醒，
+    // 每轮都发是正常的，不是重复上报。
+    const damageEvents = async () => {
+      const st = (await aut.status()).pairs.find(p => p.pair.id === id);
+      return (st?.recent ?? []).filter(e => /历史账本(损坏|需要人工核对)/.test(e.action));
+    };
+    const first = await damageEvents();
+    // 一次损坏只产生一条事件：修复的结果（留证 / 需要人工核对）才是该报的事，
+    // 「发现时先报一声正在修」等于承诺一个可能兑现不了的修复。
+    assert.equal(first.length, 1, `同一份损坏只应上报一次，实际报了 ${first.length} 条`);
+    assert.ok(!/正在修复/.test(first.map(e => e.detail ?? '').join('|')), '不得承诺一个兑现不了的修复');
+    assert.ok(/已留证/.test(first[0].detail ?? ''), '修好的损坏必须如实说已留证');
+
+    // 第二轮：账本已经干净，同一份损坏不该再报一遍
+    await put(input.sourceRoot, 'later2', 'new2');
+    await aut.resume(id);
+    await idle(aut, id);
+    const second = await damageEvents();
+    assert.equal(second.length, first.length, '同一份损坏不得每轮重复上报');
+  }));
+
   await test('拒绝源内目标和反向包含', () => fixture({}, async (aut, input) => {
     const nested = path.join(input.sourceRoot, 'nested'); await fs.mkdir(nested);
     await assert.rejects(aut.addPair({ ...input, targetRoot: nested }), /互相包含/);

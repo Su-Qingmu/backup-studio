@@ -66,8 +66,10 @@ interface PairRuntime {
   /** 会话基线：本次软件运行期间观察到的源端文件集合。 */
   baseline: Set<string>;
   session: { deletes: number; unmanaged: number; counted: Set<string> };
-  /** 上一次上报过的账本损坏指纹：同一份损坏只该报一次。 */
+  /** 本轮读到的账本损坏指纹（由 hydrate 写入）。 */
   corruptionFingerprint?: string;
+  /** 已经向用户报过的损坏指纹：同一份损坏不得每轮重复上报。 */
+  reportedCorruption?: string;
 }
 
 const blank = (): Local => ({ version: 2, pairs: [] });
@@ -279,15 +281,12 @@ export class AutoSync implements AutoSyncApi {
     }
     // 账本读不出来时不能装作没事：那份记录可能仍指向对象库里的历史对象。
     // 损坏情况会在同步流程里被修复并上报；这里先把事实记下来。
-    if (remote.corruption.length) {
-      const detail = remote.corruption.map(c => `${c.file}(${c.lines} 行)`).join('、');
-      const rt = this.runtime(st.pair.id);
-      // 同一份损坏每一轮都会被读出来，不该每一轮都报一遍：事件流里重复的
-      // 同一条只会淹没真正的新变化。
-      if (rt.corruptionFingerprint !== corruptionFingerprint(remote.corruption)) {
-        this.event(st, '历史账本损坏', `读不出来的内容：${detail}；正在修复，修不好的会另行告知`);
-      }
-    }
+    // 损坏的事实先记下来，**不在这里发事件**：只有修完之后才知道到底修好没修好，
+    // 由 repairLedger 如实报告（修好了说已留证、修不好说要人工核对）。
+    // 在这里发事件等于每轮承诺一次「马上会修」，而同一份损坏每轮都会被读出来，
+    // 重复的同一条只会淹没真正的新变化。
+    const rt = this.runtime(st.pair.id);
+    rt.corruptionFingerprint = remote.corruption.length ? corruptionFingerprint(remote.corruption) : undefined;
     if (!remote.commits.length && !remote.versions.length && !Object.keys(remote.index).length) return;
     st.history = { commits: remote.commits, versions: remote.versions };
     if (!Object.keys(st.index).length && Object.keys(remote.index).length) {
@@ -307,25 +306,32 @@ export class AutoSync implements AutoSyncApi {
    * 随后的修复会把这条坏行整条丢弃——用户这一轮的恢复点就此从账本上消失。
    */
   private async repairLedger(st: PairState, ledger: PairLedger, gate: Gate): Promise<void> {
-    const corruption = await ledger.repairLedger(gate);
+    const found = await ledger.repairLedger(gate);
     const rt = this.runtime(st.pair.id);
-    if (corruption.length) {
-      const detail = corruption
-        .map(c => `${c.file}${c.tornTail ? '（尾部半行，已截回）' : '（中段损坏，坏行已隔离留证）'}`)
-        .join('、');
-      this.event(st, '历史账本损坏', `${detail}；损坏内容已留证在账本目录的 .corrupt-* 文件中`);
-      rt.corruptionFingerprint = undefined;
-      return;
-    }
-    // 修完还是坏：说明有自动修复处理不了的损坏。如实告诉用户需要人工核对，
-    // 而不是永远挂着同一句「会先修复再继续」。
+    // 正常路径不做多余的读取：只有「本轮修过」或「hydrate 报了损坏」才复查。
+    if (!found.length && !rt.corruptionFingerprint) return;
+    // 修完必须复查：修完还坏，说明根本没修好，此时报「已修复、已留证」是假的。
     let after: LedgerSnapshot | undefined;
     try { after = await ledger.read(); } catch { after = undefined; }
-    if (!after || !after.corruption.length) { rt.corruptionFingerprint = undefined; return; }
-    const fingerprint = corruptionFingerprint(after.corruption);
-    if (rt.corruptionFingerprint === fingerprint) return;
+    const remaining = after?.corruption ?? [];
+    if (!remaining.length) {
+      if (found.length) {
+        const detail = found
+          .map(c => `${c.file}${c.tornTail ? '（尾部半行，已截回）' : '（中段损坏，坏行已隔离留证）'}`)
+          .join('、');
+        this.event(st, '历史账本损坏', `${detail}；损坏内容已留证在账本目录的 .corrupt-* 文件中`);
+      }
+      rt.corruptionFingerprint = undefined;
+      rt.reportedCorruption = undefined;
+      return;
+    }
+    // 还坏着：如告诉用户需要人工核对。同一份损坏不重复上报——
+    // 反复刷同一条只会让人以为程序在反复失败。
+    const fingerprint = corruptionFingerprint(remaining);
     rt.corruptionFingerprint = fingerprint;
-    const detail = after.corruption.map(c => `${c.file}(${c.lines} 行)`).join('、');
+    if (rt.reportedCorruption === fingerprint) return;
+    rt.reportedCorruption = fingerprint;
+    const detail = remaining.map(c => `${c.file}(${c.lines} 行)`).join('、');
     this.event(st, '历史账本需要人工核对', `读不出来的内容：${detail}；自动修复未能处理，请人工核对介质上的账本文件`);
   }
 

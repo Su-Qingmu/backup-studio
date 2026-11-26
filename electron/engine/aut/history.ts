@@ -58,9 +58,9 @@ function isTombstoneRow(row: unknown): boolean {
 function isVersionRow(row: unknown): boolean {
   if (!row || typeof row !== 'object') return false;
   const v = row as Record<string, unknown>;
-  // 空哈希是合法的「这个版本没有对象」形态：删除类变更就没有内容哈希
-  // （见 index.ts 的 recordChange：`hash: change.hash ?? ''`）。
-  // 把空哈希当成损坏会把正常的删除记录误判成坏行。
+  // 空哈希按「这个版本没有内容对象」处理，不当成损坏：一行恰好被损坏成
+  // hash:'' 时无法再与合法的空哈希区分，这是刻意的折中——宁可放过一行，
+  // 也不要把一整类无对象的版本记录误判成坏行。
   return typeof v.id === 'string'
     && typeof v.relPath === 'string'
     && typeof v.hash === 'string'
