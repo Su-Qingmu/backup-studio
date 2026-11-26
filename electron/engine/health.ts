@@ -216,7 +216,21 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
   // 「证据不足」的措辞在这里收口：无论结论来自哪条判定路径都不再自称「保持只读」，
   // 避免界面同时表达「不要写入」与「可以开始写入」两个相反结论。
   if (condition === 'uncertain' && assessment.level === 'L1') assessment.suggestion = UNCERTAIN_SUGGESTION;
-  return { assessment, condition, volume: volume && letter ? `${letter}:` : null, permission, smart, index, files, diskReadOnly: typeof volume?.readOnly === 'boolean' ? volume.readOnly : null };
+  // L2 绝不能被标成「证据不足」：等级与条件必须一致，否则界面会同时
+  // 显示「L2」和「证据不足」两个互相矛盾的结论。
+  if (condition === 'uncertain' && assessment.level === 'L2') condition = 'media-unavailable';
+  return {
+    assessment,
+    condition,
+    volume: volume && letter ? `${letter}:` : null,
+    permission,
+    smart,
+    index,
+    files,
+    diskReadOnly: typeof volume?.readOnly === 'boolean' ? volume.readOnly : null,
+    // 目录级可写性：卷可写不等于该目录可写，写入闸门两者都要看。
+    targetWritable: probe.writable,
+  };
 }
 
 export async function preflightImage(volume: string, run = executeRead): Promise<Buffer> {

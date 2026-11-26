@@ -201,6 +201,13 @@ export interface HealthReport {
   smart: '能力缺失' | '有基线';
   index: '完整' | '截断' | '缺失' | '索引不一致' | '未验证';
   files: { complete: number; truncated: number; missing: number; mismatch: number; unchecked: number };
+  /**
+   * 目标根目录本身是否可写（目录级访问权限）。
+   *
+   * 与 `diskReadOnly`（卷级写保护）是两回事：卷可写不等于该目录可写，
+   * 两者都要进入写入闸门，否则许可可能放行一个根本写不进去的目录。
+   */
+  targetWritable?: boolean | null;
 }
 
 /**
@@ -239,15 +246,8 @@ export interface WriteGate {
  *
  * 许可必须与它针对的目标绑定：换了目标目录，上一份许可就不再适用。
  */
-export interface WritePermit {
-  /** 是否允许写入目标 */
-  allowed: boolean;
-  /**
-   * 允许写入但卷级健康无法判定：须由用户显式确认后继续。
-   * 自动写入不走这个状态——它按「默认只读」直接阻断。
-   */
-  requiresConfirmation: boolean;
-  /** 主进程原文理由：阻断时给出原因，需确认时给出提示 */
+export interface WritePermitBase {
+  /** 主进程原文理由：blocked/confirm 必给，allowed 为 null */
   reason: string | null;
   /** 判定依据 */
   evidence: string[];
@@ -259,9 +259,41 @@ export interface WritePermit {
   condition: HealthReport['condition'];
   /** 卷级健康结论 */
   volumeHealth: WriteGate['volumeHealth'];
+  /**
+   * 许可修订号：每次重新判定递增。
+   *
+   * 用户确认的回执必须带上它——判定一旦更新，旧回执自动失效，
+   * 免得「确认过一次」被复用到另一份判定上。
+   */
+  revision: number;
   /** 判定时间 */
   at: number;
 }
+
+/** 被阻断：界面必须禁用写入，并原样展示理由 */
+export interface WritePermitBlocked extends WritePermitBase {
+  verdict: 'blocked';
+  reason: string;
+}
+
+/** 需人工确认：允许写入，但必须先由用户显式确认（回执带 revision） */
+export interface WritePermitConfirm extends WritePermitBase {
+  verdict: 'confirm';
+  reason: string;
+}
+
+/** 放行：允许写入 */
+export interface WritePermitAllowed extends WritePermitBase {
+  verdict: 'allowed';
+  reason: null;
+}
+
+/**
+ * 写入许可：主进程给出的**唯一**裁决。
+ *
+ * 只有这三种裁决，界面按 verdict 分支处理，不得自行推导安全规则。
+ */
+export type WritePermit = WritePermitBlocked | WritePermitConfirm | WritePermitAllowed;
 
 export interface RepairRequest {
   volume: string;
@@ -305,8 +337,13 @@ export interface AppState {
   recoverableJob: RecoverableJob | null;
   /** 介质判定结果（L0/L1/L2）与证据链 */
   assessment: MediaAssessment | null;
-  /** 写入许可：主进程裁决，界面据此禁用/确认，不得自行推导安全规则 */
-  writePermit: WritePermit | null;
+  /**
+   * 写入许可表：按目标根缓存主进程的裁决。
+   *
+   * 逐目标缓存是必须的：后台对别的目标做的判定（自动同步、查重清理、
+   * 诊断面板）不得覆盖当前备份目标的结论。
+   */
+  writePermits: Record<string, WritePermit>;
   /** 隔离观察标记；可由用户撤销 */
   quarantine: QuarantineMark | null;
 }

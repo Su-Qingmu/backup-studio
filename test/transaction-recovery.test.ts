@@ -10,6 +10,7 @@ import type { CopyResult } from '../electron/engine/pool';
 import { BackupTransaction } from '../electron/engine/transaction';
 import { CASE_INSENSITIVE_PATHS } from '../electron/engine/path-identity';
 import type { AppState, SyncMode } from '../shared/types';
+import { startWithPermit } from './permit-helper';
 
 // The service launches copyWorker.js alongside itself. Use the existing Electron build.
 const { BackupService } = require('../dist-electron/electron/engine/service.js') as typeof import('../electron/engine/service');
@@ -39,7 +40,7 @@ async function fixture(t: TestContext) {
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
 function start(service: Service, { source, target }: Fixture, syncMode: SyncMode) {
-  return service.start({ sourceRoot: source, targetRoot: target, syncMode, allowMassDelete: true, resume: true });
+  return startWithPermit(service, { sourceRoot: source, targetRoot: target, syncMode, allowMassDelete: true, resume: true });
 }
 
 async function seedBackup(f: Fixture, syncMode: SyncMode) {
@@ -285,7 +286,7 @@ fs.unlink = async (file) => {
   if (mode === 'start') {
     const plan = await service.plan(source, target, syncMode);
     deletePlan.push(...plan.actions.filter(({ type }) => type === 'delete').map(({ relPath }) => relPath));
-    await service.start({ sourceRoot: source, targetRoot: target, syncMode, allowMassDelete: true, resume: true });
+    await startWithPermit(service, { sourceRoot: source, targetRoot: target, syncMode, allowMassDelete: true, resume: true });
   } else if (mode === 'recover') {
     checkpoint = (await service.findRecoverableJob())?.jobId ?? null;
     assert.ok(checkpoint, '重启后仍应能发现中断任务');

@@ -15,7 +15,7 @@ import { IconAlert, IconCheck, IconLayers, IconMoon, IconRefresh, IconSun } from
 import { useSpringValue } from './hooks/useSpringValue';
 import { POP_SPRING } from './lib/spring';
 import { fmtBytes, fmtDuration, fmtInt, normalizeDirectoryRoot } from './lib/format';
-import type { BackupPhase, RecycleEntry, SyncMode } from '../shared/types';
+import type { BackupPhase, RecycleEntry, SyncMode, WritePermit } from '../shared/types';
 import type { BackupRevealResult, BackupRevealState } from '../shared/reveal-types';
 
 type StepState = 'idle' | 'active' | 'done';
@@ -70,8 +70,8 @@ export default function App() {
   const [collapsed, setCollapsed] = useState(false);
   const [busyStage, setBusyStage] = useState<'scanning' | 'planning' | 'starting' | null>(null);
   const [confirming, setConfirming] = useState(false);
-  // 卷级健康无法判定时的显式风险确认：换了目标就必须重新确认。
-  const [riskConfirmed, setRiskConfirmed] = useState(false);
+  // 卷级健康无法判定时的显式风险确认：记录用户确认时的许可修订号。
+  const [riskAck, setRiskAck] = useState<number | null>(null);
   const [allowMassDelete, setAllowMassDelete] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [dismissedFailure, setDismissedFailure] = useState<string | null>(null);
@@ -90,7 +90,7 @@ export default function App() {
 
   // 换了目标，上一份风险确认不再适用。
   useEffect(() => {
-    setRiskConfirmed(false);
+    setRiskAck(null);
   }, [targetRoot]);
 
   useEffect(() => {
@@ -238,8 +238,11 @@ export default function App() {
       return runScanAndPlan(root, targetRoot, syncMode);
     }
     setTargetRoot(root);
+    // 目标换了就重新做一次分层判定：许可必须跟着目标走，
+    // 否则界面只能给出「未发现明确写入阻断」的粗结论。
+    void api.assess(root).catch(() => undefined);
     return runScanAndPlan(sourceRoot, root, syncMode);
-  }, [sourceRoot, targetRoot, syncMode, runScanAndPlan]);
+  }, [api, sourceRoot, targetRoot, syncMode, runScanAndPlan]);
 
   const handleBrowseSource = useCallback(async () => {
     const picked = await api.pickDirectory('选择需要备份的源目录');
@@ -263,6 +266,31 @@ export default function App() {
     [runScanAndPlan, sourceRoot, targetRoot],
   );
 
+  const running = phase === 'running' || phase === 'paused';
+  // 写入许可由主进程裁决，界面只消费结论，不再自行复制安全规则。
+  // 许可只对被判定过的目标有效：目标换了就不得沿用上一份结论。
+  // 许可按目标根缓存：当前目标的结论不会被别的目标的判定覆盖。
+  const permit = targetRoot ? state?.writePermits?.[targetRoot] ?? null : null;
+  const permitApplies = Boolean(permit);
+  // 完成态按钮只重新扫描和生成计划，不会启动写入，因此不受许可约束。
+  const permitVerdict: WritePermit['verdict'] = phase !== 'completed' && permitApplies && permit
+    ? permit.verdict
+    : 'allowed';
+  const writeBlockReason = permitVerdict === 'blocked'
+    ? permit?.reason ?? '写入已被阻断'
+    : null;
+  // 「需人工确认」：用户勾选确认的回执必须与当前许可的修订号一致，
+  // 判定一更新，旧回执自动失效（复选框随之回到未勾选）。
+  const permitNeedsConfirm = permitVerdict === 'confirm';
+  const riskAcknowledged = permitNeedsConfirm && riskAck !== null && riskAck === permit?.revision;
+  // 许可缺席＝这个目标还没判定过：不得当成放行。
+  const permitMissing = phase !== 'completed' && Boolean(targetRoot) && !permitApplies;
+  const canStart = Boolean(sourceRoot && targetRoot) && !running && phase !== 'scanning' && phase !== 'planning'
+    && writeBlockReason === null
+    && !permitMissing
+    // 卷级健康无法判定时不得默认放行：必须由用户显式确认。
+    && (!permitNeedsConfirm || riskAcknowledged);
+
   const handleStart = useCallback(
     async (confirmedOverride?: boolean) => {
       const confirmed = confirmedOverride ?? allowMassDelete;
@@ -279,6 +307,8 @@ export default function App() {
           syncMode,
           allowMassDelete: confirmed,
           resume: true,
+          // 主进程强制校验：卷级健康无法判定时必须带上与当前许可一致的确认回执。
+          acknowledgeRisk: riskAcknowledged ? permit?.revision : undefined,
         });
       } catch (err) {
         // 引擎原话直接呈现给用户，不再只写进 console。
@@ -287,26 +317,8 @@ export default function App() {
         setBusyStage(null);
       }
     },
-    [api, sourceRoot, targetRoot, syncMode, allowMassDelete, state?.requiresConfirmation],
+    [api, sourceRoot, targetRoot, syncMode, allowMassDelete, state?.requiresConfirmation, riskAcknowledged, permit?.revision],
   );
-
-  const running = phase === 'running' || phase === 'paused';
-  // 写入许可由主进程裁决，界面只消费结论，不再自行复制安全规则。
-  // 许可只对被判定过的目标有效：目标换了就不得沿用上一份结论。
-  const permit = state?.writePermit ?? null;
-  const permitApplies = Boolean(permit && targetRoot && permit.targetRoot === targetRoot);
-  // 完成态按钮只重新扫描和生成计划，不会启动写入，因此不受许可约束。
-  const permitGate = phase !== 'completed' && permitApplies;
-  // 三态：阻断 / 需显式确认 / 放行。
-  const permitBlocked = permitGate && permit?.allowed === false;
-  const permitNeedsConfirm = permitGate && permit?.allowed === true && permit.requiresConfirmation === true;
-  const writeBlockReason = permitBlocked
-    ? permit?.reason ?? '写入已被阻断'
-    : null;
-  const canStart = Boolean(sourceRoot && targetRoot) && !running && phase !== 'scanning' && phase !== 'planning'
-    && writeBlockReason === null
-    // 卷级健康无法判定时不得默认放行：必须由用户显式确认。
-    && (!permitNeedsConfirm || riskConfirmed);
 
   /**
    * 恢复中断的备份。
@@ -619,11 +631,19 @@ export default function App() {
                   <label className="permit-confirm">
                     <input
                       type="checkbox"
-                      checked={riskConfirmed}
-                      onChange={(event) => setRiskConfirmed(event.target.checked)}
+                      checked={riskAcknowledged}
+                      onChange={(event) => setRiskAck(event.target.checked ? permit?.revision ?? null : null)}
                     />
                     我已确认目标介质状态，允许写入
                   </label>
+                </div>
+              ) : null}
+
+              {permitMissing ? (
+                <div className="banner" role="status">
+                  <span className="banner-text">
+                    目标尚未完成介质判定：先重新扫描或「重新检测」拿到判定结论，才能开始备份。
+                  </span>
                 </div>
               ) : null}
 
@@ -713,7 +733,7 @@ export default function App() {
               key={diagnosticsRoot}
               api={api}
               root={diagnosticsRoot}
-              permit={permitApplies ? permit : null}
+              permit={diagnosticsRoot ? state?.writePermits?.[diagnosticsRoot] ?? null : null}
               disabled={phase === 'running' || phase === 'paused'}
             />
 

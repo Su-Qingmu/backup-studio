@@ -42,6 +42,8 @@ export interface StartOptions {
   syncMode: SyncMode;
   allowMassDelete: boolean;
   resume: boolean;
+  /** 「需人工确认」回执：携带用户确认时的许可修订号 */
+  acknowledgeRisk?: number;
 }
 
 export interface PlanPayload {

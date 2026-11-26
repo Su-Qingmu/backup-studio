@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 import type { RecycleBin } from '../shared/types';
+import { startWithPermit } from './permit-helper';
 
 // The service spawns copyWorker.js next to itself, so the crash tests must use
 // the Electron build (dist-electron), exactly like test/transaction-recovery.test.ts.
@@ -50,7 +51,7 @@ async function seed(f: Fixture, files: Record<string, string>): Promise<void> {
   const service = new BackupService(f.userData);
   for (const [rel, content] of Object.entries(files)) await writeSource(f, rel, content);
   await service.plan(f.source, f.target, syncMode);
-  await service.start({ sourceRoot: f.source, targetRoot: f.target, syncMode, allowMassDelete: true, resume: true });
+  await startWithPermit(service, { sourceRoot: f.source, targetRoot: f.target, syncMode, allowMassDelete: true, resume: true });
   assert.equal(service.getState().phase, 'completed', '种子备份应完成');
   for (const rel of Object.keys(files)) await fs.unlink(path.join(f.source, rel));
 }
@@ -236,7 +237,7 @@ fs.copyFile = async (from, to, flags) => {
       // 它既不会被计划当成孤儿删除，也不会被待删临时名覆盖。
       await fs.writeFile(config.plantPath, config.plantContent || 'DECOY MUST SURVIVE');
     }
-    await service.start({ sourceRoot: source, targetRoot: target, syncMode, allowMassDelete: true, resume: true });
+    await startWithPermit(service, { sourceRoot: source, targetRoot: target, syncMode, allowMassDelete: true, resume: true });
   } else if (mode === 'recover') {
     const job = await service.findRecoverableJob();
     assert.ok(job, '重启后仍应能发现中断任务');
@@ -645,13 +646,13 @@ test('容量超限时删除被阻断：原文件仍在、归档未生成、旧�
   const service = new BackupService(f.userData, { recycleMaxBytes: small });
   await writeSource(f, 'a.txt', 'x'.repeat(200));
   await service.plan(f.source, f.target, syncMode);
-  await service.start({ sourceRoot: f.source, targetRoot: f.target, syncMode, allowMassDelete: true, resume: true });
+  await startWithPermit(service, { sourceRoot: f.source, targetRoot: f.target, syncMode, allowMassDelete: true, resume: true });
   assert.equal(service.getState().phase, 'completed');
   await fs.unlink(path.join(f.source, 'a.txt'));
 
   const blocked = new BackupService(f.userData, { recycleMaxBytes: small });
   await blocked.plan(f.source, f.target, syncMode);
-  await blocked.start({ sourceRoot: f.source, targetRoot: f.target, syncMode, allowMassDelete: true, resume: true });
+  await startWithPermit(blocked, { sourceRoot: f.source, targetRoot: f.target, syncMode, allowMassDelete: true, resume: true });
   assert.notEqual(blocked.getState().phase, 'completed', '超限时任务不得报完成');
   assert.equal(await exists(path.join(f.target, 'a.txt')), true, '被阻断的删除必须保留原文件');
   const logs = blocked.getState().logs.map((item) => item.text).join('\n');
@@ -1156,7 +1157,7 @@ test('跨任务账本枚举失败时不发布不完整索引', async (t) => {
   await writeSource(f, 'b.txt', 'payload-b');
   const service = new BackupService(f.userData);
   await service.plan(f.source, f.target, syncMode);
-  await service.start({ sourceRoot: f.source, targetRoot: f.target, syncMode, allowMassDelete: true, resume: true });
+  await startWithPermit(service, { sourceRoot: f.source, targetRoot: f.target, syncMode, allowMassDelete: true, resume: true });
   await fs.unlink(path.join(f.source, 'b.txt'));
   const crashed = await runChild(f, { mode: 'start', fault: 'after-archived' });
   assert.equal(crashed.code, crashExitCode);

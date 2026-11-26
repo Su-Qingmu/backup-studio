@@ -8,6 +8,7 @@ import { buildPlan } from '../electron/engine/planner';
 import { readManifest, writeManifest } from '../electron/engine/manifest';
 import { CopyPool } from '../electron/engine/pool';
 import { BackupService } from '../electron/engine/service';
+import { startWithPermit } from './permit-helper';
 import { assessMedia, identifyMedia, probeMedia, sameMedia } from '../electron/engine/media';
 import { JournalStore, crc32, partFileName } from '../electron/engine/journal';
 import type { MediaIdentity, SyncMode } from '../shared/types';
@@ -105,7 +106,7 @@ async function planFor(source: string, target: string, syncMode: SyncMode = 'mir
 async function runService(source: string, target: string, syncMode: SyncMode = 'mirror'): Promise<void> {
   const service = new BackupService(await makeTemp('backup-studio-journal-'));
   await service.plan(source, target, syncMode);
-  await service.start({
+  await startWithPermit(service, {
     sourceRoot: source,
     targetRoot: target,
     syncMode,
@@ -622,7 +623,7 @@ async function main(): Promise<void> {
 
     const service = new BackupService(await makeTemp('bs-journal-'));
     await service.plan(source, target, 'mirror');
-    const running = service.start({
+    const running = startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',
@@ -657,7 +658,7 @@ async function main(): Promise<void> {
 
     const service = new BackupService(await makeTemp('bs-journal-'));
     await service.plan(source, target, 'mirror');
-    const running = service.start({
+    const running = startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',
@@ -1165,7 +1166,7 @@ async function main(): Promise<void> {
     // 在开始前删掉其中一个源文件，触发单文件失败
     await fs.unlink(path.join(source, 'missing.txt'));
 
-    await service.start({
+    await startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',
@@ -1228,7 +1229,7 @@ async function main(): Promise<void> {
 
     const service = new BackupService(userData);
     await service.plan(source, target, 'mirror');
-    await service.start({
+    await startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',
