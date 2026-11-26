@@ -2,7 +2,8 @@
 /**
  * Backup Studio — GitHub REST API helper.
  *
- * 本仓库没有安装 `gh` CLI，所有 GitHub 操作通过 REST API 完成。本脚本封装了本机
+ * 本脚本是「本机未安装 `gh` CLI」时的回退路径（装有 `gh` 时优先用 `gh`，见 SKILL.md 0.2）。
+ * 它封装了本机
  * 实测可用的调用方式：
  *
  *   * 凭据：Git Credential Manager（`git credential-manager get`），主账号 Su-Qingmu。

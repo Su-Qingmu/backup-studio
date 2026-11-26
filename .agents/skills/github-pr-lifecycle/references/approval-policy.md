@@ -84,7 +84,7 @@
 
 ## 正式 Review 的提交与核实
 
-本机未安装 `gh` CLI。正式 Review 通过 GitHub REST API 提交，必须遵守以下顺序：
+正式 Review 提交**优先使用 `gh` CLI**（`gh pr review` / `gh api`，token 注入方式见 [SKILL.md 0.2](../SKILL.md)）；**仅当本机未安装 `gh` CLI 时**，通过 GitHub REST API 提交。无论走哪条路径，必须遵守以下顺序：
 
 1. **核对目标、授权和权限。** 回读 `GET /repos/{owner}/{repo}/pulls/{number}`，确认是获授权的仓库和 PR、PR 仍为 `open`、`head.sha` 与审查及授权一致。核对当前 GitHub 登录身份与 PR 的 `user.login`，并核实目标分支适用规则及是否需要独立审批。无法确认任一必要前提时停止写入。不得对其他 PR 或其他仓库执行操作。
 2. **构造正文并固定提交。** 按上述决策要求写 `body`，以 `C1`、`H1`、`M2` 等编号组织发现，填入审查所依据的完整 SHA 作为 `commit_id`。选择与实际结论和用户授权均一致的 `event`。用户只授权 Approve 而审查应判 Request Changes 时，报告内部结论。提交 Request Changes 或 Comment 须另有相应授权。
