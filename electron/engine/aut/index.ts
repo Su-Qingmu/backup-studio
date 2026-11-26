@@ -265,6 +265,12 @@ export class AutoSync implements AutoSyncApi {
     let remote;
     try { remote = await ledger.read(); }
     catch { return; }
+    // 账本读不出来时不能装作没事：那份记录可能仍指向对象库里的历史对象。
+    // 损坏情况会在同步流程里被修复并上报；这里先把事实记下来。
+    if (remote.corruption.length) {
+      const detail = remote.corruption.map(c => `${c.file}(${c.lines} 行)`).join('、');
+      this.event(st, '历史账本损坏', `读不出来的内容：${detail}；本轮会先修复再继续`);
+    }
     if (!remote.commits.length && !remote.versions.length && !Object.keys(remote.index).length) return;
     st.history = { commits: remote.commits, versions: remote.versions };
     if (!Object.keys(st.index).length && Object.keys(remote.index).length) {
@@ -276,6 +282,22 @@ export class AutoSync implements AutoSyncApi {
     await this.save();
   }
 
+  /**
+   * 修复介质侧账本里读不出来的内容，并把损坏情况如实报给用户。
+   *
+   * 必须在**追加任何记录之前**调用：账本尾部若留着崩溃留下的半行，
+   * 直接追加会把新记录拼接到半行后面，两条粘成一条坏行，
+   * 随后的修复会把这条坏行整条丢弃——用户这一轮的恢复点就此从账本上消失。
+   */
+  private async repairLedger(st: PairState, ledger: PairLedger, gate: Gate): Promise<void> {
+    const corruption = await ledger.repairLedger(gate);
+    if (!corruption.length) return;
+    const detail = corruption
+      .map(c => `${c.file}${c.tornTail ? '（尾部半行，已截回）' : '（中段损坏，坏行已隔离留证）'}`)
+      .join('、');
+    this.event(st, '历史账本损坏', `${detail}；损坏内容已留证在账本目录的 .corrupt-* 文件中`);
+  }
+
   /** 把索引与历史写回介质，并按容量上限清理（不删唯一完整恢复点）。 */
   private async writeLedger(st: PairState, ledger: PairLedger, gate: Gate): Promise<void> {
     const index: Record<string, LedgerIndexEntry> = {};
@@ -284,18 +306,15 @@ export class AutoSync implements AutoSyncApi {
     }
     await ledger.writeIndex(index, gate);
     await ledger.writeMeta(gate);
-    // 账本读不出来时先修复，并把损坏内容留证。
-    const corruption = await ledger.repairLedger(gate);
-    if (corruption.length) {
-      // 账本坏过：容量清理必须停手。
-      //
-      // 被读不出来的那几行可能仍然指向对象库里的历史对象——那些版本记录
-      // 已经不在账本里了，清理会把它们当成「无人引用的对象」删掉。
-      // 用户的恢复点就此消失，而且再也找不回来。账本修好之前一个对象都不删。
-      const detail = corruption
-        .map(c => `${c.file}${c.tornTail ? '（尾部半行，已截回）' : '（中段损坏，已隔离留证）'}`)
-        .join('、');
-      this.event(st, '历史账本损坏', `${detail}；本轮不做历史容量清理`);
+    // 账本曾经坏过：容量清理必须停手，而且要一直停到留证被人工处理掉为止。
+    //
+    // 被读不出来的那几行可能仍然指向对象库里的历史对象——那些版本记录
+    // 已经不在账本里了，清理会把它们当成「无人引用的对象」删掉。
+    // 用户的恢复点就此消失，而且再也找不回来。
+    // 只在「本轮刚修过」时停手是不够的：下一轮账本已经干净，
+    // 清理会恢复，而丢失记录独占的对象仍可能被当成孤儿删掉。
+    if (await ledger.hasQuarantine()) {
+      this.event(st, '历史账本曾损坏', '损坏内容仍留有隔离件，本轮及后续轮次不做历史容量清理');
       return;
     }
     const liveHashes = new Set(Object.values(st.index).map(entry => entry.hash));
@@ -355,6 +374,11 @@ export class AutoSync implements AutoSyncApi {
         const ledger = new PairLedger(st.pair);
         const gate = this.gateFor(st, rt, epoch);
         await this.hydrate(st, ledger);
+        // 账本有损坏时**先修复再对账**：否则本轮新增的 commit/version 会
+        // 直接追加到崩溃留下的半行后面，两条记录粘成一条坏行，
+        // 随后的修复会把这条粘在一起的坏行整条丢弃——用户这一轮的
+        // 恢复点就此从账本上消失。
+        await this.repairLedger(st, ledger, gate);
         await reconcile({
           pair: st.pair,
           permit: this.permit,

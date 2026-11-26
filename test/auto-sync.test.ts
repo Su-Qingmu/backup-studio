@@ -187,9 +187,15 @@ async function main() {
     assert.equal(results.filter(Boolean).length, 1, '两个写者中只有一个真正写入了对象，另一个应当走去重');
   }));
 
-  await test('历史账本损坏时不得做容量清理：丢了记录引用的对象不能被当成孤儿删掉', () => fixture({}, async (_aut, input) => {
-    const pair = makePair(input);
-    const ledger = new PairLedger(pair);
+  await test('历史账本损坏时不得做容量清理：丢了记录引用的对象不能被当成孤儿删掉', () => fixture({}, async (aut, input) => {
+    // 走真实生产路径：先让同步跑起来，账本目录才会被建出来，
+    // 之后人为把版本账本写坏，再触发一轮同步。
+    const id = await enable(aut, input);
+    await idle(aut, id);
+    // 必须用**真实配对**的 id：账本目录是按配对 id 建的，
+    // 用一个自造的 id 会写到另一个目录，同步根本看不到。
+    const realPair = pairOf(await aut.status(), id).pair;
+    const ledger = new PairLedger(realPair);
     const payload = 'D'.repeat(1024);
     const hash = sha256(payload);
     await fs.mkdir(ledger.objectsDir, { recursive: true });
@@ -198,14 +204,21 @@ async function main() {
     // 一条读不出来的版本记录：它引用的对象在账本里「不存在」了
     await fs.writeFile(ledger.versionsFile, '{坏掉的版本记录}\n', 'utf8');
 
-    const snap = await ledger.read();
-    assert.equal(snap.corruption.length, 1, '必须报告账本损坏');
-    // 清理的依据是账本：账本坏了就不能按「无人引用」删对象
-    const versions = snap.versions;
-    const liveHashes = new Set<string>();
-    const orphan = new Set(versions.filter(v => !liveHashes.has(v.hash)).map(v => v.hash));
-    assert.equal(orphan.size, 0, '读不出记录时不得凭空得出「孤儿对象」结论');
+    await put(input.sourceRoot, 'later', 'new');
+    await aut.resume(id);
+    await idle(aut, id);
+
+    // 损坏必须被如实报出来
+    const status = (await aut.status()).pairs.find(p => p.pair.id === id);
+    const events = status?.recent ?? [];
+    assert.ok(events.some((e: { action: string; detail?: string }) => /账本损坏/.test(e.action + (e.detail ?? ''))),
+      '账本损坏必须如实上报，不能静默');
+    // 关键：容量清理不得把「丢了记录引用的对象」当成孤儿删掉
     assert.ok(await fs.stat(ledger.objectPath(hash)), '账本损坏期间对象必须留着');
+    // 留证文件必须在，清理会一直停手
+    const quarantined = (await fs.readdir(ledger.root)).filter(f => f.includes('.corrupt-'));
+    assert.equal(quarantined.length, 1, '损坏内容必须留证');
+    assert.ok(await ledger.hasQuarantine(), '留证还在时清理必须继续停手');
   }));
   await test('拒绝源内目标和反向包含', () => fixture({}, async (aut, input) => {
     const nested = path.join(input.sourceRoot, 'nested'); await fs.mkdir(nested);

@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import type { AutoChange, AutoCommit, AutoPair, AutoRecycleEntry, AutoVersion } from '../../../shared/aut-types';
 import { writeJsonAtomic } from '../manifest';
 import { hashFile } from '../hash';
@@ -62,6 +63,8 @@ export interface LedgerCorruption {
   lines: number;
   /** 被跳过的原始行（原样保留，供人工核对） */
   raw: string[];
+  /** 被跳过行在原文件中的字节区间：留证时按字节切片，保住原始内容 */
+  slices: Array<{ start: number; end: number }>;
   /** 是否为文件尾部的半行（可自愈） */
   tornTail: boolean;
   /** 尾部半行时：最后一条完好记录之后的字节偏移 */
@@ -98,11 +101,31 @@ class KeyedMutex {
   }
 }
 
+/**
+ * 按「介质 + 配对」共享的对象库互斥锁。
+ *
+ * 锁必须是模块级的：同一配对在代码里会被反复用新的 PairLedger 实例包起来
+ * （hydrate / reconcile / restore / history 各建一个），实例级锁彼此不排斥，
+ * 保护力度会被高估。跨进程仍无保护——那是另一个层面的问题。
+ */
+const objectLocks = new Map<string, KeyedMutex>();
+
+function lockFor(targetRoot: string, pairId: string): KeyedMutex {
+  const key = `${path.resolve(targetRoot)}\u0000${pairId}`;
+  let lock = objectLocks.get(key);
+  if (!lock) {
+    lock = new KeyedMutex();
+    objectLocks.set(key, lock);
+  }
+  return lock;
+}
+
 /** 历史对象库：内容寻址，重复内容只存一份。 */
 export class PairLedger {
   readonly root: string;
   constructor(private readonly pair: AutoPair) {
     this.root = path.join(pair.targetRoot, '.backup-studio', 'aut-history', pair.id);
+    this.objects = lockFor(pair.targetRoot, pair.id);
   }
   get objectsDir() { return path.join(this.root, 'objects'); }
   get commitsFile() { return path.join(this.root, 'commits.jsonl'); }
@@ -111,8 +134,8 @@ export class PairLedger {
   get indexFile() { return path.join(this.root, 'index.json'); }
   get metaFile() { return path.join(this.root, 'pair.json'); }
 
-  /** 对象库按哈希串行化的互斥锁 */
-  private readonly objects = new KeyedMutex();
+  /** 对象库按哈希串行化的互斥锁（按介质 + 配对在模块级共享） */
+  private readonly objects: KeyedMutex;
 
   objectPath(hash: string) {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error('无效的内容哈希');
@@ -133,6 +156,7 @@ export class PairLedger {
     catch (err) { if (code(err) === 'ENOENT') return { rows: [], corruption: null }; throw err; }
     const rows: T[] = [];
     const bad: string[] = [];
+    const slices: Array<{ start: number; end: number }> = [];
     let goodBytes = 0;
     let sawBad = false;
     let goodAfterBad = false;
@@ -156,6 +180,7 @@ export class PairLedger {
       } catch {
         sawBad = true;
         bad.push(raw);
+        slices.push({ start: pos, end });
       }
       pos = next;
     }
@@ -170,6 +195,7 @@ export class PairLedger {
         file: path.basename(file),
         lines: bad.length,
         raw: bad,
+        slices,
         tornTail,
         goodBytes,
       },
@@ -179,8 +205,20 @@ export class PairLedger {
   private async appendJsonl(file: string, row: unknown, gate: Gate): Promise<void> {
     await gate();
     await fs.mkdir(path.dirname(file), { recursive: true });
-    const handle = await fs.open(file, 'a');
+    const handle = await fs.open(file, 'a+');
     try {
+      // 追加前先确认文件以换行结尾。
+      //
+      // 上一次崩溃可能留下一个没有换行符的半行；直接追加会把新记录
+      // **拼接到那半行后面**，两条记录粘成一条坏行——新记录就此消失，
+      // 而账本修复时又会把这条粘在一起的坏行整条丢弃。
+      // 补一个换行，半行就只影响它自己。
+      const stat = await handle.stat();
+      if (stat.size > 0) {
+        const tail = Buffer.allocUnsafe(1);
+        await handle.read(tail, 0, 1, stat.size - 1);
+        if (tail[0] !== 0x0a) await handle.write(Buffer.from('\n'), 0, 1, stat.size);
+      }
       await handle.writeFile(`${JSON.stringify(row)}\n`, 'utf8');
       await handle.sync();
     } finally { await handle.close(); }
@@ -206,6 +244,19 @@ export class PairLedger {
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) index = parsed as Record<string, LedgerIndexEntry>;
     } catch (err) { if (code(err) !== 'ENOENT') throw err; }
     const corruption = [tomb.corruption, ver.corruption, com.corruption].filter((c): c is LedgerCorruption => c !== null);
+    if (tomb.corruption) {
+      // 墓碑账本损坏 → 淘汰状态未知：已经被淘汰的版本可能重新出现。
+      // 而它们指向的对象往往早已被容量清理删掉了，把它们留在回收站里
+      // 只会变成指向不存在内容的「幽灵项」。按对象是否还在过滤掉。
+      const alive: AutoVersion[] = [];
+      for (const version of versions) {
+        if (!version.hash) { alive.push(version); continue; }
+        const stat = await statMaybe(this.objectPath(version.hash));
+        if (stat?.isFile()) alive.push(version);
+      }
+      versions.length = 0;
+      versions.push(...alive);
+    }
     return { commits, versions, index, corruption };
   }
 
@@ -228,27 +279,60 @@ export class PairLedger {
       if (!corruption) continue;
       found.push(corruption);
       await gate();
-      // 损坏内容原样留证：坏行绝不静默丢弃。
-      const quarantine = `${file}.corrupt-${Date.now()}`;
+      // 损坏内容**按字节**留证：坏行绝不静默丢弃，且必须保住原始字节——
+      // 按 utf8 解码再编码会把非法字节序列换成替换字符，证据就失真了。
+      const buf = await fs.readFile(file);
+      const quarantine = `${file}.corrupt-${Date.now()}-${randomUUID().slice(0, 8)}`;
       const qh = await fs.open(quarantine, 'w');
       try {
-        await qh.writeFile(corruption.raw.join('\n'), 'utf8');
+        for (const slice of corruption.slices) {
+          await qh.writeFile(buf.subarray(slice.start, slice.end));
+        }
+        await qh.writeFile('\n');
         await qh.sync();
       } finally { await qh.close(); }
-      // 把账本重建为「只含读得出来的记录」：
-      // 尾部半行 → 截回最后一条完好记录；中段损坏 → 剔除坏行、保留其后的完好记录。
-      // 先写临时件再改名：改名是原子的，崩溃时要么是原文件、要么是修好的文件，
-      // 不会出现「写了一半的账本」。
-      const rebuilt = rows.map(row => `${JSON.stringify(row)}\n`).join('');
-      const tmp = `${file}.repair`;
-      const th = await fs.open(tmp, 'w');
-      try {
-        await th.writeFile(rebuilt, 'utf8');
-        await th.sync();
-      } finally { await th.close(); }
-      await fs.rename(tmp, file);
+      if (corruption.tornTail) {
+        // 尾部半行：截回最后一条完好记录。半行本身不承载完整记录，
+        // 留着它只会让后面的追加都粘上去。
+        const tmp = `${file}.repair`;
+        const th = await fs.open(tmp, 'w');
+        try {
+          await th.writeFile(buf.subarray(0, corruption.goodBytes));
+          await th.sync();
+        } finally { await th.close(); }
+        await fs.rename(tmp, file);
+      } else {
+        // 中段损坏：剔除坏行、保留其后的完好记录。
+        // 先写临时件再改名：改名是原子的，崩溃时要么是原文件、要么是修好的文件，
+        // 不会出现「写了一半的账本」。
+        const rebuilt = rows.map(row => `${JSON.stringify(row)}\n`).join('');
+        const tmp = `${file}.repair`;
+        const th = await fs.open(tmp, 'w');
+        try {
+          await th.writeFile(rebuilt, 'utf8');
+          await th.sync();
+        } finally { await th.close(); }
+        await fs.rename(tmp, file);
+      }
     }
     return found;
+  }
+
+  /**
+   * 账本根目录下是否还有损坏留证文件。
+   *
+   * 只要留证还在，就说明账本丢过记录：那些记录可能仍指向对象库里的历史
+   * 对象，而容量清理的依据正是账本——此时清理会把它们当成「无人引用」
+   * 删掉，用户的恢复点就此消失。留证被人工处理掉之前，清理一律停手。
+   */
+  async hasQuarantine(): Promise<boolean> {
+    try {
+      const entries = await fs.readdir(this.root);
+      return entries.some(name => name.includes('.corrupt-'));
+    } catch (err) {
+      if (code(err) === 'ENOENT') return false;
+      throw err;
+    }
   }
 
   async appendCommit(commit: AutoCommit, gate: Gate): Promise<void> {
