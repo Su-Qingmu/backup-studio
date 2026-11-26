@@ -159,7 +159,15 @@ async function copyIntoHandle(srcPath: string, handle: FileHandle): Promise<numb
     for (;;) {
       const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
       if (bytesRead === 0) break;
-      await handle.write(buffer, 0, bytesRead, position);
+      // 写入可能只落一部分（POSIX 的 pwrite 允许短写）：必须循环写满，
+      // 否则目标文件在该偏移之后会出现空洞或错位，而回读校验要到很久以后
+      // 才暴露。engine/copyWorker.ts 的写入循环用的是同一套写法。
+      let written = 0;
+      while (written < bytesRead) {
+        const { bytesWritten } = await handle.write(buffer, written, bytesRead - written, position + written);
+        if (!bytesWritten) throw Object.assign(new Error('目标文件写入失败'), { code: 'EIO' });
+        written += bytesWritten;
+      }
       position += bytesRead;
     }
   } finally {
@@ -1587,12 +1595,10 @@ export class BackupService extends EventEmitter {
    * 降级提交：独占创建 + 句柄写入 + 句柄校验。
    *
    * 为什么不能用 `fs.copyFile(..., COPYFILE_EXCL)`：
-   * 1. 它把内容**边拷边落在最终路径上**，落盘完成之前，目标路径上已经
-   *    是一份可能不完整的数据；中途失败或掉电，半截文件就留在那里。
-   * 2. 它不返回句柄，我们**无法证明**最终路径上那份文件是我们写的。
-   *    于是「回读校验发现内容不对」时，只能靠路径比对来猜是不是自己的；
-   *    而路径上如果已经被外部并发替换成了另一个文件，那份替换进来的文件
-   *    就会被当成自己的删掉——用户的唯一副本被误删。
+   * 它不返回句柄，我们**无法证明**最终路径上那份文件是我们写的。
+   * 于是「回读校验发现内容不对」时，只能靠路径比对来猜是不是自己的；
+   * 而路径上如果已经被外部并发替换成了另一个文件，那份替换进来的文件
+   * 就会被当成自己的删掉——用户的唯一副本被误删。
    *
    * 现在的做法：先用 `'wx'` 独占创建目标路径。独占创建成功即证明这个
    * 实体是我们创建的（别人不可能同时创建同名文件），句柄从此绑定该实体。
@@ -1602,6 +1608,14 @@ export class BackupService extends EventEmitter {
    *
    * 任何失败都只撤销**我们自己**创建的那一份：路径上如果已经换成别人的
    * 文件，绝不删除。
+   *
+   * 已知限制（平台固有，非本次改动引入）：
+   * exFAT/FAT32 上没有「不覆盖的原子发布」可用——`fs.rename` 会覆盖，
+   * `open(..., 'wx')` 与 `copyFile(..., COPYFILE_EXCL)` 都得先建出目标
+   * 路径。于是**掉电或进程被杀**（catch 兜不住的那类中断）仍可能在目标
+   * 路径上留下半截或 0 字节文件，下一轮规划会因「目标已存在」报计划过期，
+   * 需要人工删除该文件后才能继续。这是该文件系统的固有约束，无法在本层
+   * 消除；本实现解决的是「处理得到的中断必须不留残骸」与「绝不动外来文件」。
    *
    * 返回 true 表示目标路径已被占用（别人抢先创建），false 表示提交成功。
    */
@@ -1628,7 +1642,17 @@ export class BackupService extends EventEmitter {
       // 也不能把这次提交当成成功——备份并没有落到目标上。
       const mine = await handle.stat();
       const current = await fs.stat(destPath).catch(() => undefined);
-      if (!current || current.dev !== mine.dev || current.ino !== mine.ino) {
+      if (!current) {
+        // 确认不了身份（瞬时 I/O 错误、路径已消失）不等于「被替换」：
+        // 两者不能混为一谈。这里按「无法确认」处理——不删任何东西，
+        // 如实报失败，让调用方重新扫描。把它当成「被替换」会导致我们
+        // 放弃一份其实完整正确的文件，下一轮规划还会因此卡在计划过期。
+        throw Object.assign(
+          new Error('提交后无法确认目标文件身份，未做删除，请重新扫描后重试'),
+          { code: 'TARGET_UNVERIFIED' },
+        );
+      }
+      if (current.dev !== mine.dev || current.ino !== mine.ino) {
         throw Object.assign(
           new Error('提交期间目标文件已被外部替换，未做删除'),
           { code: 'TARGET_REPLACED' },
@@ -1638,18 +1662,24 @@ export class BackupService extends EventEmitter {
       return false;
     } catch (err) {
       // 只撤销自己写的那一份：路径可能已经被别人换掉了。
+      // `ino !== 0` 是必要的守卫：某些卷（FUSE、部分网络盘）会报 ino=0，
+      // 那样身份比较会恒真，可能把外来文件当成自己的删掉。
       const mine = await handle.stat().catch(() => undefined);
       const current = await fs.stat(destPath).catch(() => undefined);
-      const ours = Boolean(mine && current && mine.dev === current.dev && mine.ino === current.ino);
+      const ours = Boolean(mine && current && mine.ino !== 0
+        && mine.dev === current.dev && mine.ino === current.ino);
       if (ours) await fs.unlink(destPath).catch(() => undefined);
       throw Object.assign(
         new Error(ours
           ? `提交失败，已撤销未完成的目标文件：${errorText(err)}`
-          : `提交失败，目标文件已被外部替换，未做删除：${errorText(err)}`),
+          : `提交失败，目标文件已被外部替换或无法确认身份，未做删除：${errorText(err)}`),
         { code: errorCode(err) ?? 'COMMIT_FAILED' },
       );
     } finally {
-      await handle.close();
+      // close() 抛错会把上面保留好的错误码顶掉（介质掉线的 ENODEV/EIO 等
+      // 一旦丢失，引擎就不会走 handleMediaLoss，可能继续对失效介质写入）。
+      // close 失败不改变本次提交的结论，只记录。
+      await handle.close().catch(() => undefined);
     }
   }
 

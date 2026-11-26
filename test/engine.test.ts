@@ -1329,6 +1329,94 @@ async function main(): Promise<void> {
       '目标保持为空时新增照常完成');
   });
 
+/**
+ * 让「降级复制在写入途中被中断」这件事在**两套实现**上都能复现。
+ *
+ * 降级提交有两代实现：旧的走 fs.copyFile（内核拷贝，不经 JS 的 fs.open），
+ * 新的走 fs.open('wx') + 句柄写入。注入点如果只认其中一种写法，同一条断言
+ * 在另一套实现上就根本没被触发——那样的「负向对照失败」证明不了任何事。
+ * 这里两种写法都挂上同一个钩子。
+ *
+ * 返回还原函数。
+ */
+function patchDegradedInterrupt(destPath: string, sourcePath: string): () => void {
+  const originalCopy = fs.copyFile;
+  const originalOpen = fs.open;
+  const originalReadFile = fs.readFile;
+  const patched = fs as unknown as { copyFile: typeof fs.copyFile; open: typeof fs.open };
+  // 旧实现：只写一半内容就报错。
+  patched.copyFile = (async (from, to, flags) => {
+    if (String(to) !== destPath) return originalCopy(from, to, flags);
+    const data = await originalReadFile(String(from));
+    await fs.writeFile(String(to), data.subarray(0, Math.floor(data.length / 2)));
+    throw Object.assign(new Error('simulated write interruption'), { code: 'ENOSPC' });
+  }) as typeof fs.copyFile;
+  // 新实现：第一块写完后报错。
+  patched.open = (async (file, flags, mode) => {
+    const handle = await originalOpen(file, flags, mode);
+    if (String(file) === destPath && typeof flags === 'string' && flags.includes('wx')) {
+      const originalWrite = handle.write.bind(handle) as (
+        buffer: Buffer, offset: number, length: number, position: number,
+      ) => Promise<{ bytesWritten: number }>;
+      let chunks = 0;
+      (handle as unknown as {
+        write: (buffer: Buffer, offset: number, length: number, position: number) => Promise<{ bytesWritten: number }>;
+      }).write = async (buffer: Buffer, offset: number, length: number, position: number) => {
+        chunks += 1;
+        if (chunks > 1) {
+          throw Object.assign(new Error('simulated write interruption'), { code: 'ENOSPC' });
+        }
+        return originalWrite(buffer, offset, length, position);
+      };
+    }
+    return handle;
+  }) as typeof fs.open;
+  void sourcePath;
+  return () => { patched.copyFile = originalCopy; patched.open = originalOpen; };
+}
+
+/**
+ * 让「目标在写入途中被外部替换」这件事在**两套实现**上都能复现。
+ *
+ * 旧实现：copyFile 写完后立刻被替换，引擎随后按路径打开目标——打开到的
+ * 已经是那份外来文件，于是「内容对不上 → 按 dev/ino 判断是自己的 → 删掉」。
+ * 新实现：句柄写入第一批数据后目标被替换，句柄仍绑定我们创建的实体。
+ */
+function patchDegradedReplacement(destPath: string, foreignContent: string): () => void {
+  const originalCopy = fs.copyFile;
+  const originalOpen = fs.open;
+  const originalUnlink = fs.unlink;
+  const originalWriteFile = fs.writeFile;
+  const patched = fs as unknown as { copyFile: typeof fs.copyFile; open: typeof fs.open };
+  const replace = async () => {
+    await originalUnlink(destPath).catch(() => undefined);
+    await originalWriteFile(destPath, foreignContent, 'utf8');
+  };
+  patched.copyFile = (async (from, to, flags) => {
+    const result = await originalCopy(from, to, flags);
+    if (String(to) === destPath) await replace();
+    return result;
+  }) as typeof fs.copyFile;
+  patched.open = (async (file, flags, mode) => {
+    const handle = await originalOpen(file, flags, mode);
+    if (String(file) === destPath && typeof flags === 'string' && flags.includes('wx')) {
+      const originalWrite = handle.write.bind(handle) as (
+        buffer: Buffer, offset: number, length: number, position: number,
+      ) => Promise<{ bytesWritten: number }>;
+      let replaced = false;
+      (handle as unknown as {
+        write: (buffer: Buffer, offset: number, length: number, position: number) => Promise<{ bytesWritten: number }>;
+      }).write = async (buffer: Buffer, offset: number, length: number, position: number) => {
+        const result = await originalWrite(buffer, offset, length, position);
+        if (!replaced) { replaced = true; await replace(); }
+        return result;
+      };
+    }
+    return handle;
+  }) as typeof fs.open;
+  return () => { patched.copyFile = originalCopy; patched.open = originalOpen; };
+}
+
   await test('可靠性：降级复制中途中断不得在目标留下半截文件', async () => {
     const source = await makeTemp('bs-degrade-int-src-');
     const target = await makeTemp('bs-degrade-int-dst-');
@@ -1341,35 +1429,13 @@ async function main(): Promise<void> {
 
     const destPath = path.join(target, 'payload.bin');
     const originalLink = fs.link;
-    const originalOpen = fs.open;
-    const patched = fs as unknown as { link: typeof fs.link; open: typeof fs.open };
+    const patched = fs as unknown as { link: typeof fs.link };
     // 模拟 exFAT / FAT32：硬链接不可用，提交走降级分支。
     patched.link = (async () => {
       throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
     }) as typeof fs.link;
-    // 模拟降级复制写到一半被中断（写盘错误）。
-    patched.open = (async (file: any, flags: any, mode?: any) => {
-      const handle = await originalOpen(file, flags, mode);
-      if (String(file) === destPath && typeof flags === 'string' && flags.includes('wx')) {
-        const originalWrite = handle.write.bind(handle) as (
-          buffer: Buffer, offset: number, length: number, position: number,
-        ) => Promise<{ bytesWritten: number }>;
-        let chunks = 0;
-        (handle as unknown as {
-          write: (buffer: Buffer, offset: number, length: number, position: number) => Promise<{ bytesWritten: number }>;
-        }).write = async (buffer: Buffer, offset: number, length: number, position: number) => {
-          chunks += 1;
-          if (chunks > 1) {
-            // ENOSPC：介质空间在复制途中耗尽。这不是介质掉线
-            //（EIO 那一类会被引擎按掉盘处理），是普通的写失败，
-            // 用来验证「写了一半失败」这条路径的清理行为。
-            throw Object.assign(new Error('simulated write interruption'), { code: 'ENOSPC' });
-          }
-          return originalWrite(buffer, offset, length, position);
-        };
-      }
-      return handle;
-    }) as typeof fs.open;
+    // 模拟降级复制写到一半被中断（介质空间耗尽）。
+    const restore = patchDegradedInterrupt(destPath, path.join(source, 'payload.bin'));
 
     try {
       await service.start({
@@ -1380,13 +1446,13 @@ async function main(): Promise<void> {
         resume: true,
       });
     } finally {
+      restore();
       patched.link = originalLink;
-      patched.open = originalOpen;
     }
 
     assert.equal(service.getState().phase, 'failed', '降级复制中断后任务不得报完成');
     assert.equal(await exists(target, 'payload.bin'), false,
-      '复制中断后不得在目标路径留下半截文件：那会被下一次规划当成已存在的目标');
+      '复制中断后不得在目标路径留下半截文件：那会被下一次规划当成已存在的目标，备份从此卡住');
   });
 
   await test('可靠性：降级复制期间目标被并发替换时不得删除替换进来的文件', async () => {
@@ -1400,36 +1466,13 @@ async function main(): Promise<void> {
 
     const destPath = path.join(target, 'payload.bin');
     const originalLink = fs.link;
-    const originalOpen = fs.open;
-    const originalUnlink = fs.unlink;
-    const originalWriteFile = fs.writeFile;
-    const patched = fs as unknown as { link: typeof fs.link; open: typeof fs.open };
+    const patched = fs as unknown as { link: typeof fs.link };
     patched.link = (async () => {
       throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
     }) as typeof fs.link;
-    // 在降级写入刚落下第一批数据后，外部把目标路径换成另一个文件：
+    // 在降级写入刚落下数据后，外部把目标路径换成另一个文件：
     // 那是用户自己的内容，备份既不得覆盖它，也不得把它当成自己的删掉。
-    patched.open = (async (file: any, flags: any, mode?: any) => {
-      const handle = await originalOpen(file, flags, mode);
-      if (String(file) === destPath && typeof flags === 'string' && flags.includes('wx')) {
-        const originalWrite = handle.write.bind(handle) as (
-          buffer: Buffer, offset: number, length: number, position: number,
-        ) => Promise<{ bytesWritten: number }>;
-        let chunks = 0;
-        (handle as unknown as {
-          write: (buffer: Buffer, offset: number, length: number, position: number) => Promise<{ bytesWritten: number }>;
-        }).write = async (buffer: Buffer, offset: number, length: number, position: number) => {
-          chunks += 1;
-          const result = await originalWrite(buffer, offset, length, position);
-          if (chunks === 1) {
-            await originalUnlink(destPath).catch(() => undefined);
-            await originalWriteFile(destPath, 'FOREIGN-CONTENT', 'utf8');
-          }
-          return result;
-        };
-      }
-      return handle;
-    }) as typeof fs.open;
+    const restore = patchDegradedReplacement(destPath, 'FOREIGN-CONTENT');
 
     try {
       await service.start({
@@ -1440,8 +1483,8 @@ async function main(): Promise<void> {
         resume: true,
       });
     } finally {
+      restore();
       patched.link = originalLink;
-      patched.open = originalOpen;
     }
 
     assert.equal(await fs.readFile(destPath, 'utf8'), 'FOREIGN-CONTENT',
