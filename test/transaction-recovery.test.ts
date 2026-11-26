@@ -1,7 +1,4 @@
 import assert from 'node:assert/strict';
-import { registerTempCleanup, trackTempDir } from './harness';
-
-registerTempCleanup();
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
@@ -13,6 +10,9 @@ import type { CopyResult } from '../electron/engine/pool';
 import { BackupTransaction } from '../electron/engine/transaction';
 import { CASE_INSENSITIVE_PATHS } from '../electron/engine/path-identity';
 import type { AppState, SyncMode } from '../shared/types';
+import { registerTempCleanup, trackTempDir } from './harness';
+
+registerTempCleanup();
 
 // The service launches copyWorker.js alongside itself. Use the existing Electron build.
 const { BackupService } = require('../dist-electron/electron/engine/service.js') as typeof import('../electron/engine/service');

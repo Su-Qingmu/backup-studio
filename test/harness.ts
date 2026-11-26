@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 /**
  * 自制测试调度器的统一记账口径。
@@ -21,9 +23,27 @@ import fs from 'node:fs';
  */
 const trackedTempDirs = new Set<string>();
 
-/** 登记一个临时夹具目录，返回原值便于链式使用 */
+/**
+ * 登记一个临时夹具目录，返回原值便于链式使用。
+ *
+ * 这里会递归删除登记过的目录，所以必须先确认它确实是「临时夹具」：
+ * 非绝对路径、根目录、以及系统临时目录与仓库 `test/` 之外的路径一律拒绝。
+ * 当前所有调用点传的都是 `fs.mkdtemp()` 的结果，但这是测试基础设施，
+ * 将来有人手滑传错路径时，这里是最后一道闸。
+ */
 export function trackTempDir(dir: string): string {
-  trackedTempDirs.add(dir);
+  if (!path.isAbsolute(dir)) throw new Error(`临时夹具目录必须是绝对路径：${dir}`);
+  const resolved = path.resolve(dir);
+  const root = path.parse(resolved).root;
+  if (resolved === root) throw new Error(`拒绝登记要递归删除的根目录：${resolved}`);
+  const allowed = [os.tmpdir(), path.join(process.cwd(), 'test')].flatMap((base) => {
+    const abs = path.resolve(base);
+    const real = (() => { try { return fs.realpathSync(abs); } catch { return abs; } })();
+    return [abs, real];
+  });
+  const inside = allowed.some((base) => resolved === base || resolved.startsWith(base + path.sep));
+  if (!inside) throw new Error(`临时夹具目录必须位于系统临时目录或仓库 test/ 之下：${resolved}`);
+  trackedTempDirs.add(resolved);
   return dir;
 }
 
@@ -35,9 +55,14 @@ export function cleanupTrackedTempDirs(): void {
       // 占用类错误（Windows 上文件仍被打开）会重试几次再放弃
       fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     } catch {
-      // 目录被占用等：清理失败不能影响测试结论，但也不能静默丢弃记录
+      // 目录被占用等：清理失败要如实报出来。夹具生命周期本身就是本 Issue 的
+      // 契约之一——残留目录会持续占用空间，也可能影响依赖临时目录状态的后续
+      // 用例，所以这一轮不得显示为「全绿」。摘要打到 stdout，CI 日志里能直接
+      // 看到（只写 stderr 容易被当成噪声忽略）。
+      console.log(`临时目录清理失败（残留）：${dir}`);
       console.error(`临时目录清理失败（残留）：${dir}`);
       failed.push(dir);
+      process.exitCode = 1;
     }
   }
   // 清理失败的目录保留在表里：下次调用还能再试一次
@@ -79,8 +104,10 @@ export class SkipSignal extends Error {
 
 export interface Runner {
   test(name: string, fn: () => void | Promise<void>): Promise<void>;
-  /** 登记一次跳过：不得计入通过 */
+  /** 登记一次跳过：不得计入通过。会中止当前用例 */
   skip(name: string, reason: string): void;
+  /** 在用例体外登记一次跳过（不中止任何用例） */
+  registerSkip(name: string, reason: string): void;
   readonly passed: number;
   readonly failed: number;
   readonly skipped: number;
@@ -94,7 +121,6 @@ export function createRunner(options: RunnerOptions = {}): Runner {
   let passed = 0;
   let failed = 0;
   let skipped = 0;
-  let inTest = false;
   // 退出码由 runner 自己兜住，而不是靠每个套件在结尾记得写
   // 「if (runner.failed > 0) process.exitCode = 1」。
   //
@@ -103,11 +129,13 @@ export function createRunner(options: RunnerOptions = {}): Runner {
   // 而在钩子里改写 process.exitCode 能决定最终退出码，所以这里可以做到
   // 「用了 createRunner 的套件，失败必然非零退出」。
   process.on('exit', () => {
-    if (failed > 0) process.exitCode = 1;
+    // 只在「当前没有别的退出码」时置 1：已经存在的非零码（例如显式的
+    // process.exit(2)）是有意为之的退出语义，不能被改写成 1 丢掉信息。
+    // 套件显式 process.exit(0) 谎报成功时 exitCode 恰好是 0，照样会被改回 1。
+    if (failed > 0 && (process.exitCode ?? 0) === 0) process.exitCode = 1;
   });
   return {
     async test(name, fn) {
-      inTest = true;
       try {
         await fn();
         passed += 1;
@@ -126,14 +154,19 @@ export function createRunner(options: RunnerOptions = {}): Runner {
         const line = `${detail}${text}`;
         if (options.errorStream) console.error(line);
         else console.log(line);
-      } finally {
-        inTest = false;
       }
     },
-    skip(name, reason) {
-      // 用例内部调用：抛信号中止该用例，由 test() 统一记成「跳过」。
-      // 用例外部调用：直接登记（例如整段用例按能力决定是否执行）。
-      if (inTest) throw new SkipSignal(reason);
+    skip(_name, reason) {
+      // 跳过必须中止当前用例。否则「没执行断言」和「执行并通过」会被同时记上，
+      // 汇总里的「通过」就掺着根本没跑的用例——那正是本 Issue 要消灭的假通过。
+      //
+      // 一律抛信号，不看当前是否在用例体内：在用例体外调用时信号会向上传播
+      // 成显式失败，而不是悄悄多记一次「跳过」。确实需要在用例体外登记时，
+      // 用 registerSkip()。
+      throw new SkipSignal(reason);
+    },
+    registerSkip(name, reason) {
+      // 显式的「在用例体外登记一次跳过」入口。
       skipped += 1;
       console.log(`${indent}SKIP  ${name} — ${reason}`);
     },

@@ -2217,12 +2217,10 @@ async function main(): Promise<void> {
 
   await test('T26 存放路径是 UNC 网络路径：还原被拒', () =>
     withTempDir('dup-q-index-', async (dir) => {
-      // UNC 是 Windows 的路径语义：POSIX 上 path.isAbsolute() 先把它拒掉，
-      // 根本到不了「网络盘拒绝」这条分支。平台不具备该语义时如实跳过，不计入通过。
-      if (process.platform !== 'win32') {
-        skip('T26 存放路径是 UNC 网络路径：还原被拒', 'UNC 路径语义只存在于 Windows，纯字符串判定由 T26a 覆盖');
-        return;
-      }
+      // 不按平台跳过：下面用的正斜杠 UNC 写法在 POSIX 上同样是绝对路径，
+      // 而网络盘判定是纯字符串规则且排在布局校验之前，所以这条用例在任何
+      // 平台上都能走到「网络盘拒绝」那条分支。原先按平台跳过等于让 Linux CI
+      // 永远不覆盖这条路径。
       const quarantineDirectory = path.join(dir, 'quarantine');
       await fs.mkdir(quarantineDirectory, { recursive: true });
 
