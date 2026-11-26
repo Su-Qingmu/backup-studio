@@ -49,6 +49,16 @@ const idle = (aut: AutoSync, id: string) => until(aut, s => {
   const p = pairOf(s, id);
   return p.state === 'idle' && !!p.lastSync && p.pending === 0;
 });
+/**
+ * 等**下一轮**同步真正跑完。
+ *
+ * resume() 之后 lastSync 还是上一轮的值，idle() 可能拿它立刻判定「已完成」，
+ * 而那一轮同步其实还没开始——机器负载高的时候尤其容易踩到，表现为偶发失败。
+ */
+const nextIdle = async (aut: AutoSync, id: string, before: number) => until(aut, s => {
+  const p = pairOf(s, id);
+  return p.state === 'idle' && (p.lastSync ?? 0) > before && p.pending === 0;
+});
 
 /** 构造一个完整的配对对象（账本类测试直接用它，不经过 AutoSync）。 */
 const makePair = (input: AutoPairInput, id = 'pair-ledger-test'): AutoPair => ({
@@ -85,7 +95,12 @@ class UnrepairableLedger extends PairLedger {
     return { ...snap, corruption: [unrepairableCorruption()] };
   }
   override async repairLedger(): Promise<LedgerCorruption[]> {
-    return this.state.broken ? [unrepairableCorruption()] : [];
+    if (!this.state.broken) return [];
+    // 真实的修复会留下留证文件：hasQuarantine() 因此为真，容量清理继续停手。
+    // 不写的话，「容量清理可以恢复」这句话就永远没被检验过。
+    await fs.mkdir(this.root, { recursive: true });
+    await fs.writeFile(path.join(this.root, `versions.jsonl.corrupt-${Date.now()}-test`), '模拟的不可修复损坏\n', 'utf8');
+    return [unrepairableCorruption()];
   }
 }
 
@@ -443,8 +458,9 @@ async function main() {
     for (const bad of ['{坏掉的版本记录一}', '{坏掉的版本记录二}']) {
       await fs.writeFile(ledger.versionsFile, bad + '\n', 'utf8');
       await put(input.sourceRoot, 'later' + bad.length, 'new');
+      const before = (await aut.status()).pairs.find(p => p.pair.id === id)?.lastSync ?? 0;
       await aut.resume(id);
-      await idle(aut, id);
+      await nextIdle(aut, id, before);
     }
     const events = await damageEvents();
     assert.equal(events.length, 2, '两次不同的损坏必须各报一次，不得被当成同一份');
@@ -467,26 +483,34 @@ async function main() {
 
       // 第一轮：坏着，且修不掉 → 只能提示人工核对
       await put(sourceRoot, 'a.txt', 'x');
+      let before = (await aut.status()).pairs.find(p => p.pair.id === id)?.lastSync ?? 0;
       await aut.resume(id);
-      await idle(aut, id);
+      await nextIdle(aut, id, before);
       assert.equal((await damageEvents()).filter(e => /需要人工核对/.test(e.action)).length, 1, '修不掉的损坏必须提示人工核对');
 
       // 第二轮：用户照提示把账本修好了（这一轮没有东西需要自动修复）
       state.broken = false;
       await put(sourceRoot, 'b.txt', 'y');
+      before = (await aut.status()).pairs.find(p => p.pair.id === id)?.lastSync ?? 0;
       await aut.resume(id);
-      await idle(aut, id);
+      await nextIdle(aut, id, before);
 
       // 第三轮：同样的损坏又来了 —— 必须再次提示，不能被当成「已经报过」
       state.broken = true;
       await put(sourceRoot, 'c.txt', 'z');
+      before = (await aut.status()).pairs.find(p => p.pair.id === id)?.lastSync ?? 0;
       await aut.resume(id);
-      await idle(aut, id);
+      await nextIdle(aut, id, before);
 
       const events = await damageEvents();
       const manual = events.filter(e => /需要人工核对/.test(e.action));
       assert.equal(manual.length, 2, `同样的损坏在修好之后再来一次，必须再次上报，实际报了 ${manual.length} 次`);
-      assert.ok(events.some(e => /已恢复/.test(e.action)), '账本恢复后必须如实告知用户');
+      const recovered = events.find(e => /已恢复/.test(e.action));
+      assert.ok(recovered, '账本恢复后必须如实告知用户');
+      // 留证文件还在 → 容量清理必须继续停手，这时说「可以恢复」是假的。
+      assert.match(recovered?.detail ?? '', /留证文件仍在/, '留证还在时不得声称容量清理可以恢复');
+      const evidence = await fs.readdir(path.join(targetRoot, '.backup-studio', 'aut-history', id));
+      assert.ok(evidence.some(name => name.includes('.corrupt-')), '留证文件必须还在');
     } finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
   });
 

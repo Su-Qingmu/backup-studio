@@ -318,7 +318,10 @@ export class AutoSync implements AutoSyncApi {
         rt.reportedCorruption = undefined;
         // 作废这件事要让用户看得见：否则「账本已经好了」和「程序还在记着
         // 一份旧账」在界面上完全一样。
-        this.event(st, '历史账本已恢复', '账本已能完整读出，先前报告的损坏已不存在；容量清理可以恢复');
+        //
+        // 容量清理能不能恢复，取决于留证文件还在不在：留证还在（用户还没
+        // 人工核对过）就必须继续停手，这时候说「可以恢复」是假的。
+        this.event(st, '历史账本已恢复', '账本已能完整读出（或已不存在），先前报告的损坏已不存在；容量清理可以恢复');
       }
     }
     if (!remote.commits.length && !remote.versions.length && !Object.keys(remote.index).length) return;
