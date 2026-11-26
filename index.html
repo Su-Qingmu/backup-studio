@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta
@@ -8,8 +8,127 @@
     />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Backup Studio</title>
+    <style>
+      /*
+       * 首屏骨架（issue #10）。
+       *
+       * React 挂载前 #root 是空的，窗口里只有 backgroundColor——深色主题下就是
+       * 一片近乎纯黑的背景，用户要等 AppImage 解包、asar 加载、React 首帧渲染
+       * 全走完才看到界面。这段样式与骨架随 HTML 一起到达，不依赖任何 JS，
+       * 因此「窗口已可见但还是黑的」这段窗口期里也有可识别内容。
+       *
+       * 颜色必须自带：tokens.css 是由 JS 打包导入的，首屏阶段尚未加载，
+       * 所以这里不引用 CSS 变量，直接写死两套配色。取值与主进程 THEME_COLORS
+       * 保持一致，避免窗口原生底色与骨架底色之间出现接缝。
+       */
+      html,
+      body,
+      #root {
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        overflow: hidden;
+      }
+      /*
+       * 骨架是脱离文档流的浮层，不能占据布局空间。
+       *
+       * 原因：React 18 的 createRoot 首次挂载并不会清空容器。核对过本仓库
+       * react-dom 18.3.1 的实现——updateHostRoot 里给 HostRoot 打上 Snapshot
+       * 标志（该标志才会触发 commitBeforeMutationEffectsOnFiber 中的
+       * clearContainer）的前提是 current !== null，而首次挂载时 current 为 null，
+       * 容器里的既有子节点会原样留下。所以骨架若留在 #root 里当普通流内容，
+       * React 挂载后它仍占着整屏高度，把真正的界面挤到折叠线以下。
+       *
+       * 改为 fixed 浮层后：无论 React 是否清理容器，骨架都不影响界面布局；
+       * 首屏就绪时由 src/main.tsx 显式移除它。
+       *
+       * pointer-events: none 是兜底：万一移除没跑起来，浮层也不会挡住操作。
+       */
+      #boot {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        pointer-events: none;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        font-family: 'Inter', 'Segoe UI Variable Text', 'Segoe UI', system-ui, -apple-system,
+          'PingFang SC', 'Microsoft YaHei', sans-serif;
+      }
+      #boot .boot-name {
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+      #boot .boot-hint {
+        font-size: 13px;
+      }
+      #boot .boot-dots {
+        display: flex;
+        gap: 7px;
+      }
+      #boot .boot-dots i {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        animation: boot-pulse 1.2s ease-in-out infinite;
+      }
+      #boot .boot-dots i:nth-child(2) {
+        animation-delay: 0.15s;
+      }
+      #boot .boot-dots i:nth-child(3) {
+        animation-delay: 0.3s;
+      }
+      @keyframes boot-pulse {
+        0%,
+        80%,
+        100% {
+          opacity: 0.25;
+        }
+        40% {
+          opacity: 1;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #boot .boot-dots i {
+          animation: none;
+          opacity: 0.6;
+        }
+      }
+      /*
+       * 默认浅色：与 tokens.css 的 :root 一致。html 标签上不预置 data-theme，
+       * 由 preload 在解析阶段写入真实主题，避免解析器用写死的值覆盖它；
+       * 没有 preload 的浏览器开发兜底场景下就按浅色渲染，与 tokens.css 同源。
+       */
+      #boot {
+        background: #f5f5f3;
+        color: #4a4a46;
+      }
+      #boot .boot-dots i {
+        background: #4a4a46;
+      }
+      [data-theme='dark'] #boot {
+        background: #0b0b0a;
+        color: #a9a9a4;
+      }
+      [data-theme='dark'] #boot .boot-dots i {
+        background: #a9a9a4;
+      }
+    </style>
   </head>
   <body>
+    <!--
+      骨架放在 #root 之外：它属于启动流程，不属于 React 的渲染产物，
+      生命周期由 src/main.tsx 在首屏就绪后显式结束。
+    -->
+    <div id="boot">
+      <div class="boot-name">Backup Studio</div>
+      <div class="boot-dots"><i></i><i></i><i></i></div>
+      <div class="boot-hint">正在启动…</div>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { BackupService, type StartOptions } from './engine/service';
@@ -12,6 +13,7 @@ import type { AppState, SyncMode } from '../shared/types';
 import type { AutoPairInput } from '../shared/aut-types';
 import type { DupActRequest, DupItemAction } from '../shared/dup-types';
 import type { BackupRevealState } from '../shared/reveal-types';
+import type { ThemeConfig, ThemeMode, ThemeState } from '../shared/theme-types';
 let mainWindow: BrowserWindow | null = null;
 let service: BackupService | null = null;
 let autoSync: AutoSync | null = null;
@@ -43,6 +45,59 @@ function themeKey(): 'dark' | 'light' {
   return nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
 }
 
+/**
+ * 主题偏好的持久化文件。
+ *
+ * 必须放 userData：该路径只由应用名决定，与安装方式、AppImage 挂载点无关。
+ * 渲染层的 Web Storage 按页面 origin 隔离，而 AppImage 每次运行都挂载到
+ * 不同的临时目录，页面地址随之变化，不能作为跨重启的可靠载体（issue #11）。
+ */
+function themeConfigPath(): string {
+  return path.join(app.getPath('userData'), 'theme.json');
+}
+
+/** 只接受白名单内的三个字面量，防止配置文件被改坏后把 themeSource 设成怪值。 */
+function isThemeMode(value: unknown): value is ThemeMode {
+  return value === 'light' || value === 'dark' || value === 'system';
+}
+
+/**
+ * 读取持久化的主题偏好。
+ *
+ * 文件缺失（首次运行）或任何读取/解析失败一律回退 'system'（跟随系统）：
+ * 一个坏配置文件不能让应用起不来，也不该改变明暗之外的任何行为。
+ */
+function loadThemeMode(): ThemeMode {
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(themeConfigPath(), 'utf8'));
+    if (parsed && typeof parsed === 'object') {
+      const mode = (parsed as Partial<ThemeConfig>).mode;
+      if (isThemeMode(mode)) return mode;
+    }
+  } catch {
+    // 文件不存在或内容损坏：按首次运行处理
+  }
+  return 'system';
+}
+
+/**
+ * 写入主题偏好。
+ *
+ * 先写临时文件再 rename：进程在写配置文件时崩溃，不会留下半截 JSON 把
+ * 下次启动的偏好读坏。写失败只意味着「这次选择留不到下次启动」——本次
+ * 界面已经生效，不抛异常、不影响主题切换本身。
+ */
+function saveThemeMode(mode: ThemeMode): void {
+  try {
+    const file = themeConfigPath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify({ mode }), 'utf8');
+    fs.renameSync(`${file}.tmp`, file);
+  } catch {
+    // 持久化失败不应影响主题切换本身
+  }
+}
+
 function createWindow(): void {
   const palette = THEME_COLORS[themeKey()];
 
@@ -51,6 +106,12 @@ function createWindow(): void {
     height: 860,
     minWidth: 1024,
     minHeight: 680,
+    // Linux 任务栏图标：设置窗口图标以写入 _NET_WM_ICON；AppImage 未做桌面集成时，
+    // KDE 拿不到已注册的 desktop entry 与 WM_CLASS 匹配，会回落到窗口自身图标（issue #17）。
+    // 该路径对开发态（<仓库>/dist-electron/electron）与打包态（<resources>/app.asar/dist-electron/electron）
+    // 都正好上溯两级到「仓库根 / asar 根」，而 build/icon 由 package.json 的 files
+    // 原样打进 asar 根，因此两种形态下指向的是同一份资源文件。
+    icon: path.join(__dirname, '../../build/icon/512x512.png'),
     show: false,
     backgroundColor: palette.background,
     autoHideMenuBar: true,
@@ -66,21 +127,76 @@ function createWindow(): void {
       nodeIntegration: false,
       sandbox: true,
       spellcheck: false,
+      // 把建窗这一刻解析出的实际亮暗交给 preload：渲染层第一帧就能用上正确主题，
+      // 不用等异步的 app:get-theme 往返，避免「窗口底色一个色、界面另一个色」的
+      // 闪烁（issue #11）。additionalArguments 是 Electron 官方的进程外传参通道。
+      additionalArguments: [`--bs-resolved-theme=${themeKey()}`],
     },
   });
 
-  mainWindow.once('ready-to-show', () => {
+  //
+  // 窗口显示时机（issue #10）。
+  //
+  // AppImage 冷启动要解包挂载、加载 asar、跑完 React 初始化，这段时间里窗口若
+  // 已经显示，用户看到的就只是一块 backgroundColor——深色主题下近乎纯黑。
+  // index.html 内置的启动骨架保证这段等待期里也有可识别内容。
+  //
+  // 两个信号都到齐才显示窗口：
+  //  - ready-to-show：渲染进程至少画过一帧。早于它 show() 会露出窗口底色（白闪）；
+  //  - app:boot-ready：React 首屏已挂载，显示出来才是界面而不是启动骨架。
+  //
+  // 单看 ready-to-show 不够（那时 React 还没挂载，显示的是一块 backgroundColor）；
+  // 单看 boot-ready 也不够（它由渲染层主动上报，可能早于首帧真正提交）。
+  //
+  // 兜底超时是必须的：任一信号永远不来（渲染进程脚本崩了、IPC 断连），无条件
+  // 等待就等于「窗口永不出现」——那比黑屏更糟。所以到点无条件显示，宁可显示
+  // 启动骨架。
+  const BOOT_READY_TIMEOUT_MS = 4000;
+  let painted = false;
+  let mounted = false;
+  let shown = false;
+  const showWindow = (): void => {
+    if (shown || !painted || !mounted) return;
+    shown = true;
+    clearTimeout(bootTimer);
     mainWindow?.show();
+  };
+  const bootTimer = setTimeout(() => {
+    // 兜底：两个信号都当作已满足，宁可显示启动骨架也不能让窗口不出现。
+    painted = true;
+    mounted = true;
+    showWindow();
+  }, BOOT_READY_TIMEOUT_MS);
+
+  mainWindow.once('ready-to-show', () => {
+    painted = true;
+    showWindow();
   });
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+    // 窗口没了就别再留着兜底定时器：否则它会在主进程里空转到超时才触发。
+    clearTimeout(bootTimer);
     // 窗口关闭即停止自动同步，但保留用户开关意图；重开窗口时重新对账。
     void autoSync?.suspend();
   });
 
   // 重开窗口时恢复自动备份的监听与对账（不改变已保存的开关）。
   void autoSync?.start();
+
+  //
+  // 渲染层挂载完首屏后主动汇报，主进程据此显示窗口（issue #10）。
+  //
+  // 放在窗口作用域而不是 registerIpc 里：只有这里能拿到本次窗口的 bootTimer
+  // 与 showWindow 闭包，多开窗口时互不干扰。
+  //
+  // 先 removeHandler 再 handle：窗口全关后重新 createWindow() 会再走到这里，
+  // 而 ipcMain.handle 对同一 channel 重复注册会抛 "Attempted to register a second handler"。
+  ipcMain.removeHandler('app:boot-ready');
+  ipcMain.handle('app:boot-ready', () => {
+    mounted = true;
+    showWindow();
+  });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (isSafeExternalUrl(url)) {
@@ -291,8 +407,12 @@ function registerIpc(): void {
     );
   });
 
-  ipcMain.handle('app:theme', async (_event, mode: 'light' | 'dark' | 'system') => {
+  ipcMain.handle('app:theme', async (_event, mode: ThemeMode) => {
+    if (!isThemeMode(mode)) throw new Error('主题模式无效');
+    // 用户的选择必须跨重启留下（issue #11）：写进 userData 下的配置文件，
+    // 下次启动在 createWindow 之前读回，窗口首帧就是用户选的配色。
     nativeTheme.themeSource = mode;
+    saveThemeMode(mode);
     const palette = THEME_COLORS[themeKey()];
     mainWindow?.setBackgroundColor(palette.background);
     mainWindow?.setTitleBarOverlay({
@@ -302,6 +422,13 @@ function registerIpc(): void {
     });
     return themeKey();
   });
+
+  // 渲染层启动时核对当前生效的主题。渲染层自己的 localStorage 只是首帧缓存
+  // （AppImage 每次挂载路径不同，随时可能读空），这里返回的才是权威值。
+  ipcMain.handle('app:get-theme', async (): Promise<ThemeState> => ({
+    mode: nativeTheme.themeSource,
+    resolved: themeKey(),
+  }));
 
   ipcMain.handle('app:open-external', async (_event, url: string) => {
     if (!isSafeExternalUrl(url)) {
@@ -446,6 +573,9 @@ void app.whenReady().then(() => {
   registerIpc();
   registerAutoIpc();
   registerDupIpc();
+  // 主题必须在建窗之前定下来：窗口背景与原生标题栏只按创建那一刻的配色绘制，
+  // ready-to-show 之后才 show，之后再改会被用户看到一次闪烁（issue #11）。
+  nativeTheme.themeSource = loadThemeMode();
   createWindow();
   void autoSync.start();
   // 崩溃或关窗后引擎是全新实例：读一次活动账本，界面才有续传入口。
