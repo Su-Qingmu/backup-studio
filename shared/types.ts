@@ -228,6 +228,41 @@ export interface WriteGate {
   evidence: string[];
 }
 
+/**
+ * 写入许可：主进程给出的**唯一**裁决。
+ *
+ * 界面不得自行复制安全规则——同一个目标只有三种结论：
+ * - allowed=false：被阻断，界面必须禁用写入并原样展示 reason；
+ * - allowed=true 且 requiresConfirmation=true：允许写入，但卷级健康无法判定，
+ *   须由用户显式确认后继续；
+ * - allowed=true 且 requiresConfirmation=false：允许写入。
+ *
+ * 许可必须与它针对的目标绑定：换了目标目录，上一份许可就不再适用。
+ */
+export interface WritePermit {
+  /** 是否允许写入目标 */
+  allowed: boolean;
+  /**
+   * 允许写入但卷级健康无法判定：须由用户显式确认后继续。
+   * 自动写入不走这个状态——它按「默认只读」直接阻断。
+   */
+  requiresConfirmation: boolean;
+  /** 主进程原文理由：阻断时给出原因，需确认时给出提示 */
+  reason: string | null;
+  /** 判定依据 */
+  evidence: string[];
+  /** 判定针对的目标根目录；界面只采信与当前目标一致的许可 */
+  targetRoot: string;
+  /** 判定等级 */
+  level: RiskLevel;
+  /** 判定条件 */
+  condition: HealthReport['condition'];
+  /** 卷级健康结论 */
+  volumeHealth: WriteGate['volumeHealth'];
+  /** 判定时间 */
+  at: number;
+}
+
 export interface RepairRequest {
   volume: string;
   confirmed: boolean;
@@ -270,6 +305,8 @@ export interface AppState {
   recoverableJob: RecoverableJob | null;
   /** 介质判定结果（L0/L1/L2）与证据链 */
   assessment: MediaAssessment | null;
+  /** 写入许可：主进程裁决，界面据此禁用/确认，不得自行推导安全规则 */
+  writePermit: WritePermit | null;
   /** 隔离观察标记；可由用户撤销 */
   quarantine: QuarantineMark | null;
 }

@@ -35,6 +35,15 @@ export async function readDeviceBytes(device: string, offset: number, size: numb
 
 function crcBytes(bytes: Buffer): number { return Number.parseInt(crc32(bytes.toString('latin1')), 16) >>> 0; }
 
+/**
+ * 「证据不足」条件下的统一措辞。
+ *
+ * 证据不足**不等于**禁止写入：若这里自称「保持只读」，
+ * 界面就会同时表达「不要写入」与「可以开始写入」两个相反结论。
+ * 写入与否由写入许可（WritePermit）裁决，判定只负责陈述事实。
+ */
+export const UNCERTAIN_SUGGESTION = '分层证据不足，无法完成卷级健康检查；当前未发现明确写入阻断。继续前请自行确认目标介质状态。';
+
 /** 仅校验结构，不尝试解释或写回分区。 */
 export async function inspectPartition(read: (offset: number, size: number) => Promise<Buffer>, sector: number, bytes: number) {
   if (![512, 1024, 2048, 4096].includes(sector) || !Number.isSafeInteger(bytes) || bytes < sector * 3 || bytes % sector) return '能力缺失：扇区几何未知';
@@ -190,7 +199,7 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
   else if (repair) { condition = 'filesystem-repair'; assessment.level = 'L1'; assessment.confidence = 0.95; assessment.suggestion = '卷状态或脏位提示文件系统需人工检查；保持只读，先保护其他副本。'; }
   else if (!probe.reachable) condition = 'unreachable';
   else if (verified) condition = 'verified';
-  else if (assessment.level === 'L0') { assessment.level = 'L1'; assessment.confidence = 0.5; assessment.suggestion = '分层证据不足，保持只读；尝试换口、换线、换主机后重查。'; }
+  else if (assessment.level === 'L0') { assessment.level = 'L1'; assessment.confidence = 0.5; }
   if (!strong && !repair && probe.reachable && probe.writable && volume?.readOnly === false && dirty === false && bootReadable && /^(MBR|GPT)/.test(partition) && index !== '未验证' && !files.unchecked && !verifyFailures) {
     assessment.level = 'L0'; assessment.confidence = 0.8; assessment.suggestion = verified ? '分层校验通过；如需恢复备份，须显式确认并重建计划。' : '仅备份集层需要处理；优先用本机账本和完好分片，显式确认后重扫。';
   }
@@ -204,6 +213,9 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
   // 判定条件随结论一起下发：同为 L1，「文件系统需人工检查」与「仅是证据不足」
   // 对写入的含义完全不同，界面据此区分「必须保持只读」与「证据不足待复查」。
   assessment.condition = condition;
+  // 「证据不足」的措辞在这里收口：无论结论来自哪条判定路径都不再自称「保持只读」，
+  // 避免界面同时表达「不要写入」与「可以开始写入」两个相反结论。
+  if (condition === 'uncertain' && assessment.level === 'L1') assessment.suggestion = UNCERTAIN_SUGGESTION;
   return { assessment, condition, volume: volume && letter ? `${letter}:` : null, permission, smart, index, files, diskReadOnly: typeof volume?.readOnly === 'boolean' ? volume.readOnly : null };
 }
 

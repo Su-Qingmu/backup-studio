@@ -70,6 +70,8 @@ export default function App() {
   const [collapsed, setCollapsed] = useState(false);
   const [busyStage, setBusyStage] = useState<'scanning' | 'planning' | 'starting' | null>(null);
   const [confirming, setConfirming] = useState(false);
+  // 卷级健康无法判定时的显式风险确认：换了目标就必须重新确认。
+  const [riskConfirmed, setRiskConfirmed] = useState(false);
   const [allowMassDelete, setAllowMassDelete] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [dismissedFailure, setDismissedFailure] = useState<string | null>(null);
@@ -85,6 +87,11 @@ export default function App() {
     scopeIdRef.current = state?.revealScopeId;
     setRevealError(null);
   }, [state?.revealScopeId]);
+
+  // 换了目标，上一份风险确认不再适用。
+  useEffect(() => {
+    setRiskConfirmed(false);
+  }, [targetRoot]);
 
   useEffect(() => {
     // 自动同步工作区由面板回传；App 挂载及进入查重时面板不在，主动读取状态。
@@ -284,27 +291,22 @@ export default function App() {
   );
 
   const running = phase === 'running' || phase === 'paused';
-  const assessment = state?.assessment;
-  // 判定结论只对被判定过的目标有效：目标换了就不得沿用上一份结论。
-  const assessmentApplies = Boolean(
-    assessment?.targetRoot && targetRoot && assessment.targetRoot === targetRoot
-  );
-  // L1 有两种成因，含义不同：
-  // - filesystem-repair：文件系统需人工检查，必须保持只读，按钮禁用；
-  // - uncertain：仅是证据不足（常见于平台不支持卷级探测或权限不足），不等于禁止写入。
-  const mustStayReadOnly = assessmentApplies
-    && (assessment?.condition === 'filesystem-repair'
-      || assessment?.condition === 'media-unavailable'
-      || assessment?.condition === 'unreachable'
-      || assessment?.level === 'L2');
-  // 证据不足：提示复查，但不禁用——引擎的写入闸门会按 volumeHealth 与模式裁决。
-  const evidenceIncomplete = assessmentApplies && !mustStayReadOnly && assessment?.writable === false;
-  // 完成态按钮只重新扫描和生成计划，不会启动写入。
-  const writeBlockReason = phase !== 'completed' && mustStayReadOnly
-    ? `${assessment?.level}：${assessment?.suggestion}`
+  // 写入许可由主进程裁决，界面只消费结论，不再自行复制安全规则。
+  // 许可只对被判定过的目标有效：目标换了就不得沿用上一份结论。
+  const permit = state?.writePermit ?? null;
+  const permitApplies = Boolean(permit && targetRoot && permit.targetRoot === targetRoot);
+  // 完成态按钮只重新扫描和生成计划，不会启动写入，因此不受许可约束。
+  const permitGate = phase !== 'completed' && permitApplies;
+  // 三态：阻断 / 需显式确认 / 放行。
+  const permitBlocked = permitGate && permit?.allowed === false;
+  const permitNeedsConfirm = permitGate && permit?.allowed === true && permit.requiresConfirmation === true;
+  const writeBlockReason = permitBlocked
+    ? permit?.reason ?? '写入已被阻断'
     : null;
   const canStart = Boolean(sourceRoot && targetRoot) && !running && phase !== 'scanning' && phase !== 'planning'
-    && writeBlockReason === null;
+    && writeBlockReason === null
+    // 卷级健康无法判定时不得默认放行：必须由用户显式确认。
+    && (!permitNeedsConfirm || riskConfirmed);
 
   /**
    * 恢复中断的备份。
@@ -609,11 +611,19 @@ export default function App() {
                 </div>
               ) : null}
 
-              {evidenceIncomplete && phase !== 'completed' ? (
-                <div className="banner" role="status">
-                  <span className="banner-text" title={assessment?.suggestion}>
-                    分层证据不足，建议先复查介质：{assessment?.suggestion}
+              {permitNeedsConfirm ? (
+                <div id="backup-write-permit-notice" className="banner" data-tone="warn" role="status">
+                  <span className="banner-text" title={permit?.reason ?? undefined}>
+                    {permit?.reason}
                   </span>
+                  <label className="permit-confirm">
+                    <input
+                      type="checkbox"
+                      checked={riskConfirmed}
+                      onChange={(event) => setRiskConfirmed(event.target.checked)}
+                    />
+                    我已确认目标介质状态，允许写入
+                  </label>
                 </div>
               ) : null}
 
@@ -636,7 +646,9 @@ export default function App() {
                     className={writeBlockReason === null ? 'btn btn-primary' : 'btn'}
                     type="button"
                     disabled={phase === 'completed' ? !sourceRoot || !targetRoot || busy : !canStart || busy}
-                    aria-describedby={writeBlockReason === null ? undefined : 'backup-write-block-reason'}
+                    aria-describedby={writeBlockReason !== null
+                      ? 'backup-write-block-reason'
+                      : permitNeedsConfirm ? 'backup-write-permit-notice' : undefined}
                     onClick={() => {
                       if (phase === 'completed') {
                         // 再次备份 = 重新扫描并重新生成计划，而不是直接复用旧计划。
@@ -701,6 +713,7 @@ export default function App() {
               key={diagnosticsRoot}
               api={api}
               root={diagnosticsRoot}
+              permit={permitApplies ? permit : null}
               disabled={phase === 'running' || phase === 'paused'}
             />
 

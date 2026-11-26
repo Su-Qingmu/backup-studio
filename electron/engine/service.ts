@@ -33,6 +33,7 @@ import {
   type ManifestEntry,
 } from './manifest';
 import type {
+  HealthReport,
   AppState,
   LogEntry,
   LogLevel,
@@ -47,20 +48,28 @@ import type {
   ScanResult,
   SyncMode,
   WriteGate,
+  WritePermit,
 } from '../../shared/types';
 
 /**
  * 自动写入要求确认卷健康（需求 §3.2）；用户显式指定目录的查重清理落系统回收站，可恢复，
  * 因此仅放宽「卷健康未知」。两种模式仍拦截不可达、隔离、L2、只读和需修复的介质。
  */
-export function decideWriteGate(facts: {
+/**
+ * 写入闸门的事实集合。
+ *
+ * 闸门、许可与界面提示都从同一份事实推导，避免出现第二套安全规则。
+ */
+export interface WriteGateFacts {
   reachable: boolean;
   isolated: boolean;
   level: WriteGate['level'];
   readOnly: boolean;
   repairNeeded: boolean;
   volumeHealth: WriteGate['volumeHealth'];
-}, mode: 'automatic' | 'user-directed'): { allowed: boolean; reason?: string } {
+}
+
+export function decideWriteGate(facts: WriteGateFacts, mode: 'automatic' | 'user-directed'): { allowed: boolean; reason?: string } {
   const { reachable, isolated, level, readOnly, repairNeeded, volumeHealth } = facts;
   let reason: string | undefined;
   if (!reachable) reason = '目标介质不可达';
@@ -70,6 +79,36 @@ export function decideWriteGate(facts: {
   else if (repairNeeded || volumeHealth === 'repair-required') reason = '卷需要人工检查，禁止写入；处理完成并重新对账后再继续';
   else if (mode === 'automatic' && volumeHealth === 'unknown') reason = '未能确认卷健康（权限不足或当前平台不支持卷级检查），按默认只读处理；自动写入已禁止';
   return { allowed: reason === undefined, reason };
+}
+
+/**
+ * 把闸门事实翻译成界面可以直接执行的写入许可。
+ *
+ * 三态契约：
+ * - 阻断（allowed=false）：界面必须禁用写入，并原样展示 reason；
+ * - 需确认（allowed=true 且 requiresConfirmation=true）：允许写入，但卷级健康
+ *   无法判定，须由用户显式确认后继续；
+ * - 放行：允许写入。
+ *
+ * 措辞上必须与结论一致：证据不足时**不得**再自称「保持只读」，
+ * 否则界面会同时表达「不要写入」与「可以开始写入」两个相反结论。
+ */
+export function deriveWritePermit(
+  facts: WriteGateFacts,
+  mode: 'automatic' | 'user-directed',
+): { allowed: boolean; requiresConfirmation: boolean; reason: string | null } {
+  const decision = decideWriteGate(facts, mode);
+  if (!decision.allowed) {
+    return { allowed: false, requiresConfirmation: false, reason: decision.reason ?? '写入已被阻断' };
+  }
+  if (facts.volumeHealth === 'unknown') {
+    return {
+      allowed: true,
+      requiresConfirmation: true,
+      reason: '未能确认卷级健康状况（权限不足或当前平台不支持卷级检查）；当前未发现明确写入阻断，继续前请自行确认目标介质状态。',
+    };
+  }
+  return { allowed: true, requiresConfirmation: false, reason: null };
 }
 
 /** 判定为「介质不可用」的错误码：拔盘、拔出 USB、总线错误 */
@@ -285,6 +324,7 @@ export class BackupService extends EventEmitter {
       confirmReason: '',
       recoverableJob: null,
       assessment: null,
+      writePermit: null,
       quarantine: null,
     };
   }
@@ -1036,8 +1076,54 @@ export class BackupService extends EventEmitter {
     // 判定结论必须带上它针对的目标：换了目标，上一份判定就不再适用。
     report.assessment.targetRoot = targetRoot;
     this.state.assessment = report.assessment;
+    // 许可与判定同源：界面只消费主进程的裁决，不再自行推导安全规则。
+    this.state.writePermit = await this.buildWritePermit(targetRoot, report);
     this.emitState();
     return report;
+  }
+
+  /**
+   * 写入闸门的事实集合：闸门、许可与界面提示共用同一份事实。
+   *
+   * 只有确实取到卷级事实且未发现问题时才敢称「健康」；否则标注能力缺失，
+   * 不伪造健康结论。
+   */
+  private async writeFacts(targetRoot: string, report: HealthReport): Promise<WriteGateFacts> {
+    const riskKey = await this.targetRiskKey(targetRoot);
+    const mark = this.state.quarantine;
+    const isolated = Boolean(mark && !mark.released && (await this.targetRiskKey(mark.targetRoot)) === riskKey);
+    const level = report.assessment.level;
+    const reachable = report.condition !== 'unreachable';
+    const readOnly = report.diskReadOnly === true;
+    const repairNeeded = report.condition === 'filesystem-repair' || this.blockedTargets.has(riskKey);
+    const volumeChecked = reachable && report.volume !== null && !readOnly && !repairNeeded;
+    const volumeHealth: WriteGate['volumeHealth'] = repairNeeded ? 'repair-required' : volumeChecked ? 'healthy' : 'unknown';
+    return { reachable, isolated, level, readOnly, repairNeeded, volumeHealth };
+  }
+
+  /**
+   * 生成写入许可：主进程给界面的**唯一**裁决。
+   *
+   * 手动备份的目标由用户显式指定，按 user-directed 模式裁决：
+   * 卷级健康无法判定不等于禁止写入，但必须先由用户显式确认。
+   */
+  private async buildWritePermit(targetRoot: string, report: HealthReport): Promise<WritePermit> {
+    const facts = await this.writeFacts(targetRoot, report);
+    const { allowed, requiresConfirmation, reason } = deriveWritePermit(facts, 'user-directed');
+    const evidence = report.assessment.evidence.map((item) => `${item.kind}：${item.detail}`);
+    if (facts.volumeHealth === 'unknown') evidence.push('卷健康未知：未能确认卷级健康状况');
+    if (report.assessment.suggestion) evidence.push(`建议：${report.assessment.suggestion}`);
+    return {
+      allowed,
+      requiresConfirmation,
+      reason,
+      evidence,
+      targetRoot,
+      level: report.assessment.level,
+      condition: report.condition,
+      volumeHealth: facts.volumeHealth,
+      at: now(),
+    };
   }
 
   private async targetRiskKey(targetRoot: string): Promise<string> {
@@ -1052,27 +1138,26 @@ export class BackupService extends EventEmitter {
     // L2 是已确认的介质层故障，必须拒绝。
     // L1 只表示「分层证据不足」，不等于禁止写入：证据不足往往源于平台不支持
     // 卷级探测或权限不足，若一律拒绝会让无卷级权限的环境完全无法备份。
-    // 是否放行由 writeGate/decideWriteGate 按 volumeHealth 与模式裁决。
-    if (report?.assessment.level === 'L2' || report?.diskReadOnly === true || this.blockedTargets.has(riskKey) || (mark && !mark.released && await this.targetRiskKey(mark.targetRoot) === riskKey)) {
-      throw new Error('当前目标存在只读风险，禁止写入；请查看介质证据。');
-    }
+    // 判定事实与界面许可同源（writeFacts / decideWriteGate），不再维护第二套规则。
+    const facts: WriteGateFacts = {
+      reachable: report ? report.condition !== 'unreachable' : true,
+      isolated: Boolean(mark && !mark.released && (await this.targetRiskKey(mark.targetRoot)) === riskKey),
+      level: (report?.assessment.level ?? 'L1') as WriteGate['level'],
+      readOnly: report?.diskReadOnly === true,
+      repairNeeded: this.blockedTargets.has(riskKey) || report?.condition === 'filesystem-repair',
+      volumeHealth: 'unknown',
+    };
+    const { allowed, reason } = decideWriteGate(facts, 'user-directed');
+    if (!allowed) throw new Error(reason ?? '当前目标存在只读风险，禁止写入；请查看介质证据。');
   }
 
   /** 默认按自动写入策略裁决；可恢复的用户清理须显式选择模式。 */
   async writeGate(targetRoot: string, options?: { mode?: 'automatic' | 'user-directed' }): Promise<WriteGate> {
     const report = await this.inspectTarget(targetRoot, true);
-    const riskKey = await this.targetRiskKey(targetRoot);
-    const mark = this.state.quarantine;
-    const isolated = Boolean(mark && !mark.released && (await this.targetRiskKey(mark.targetRoot)) === riskKey);
-    const level = report.assessment.level;
-    const reachable = report.condition !== 'unreachable';
-    const readOnly = report.diskReadOnly === true;
-    const repairNeeded = report.condition === 'filesystem-repair' || this.blockedTargets.has(riskKey);
-    // 只有确实取到卷级事实且未发现问题时才敢称「健康」；否则标注能力缺失，不伪造健康结论。
-    const volumeChecked = reachable && report.volume !== null && !readOnly && !repairNeeded;
-    const volumeHealth: WriteGate['volumeHealth'] = repairNeeded ? 'repair-required' : volumeChecked ? 'healthy' : 'unknown';
+    const facts = await this.writeFacts(targetRoot, report);
+    const { reachable, isolated, level, volumeHealth } = facts;
     const mode = options?.mode ?? 'automatic';
-    const { allowed, reason } = decideWriteGate({ reachable, isolated, level, readOnly, repairNeeded, volumeHealth }, mode);
+    const { allowed, reason } = decideWriteGate(facts, mode);
 
     const evidence = report.assessment.evidence.map((item) => `${item.kind}：${item.detail}`);
     if (mode === 'user-directed' && volumeHealth === 'unknown') evidence.push('卷健康未知：未能确认卷级健康状况');

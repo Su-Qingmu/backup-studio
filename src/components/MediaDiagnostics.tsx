@@ -1,11 +1,11 @@
 import { useState } from 'react';
 import '../styles/media-diagnostics.css';
-import type { CapabilityRow, HealthReport } from '../../shared/types';
+import type { CapabilityRow, HealthReport, WritePermit } from '../../shared/types';
 import type { BackupAPI } from '../lib/api';
 
 const labels: Record<HealthReport['condition'], string> = { unreachable: '目标目录不可达', 'filesystem-repair': '文件系统需人工检查', 'media-unavailable': '介质层不可用或已隔离', verified: '分层校验通过', uncertain: '证据不足' };
 
-export function MediaDiagnostics({ api, root, disabled }: { api: BackupAPI; root: string; disabled: boolean }) {
+export function MediaDiagnostics({ api, root, disabled, permit }: { api: BackupAPI; root: string; disabled: boolean; permit?: WritePermit | null }) {
   const [report, setReport] = useState<HealthReport>();
   const [matrix, setMatrix] = useState<CapabilityRow[]>();
   const [platform, setPlatform] = useState('Windows');
@@ -37,6 +37,12 @@ export function MediaDiagnostics({ api, root, disabled }: { api: BackupAPI; root
     {report && <>
       <p><strong>{report.assessment.level} / {labels[report.condition]}</strong>（置信度 {Math.round(report.assessment.confidence * 100)}%）</p>
       <p>{report.assessment.suggestion}</p>
+      {permit && permit.targetRoot === root ? (
+        <p role="status">
+          <strong>写入许可：{permit.allowed ? (permit.requiresConfirmation ? '需人工确认' : '允许写入') : '已阻断'}</strong>
+          {permit.reason ? `（${permit.reason}）` : ''}
+        </p>
+      ) : null}
       <details open><summary>分层证据</summary><dl>{report.assessment.evidence.map(({ kind, detail }, i) => <div key={`${kind}-${i}`}><dt>{kind}</dt><dd>{detail}</dd></div>)}</dl></details>
       {report.condition === 'filesystem-repair' && report.volume && <fieldset disabled={locked || !report.permission}>
         <legend>人工修复预检与镜像演练</legend>

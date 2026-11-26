@@ -136,6 +136,7 @@ export function createMockApi(): BackupAPI {
     confirmReason: '',
     recoverableJob: null,
     assessment: null,
+    writePermit: null,
     quarantine: null,
   });
 
@@ -766,18 +767,31 @@ export function createMockApi(): BackupAPI {
     async exportPartitionEvidence() { return { auditId: 'demo', guidance: '浏览器演示：未写入文件。' }; },
     async capabilities() { return (await import('../../electron/engine/capability')).capabilityMatrix; },
 
-    async assess(_targetRoot: string) {
-      return {
-        assessment: {
-          level: 'L0' as const,
-          confidence: 0.8,
-          evidence: [],
-          suggestion: '介质读取稳定',
-          at: Date.now(),
-          writable: true,
-        },
-        state: current,
+    async assess(targetRoot: string) {
+      const assessment = {
+        level: 'L0' as const,
+        confidence: 0.8,
+        evidence: [],
+        suggestion: '介质读取稳定',
+        at: Date.now(),
+        writable: true,
+        targetRoot,
+        condition: 'verified' as const,
       };
+      // 演示态也遵守同一条契约：界面拿到的必须是主进程给的许可。
+      const writePermit = {
+        allowed: true,
+        requiresConfirmation: false,
+        reason: null,
+        evidence: [],
+        targetRoot,
+        level: 'L0' as const,
+        condition: 'verified' as const,
+        volumeHealth: 'healthy' as const,
+        at: Date.now(),
+      };
+      current = { ...current, assessment, writePermit };
+      return { assessment, state: current };
     },
 
     async recover() {
