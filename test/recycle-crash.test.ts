@@ -237,7 +237,13 @@ fs.copyFile = async (from, to, flags) => {
       // 它既不会被计划当成孤儿删除，也不会被待删临时名覆盖。
       await fs.writeFile(config.plantPath, config.plantContent || 'DECOY MUST SURVIVE');
     }
-    await startWithPermit(service, { sourceRoot: source, targetRoot: target, syncMode, allowMassDelete: true, resume: true });
+    // 这个子进程是 --eval 片段，没有模块作用域：回执逻辑必须内联，
+    // 不能引用本文件 import 进来的 startWithPermit。
+    const permit = service.getState().writePermits[target];
+    await service.start({
+      sourceRoot: source, targetRoot: target, syncMode, allowMassDelete: true, resume: true,
+      acknowledgeRisk: permit && permit.verdict === 'confirm' ? permit.revision : undefined,
+    });
   } else if (mode === 'recover') {
     const job = await service.findRecoverableJob();
     assert.ok(job, '重启后仍应能发现中断任务');
