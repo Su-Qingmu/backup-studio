@@ -77,7 +77,9 @@ export function cleanupTrackedTempDirs(): void {
       console.log(`临时目录清理失败（残留）：${dir}`);
       console.error(`临时目录清理失败（残留）：${dir}`);
       failed.push(dir);
-      process.exitCode = 1;
+      // 与 runner 的退出码钩子同一口径：只在本轮没有别的退出码时才置 1。
+      // 套件显式 process.exit(2) 那样有意为之的退出语义不能被改写成 1。
+      if ((process.exitCode ?? 0) === 0) process.exitCode = 1;
     }
   }
   // 清理失败的目录保留在表里：下次调用还能再试一次
