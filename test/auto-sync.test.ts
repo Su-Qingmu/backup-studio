@@ -393,6 +393,42 @@ async function main() {
     assert.equal(second.length, first.length, '同一份损坏不得每轮重复上报');
   }));
 
+  await test('历史账本：内容不同的损坏必须有不同的摘要，不得只靠偏移区分', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    await fs.mkdir(path.dirname(ledger.commitsFile), { recursive: true });
+    await fs.writeFile(ledger.commitsFile, '{坏行甲}\n', 'utf8');
+    const first = (await ledger.read()).corruption[0];
+    assert.ok(first, '必须报告损坏');
+    assert.equal(first.digest.length, 64, '摘要必须是哈希');
+    // 位置、行数都一样，只有内容不同：只比偏移会把这两份损坏当成同一份，
+    // 于是「修好之后同样的位置又坏了」会被静默吞掉。
+    await fs.writeFile(ledger.commitsFile, '{坏行乙}\n', 'utf8');
+    const second = (await ledger.read()).corruption[0];
+    assert.equal(first.slices[0].start, second.slices[0].start, '两处损坏的位置相同，用于验证摘要的区分作用');
+    assert.notEqual(first.digest, second.digest, '内容不同的损坏必须有不同摘要');
+  }));
+
+  await test('历史账本：修好之后再坏一次，必须再次上报', () => fixture({}, async (aut, input) => {
+    const id = await enable(aut, input);
+    await idle(aut, id);
+    const realPair = pairOf(await aut.status(), id).pair;
+    const ledger = new PairLedger(realPair);
+    await fs.mkdir(path.dirname(ledger.versionsFile), { recursive: true });
+    const damageEvents = async () => {
+      const st = (await aut.status()).pairs.find(p => p.pair.id === id);
+      return (st?.recent ?? []).filter(e => /历史账本(损坏|需要人工核对)/.test(e.action));
+    };
+    for (const bad of ['{坏掉的版本记录一}', '{坏掉的版本记录二}']) {
+      await fs.writeFile(ledger.versionsFile, bad + '\n', 'utf8');
+      await put(input.sourceRoot, 'later' + bad.length, 'new');
+      await aut.resume(id);
+      await idle(aut, id);
+    }
+    const events = await damageEvents();
+    assert.equal(events.length, 2, '两次不同的损坏必须各报一次，不得被当成同一份');
+  }));
+
   await test('拒绝源内目标和反向包含', () => fixture({}, async (aut, input) => {
     const nested = path.join(input.sourceRoot, 'nested'); await fs.mkdir(nested);
     await assert.rejects(aut.addPair({ ...input, targetRoot: nested }), /互相包含/);

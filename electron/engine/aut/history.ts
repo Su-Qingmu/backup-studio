@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { promises as fs, realpathSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { AutoChange, AutoCommit, AutoPair, AutoRecycleEntry, AutoVersion } from '../../../shared/aut-types';
 import { writeJsonAtomic } from '../manifest';
 import { hashFile } from '../hash';
@@ -96,6 +96,14 @@ export interface LedgerCorruption {
   raw: string[];
   /** 被跳过行在原文件中的字节区间：留证时按字节切片，保住原始内容 */
   slices: Array<{ start: number; end: number }>;
+  /**
+   * 坏行原始字节的摘要。
+   *
+   * 光看行数与字节偏移分不清两份不同的损坏：同样长度、同样位置的两处损坏
+   * 会被当成同一份，于是「用户修好账本后同样的损坏又回来」这种真事故会被
+   * 静默吞掉。摘要让不同的损坏必然不同。
+   */
+  digest: string;
   /** 是否为文件尾部的半行（可自愈） */
   tornTail: boolean;
   /** 尾部半行时：最后一条完好记录之后的字节偏移 */
@@ -247,6 +255,10 @@ export class PairLedger {
     // 再读时末尾就有换行符了——若拿换行符当判据，同一份残留会被从
     // 「尾部半行，可自愈」改判成「中段损坏，磁盘坏了」，白白误导用户。
     const tornTail = bad.length === 1 && !goodAfterBad && badIsLastLine;
+    // 摘要按**原始字节**算：按 utf8 解码再编码会把非法字节序列换成替换
+    // 字符，两份不同的损坏就可能算出同一个摘要。
+    const digest = createHash('sha256');
+    for (const slice of slices) digest.update(buf.subarray(slice.start, slice.end));
     return {
       rows,
       corruption: {
@@ -254,6 +266,7 @@ export class PairLedger {
         lines: bad.length,
         raw: bad,
         slices,
+        digest: digest.digest('hex'),
         tornTail,
         goodBytes,
       },

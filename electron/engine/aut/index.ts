@@ -76,7 +76,7 @@ const blank = (): Local => ({ version: 2, pairs: [] });
 
 /** 账本损坏的指纹：同一份损坏只该报一次，否则事件流会被重复条目淹没。 */
 const corruptionFingerprint = (list: readonly LedgerCorruption[]) =>
-  list.map(c => `${c.file}:${c.lines}:${c.tornTail}:${c.slices.map(s => `${s.start}-${s.end}`).join(',')}`).join('|');
+  list.map(c => `${c.file}:${c.lines}:${c.tornTail}:${c.digest}:${c.slices.map(s => `${s.start}-${s.end}`).join(',')}`).join('|');
 
 const reasonFor = (err: unknown) => {
   const labels: Record<string, string> = { ENOENT: '目录或文件不可用', EACCES: '权限不足', EPERM: '操作被拒绝或文件被占用', EBUSY: '文件被占用', ENOSPC: '磁盘空间不足', ENAMETOOLONG: '路径过长', EIO: '读写设备失败' };
@@ -286,7 +286,15 @@ export class AutoSync implements AutoSyncApi {
     // 在这里发事件等于每轮承诺一次「马上会修」，而同一份损坏每轮都会被读出来，
     // 重复的同一条只会淹没真正的新变化。
     const rt = this.runtime(st.pair.id);
-    rt.corruptionFingerprint = remote.corruption.length ? corruptionFingerprint(remote.corruption) : undefined;
+    if (remote.corruption.length) {
+      rt.corruptionFingerprint = corruptionFingerprint(remote.corruption);
+    } else {
+      rt.corruptionFingerprint = undefined;
+      // 账本已经干净了，上一次上报过的损坏随之作废。不清的话，等同样的
+      // 损坏再次出现时，它会被当成「已经报过」而静默吞掉——用户刚修好的账本
+      // 又坏了，却什么提示都收不到。
+      rt.reportedCorruption = undefined;
+    }
     if (!remote.commits.length && !remote.versions.length && !Object.keys(remote.index).length) return;
     st.history = { commits: remote.commits, versions: remote.versions };
     if (!Object.keys(st.index).length && Object.keys(remote.index).length) {
@@ -313,7 +321,13 @@ export class AutoSync implements AutoSyncApi {
     // 修完必须复查：修完还坏，说明根本没修好，此时报「已修复、已留证」是假的。
     let after: LedgerSnapshot | undefined;
     try { after = await ledger.read(); } catch { after = undefined; }
-    const remaining = after?.corruption ?? [];
+    if (!after) {
+      // 复查读不出来：不能据此断言「已经干净」，也不能断言「还坏着」。
+      // 本轮若确实修过，就如实说留证了；指纹留着，下一轮再核对。
+      if (found.length) this.event(st, '历史账本损坏', `${found.map(c => `${c.file}${c.tornTail ? '（尾部半行，已截回）' : '（中段损坏，坏行已隔离留证）'}`).join('、')}；损坏内容已留证在账本目录的 .corrupt-* 文件中`);
+      return;
+    }
+    const remaining = after.corruption;
     if (!remaining.length) {
       if (found.length) {
         const detail = found
