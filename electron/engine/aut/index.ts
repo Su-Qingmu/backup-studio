@@ -19,7 +19,7 @@ import type {
 import { writeJsonAtomic } from '../manifest';
 import { hashFile } from '../hash';
 import { scanTree } from '../scan';
-import { checkRoot, code, exclusion, historyLimits, makePair, safePath, statMaybe, validatePairInput } from './config';
+import { checkRoot, code, exclusion, historyLimits, makePair, safePath, statFollowing, statMaybe, validatePairInput } from './config';
 import { copyAtomic, fault, stamp, type Gate } from './copy';
 import { Blocked, denial, type WritePermit } from './permit';
 import { MAX_ATTEMPTS, queueState, retryDelay, type QueueState } from './queue';
@@ -324,7 +324,13 @@ export class AutoSync implements AutoSyncApi {
         // 也可能下一刻被人工删掉——提前替它表态，说的就是假的。清理是否停手
         // 由另一条事件（历史账本曾损坏）如实交代。
         let vanished = false;
-        try { vanished = !(await statMaybe(ledger.root))?.isDirectory(); } catch { vanished = false; }
+        try {
+          // 跟随链接看真实形态：lstat 把 Windows 的目录联接报成「不是目录」，
+          // 而它指向的账本目录明明正常存在。照 lstat 判会说「账本已消失」——
+          // 那是凭空造出来的假警报，用户会以为历史真的没了。
+          const st = await statFollowing(ledger.root);
+          vanished = !st?.isDirectory();
+        } catch { vanished = false; }
         this.event(st, vanished ? '历史账本已消失' : '历史账本已恢复',
           vanished
             ? '账本目录已不存在，先前报告的损坏已无处核对；介质上的历史请自行确认'

@@ -552,6 +552,88 @@ async function main() {
     } finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
   });
 
+  await test('历史账本：账本目录被删掉后必须说「已消失」，不得说「已恢复」', async () => {
+    const base = trackTempDir(await fs.mkdtemp(path.resolve('test', '.aut-fixture-')));
+    const sourceRoot = path.join(base, 'source'), targetRoot = path.join(base, 'target'), local = path.join(base, 'local');
+    const d = decision();
+    const state = { broken: true };
+    const aut = new AutoSync(local, { canWrite: () => d }, { ledgerFor: pair => new UnrepairableLedger(pair, state) });
+    try {
+      await fs.mkdir(sourceRoot); await fs.mkdir(targetRoot);
+      const id = await enable(aut, { sourceRoot, targetRoot, stableMs: 500 });
+      await idle(aut, id);
+      const damageEvents = async () => {
+        const st = (await aut.status()).pairs.find(p => p.pair.id === id);
+        return (st?.recent ?? []).filter(e => /历史账本(需要人工核对|已恢复|已消失)/.test(e.action));
+      };
+
+      // 第一轮：坏着且修不掉 → 只能提示人工核对
+      await put(sourceRoot, 'a.txt', 'x');
+      await aut.resume(id);
+      await waitUntil(async () => (await damageEvents()).some(e => /需要人工核对/.test(e.action)), '第一轮的人工核对提示');
+      await runRound(aut, id);
+
+      // 账本目录整个被删掉了（介质被格式化、用户手动清理、目录被挪走……）
+      state.broken = false;
+      const ledgerRoot = path.join(targetRoot, '.backup-studio', 'aut-history', id);
+      await fs.rm(ledgerRoot, { recursive: true, force: true });
+      await put(sourceRoot, 'b.txt', 'y');
+      await aut.resume(id);
+      await waitUntil(async () => (await damageEvents()).some(e => /已消失/.test(e.action)), '账本已消失的提示');
+      await runRound(aut, id);
+
+      const events = await damageEvents();
+      assert.ok(events.some(e => e.action === '历史账本已消失'), '账本目录不存在时必须说「已消失」');
+      assert.ok(!events.some(e => e.action === '历史账本已恢复'), '账本目录都不在了，说「已恢复」是假的：那份历史其实没了');
+    } finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
+  });
+
+  await test('历史账本：账本目录是 junction（仍可正常读写）时不得误报「已消失」', async () => {
+    const base = trackTempDir(await fs.mkdtemp(path.resolve('test', '.aut-fixture-')));
+    const sourceRoot = path.join(base, 'source'), targetRoot = path.join(base, 'target'), local = path.join(base, 'local');
+    const d = decision();
+    const state = { broken: true };
+    const aut = new AutoSync(local, { canWrite: () => d }, { ledgerFor: pair => new UnrepairableLedger(pair, state) });
+    try {
+      await fs.mkdir(sourceRoot); await fs.mkdir(targetRoot);
+      const id = await enable(aut, { sourceRoot, targetRoot, stableMs: 500 });
+      await idle(aut, id);
+      const damageEvents = async () => {
+        const st = (await aut.status()).pairs.find(p => p.pair.id === id);
+        return (st?.recent ?? []).filter(e => /历史账本(需要人工核对|已恢复|已消失)/.test(e.action));
+      };
+
+      // 第一轮：坏着且修不掉 → 只能提示人工核对
+      await put(sourceRoot, 'a.txt', 'x');
+      await aut.resume(id);
+      await waitUntil(async () => (await damageEvents()).some(e => /需要人工核对/.test(e.action)), '第一轮的人工核对提示');
+      await runRound(aut, id);
+
+      // 账本目录换成一个目录联接（junction）：路径变了，但内容照样读得到。
+      // lstat 看到的是「不是目录」，照它判会误报成「账本已消失」。
+      state.broken = false;
+      const ledgerRoot = path.join(targetRoot, '.backup-studio', 'aut-history', id);
+      const realLedger = path.join(base, 'real-ledger');
+      await fs.rename(ledgerRoot, realLedger);
+      await fs.symlink(realLedger, ledgerRoot, 'junction');
+      await put(sourceRoot, 'b.txt', 'y');
+      await aut.resume(id);
+      await waitUntil(async () => (await damageEvents()).some(e => /已恢复/.test(e.action)), '账本已恢复的提示');
+      await runRound(aut, id);
+
+      const events = await damageEvents();
+      assert.ok(events.some(e => e.action === '历史账本已恢复'), 'junction 指向的目录能正常访问，必须说「已恢复」');
+      assert.ok(!events.some(e => e.action === '历史账本已消失'), 'junction 只是路径不同，不得误报「账本已消失」');
+    } finally {
+      await aut.suspend();
+      // 先摘掉联接本身，再删临时目录：否则会把联接指向的真实目录一起带走。
+      // 这里不能用 id：它在 try 块里是块级作用域，finally 里取不到。
+      const junctionPath = path.join(targetRoot, '.backup-studio', 'aut-history');
+      await fs.rm(junctionPath, { recursive: true, force: true }).catch(() => undefined);
+      await fs.rm(base, { recursive: true });
+    }
+  });
+
   await test('拒绝源内目标和反向包含', () => fixture({}, async (aut, input) => {
     const nested = path.join(input.sourceRoot, 'nested'); await fs.mkdir(nested);
     await assert.rejects(aut.addPair({ ...input, targetRoot: nested }), /互相包含/);
