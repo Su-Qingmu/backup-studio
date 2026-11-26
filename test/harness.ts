@@ -95,6 +95,16 @@ export function createRunner(options: RunnerOptions = {}): Runner {
   let failed = 0;
   let skipped = 0;
   let inTest = false;
+  // 退出码由 runner 自己兜住，而不是靠每个套件在结尾记得写
+  // 「if (runner.failed > 0) process.exitCode = 1」。
+  //
+  // 以前那行是纯约定：漏写一个套件，那一套就会「有失败却退出 0」，
+  // CI 显示绿色，失败被吞掉。'exit' 钩子在 process.exit() 之后仍会执行，
+  // 而在钩子里改写 process.exitCode 能决定最终退出码，所以这里可以做到
+  // 「用了 createRunner 的套件，失败必然非零退出」。
+  process.on('exit', () => {
+    if (failed > 0) process.exitCode = 1;
+  });
   return {
     async test(name, fn) {
       inTest = true;
