@@ -6,7 +6,7 @@ import { setTimeout as wait } from 'node:timers/promises';
 import { AutoSync, type WriteDecision, type WritePermit } from '../electron/engine/aut';
 import { Debounce, retryDelay } from '../electron/engine/aut/queue';
 import { ensureRoom, recyclePath } from '../electron/engine/aut/recycle';
-import { PairLedger } from '../electron/engine/aut/history';
+import { PairLedger, type LedgerCorruption, type LedgerSnapshot } from '../electron/engine/aut/history';
 import type { AutoPair, AutoPairInput, AutoRecycleEntry, AutoStatus } from '../shared/aut-types';
 import { createRunner, registerTempCleanup, trackTempDir } from './harness';
 
@@ -68,6 +68,27 @@ const makePair = (input: AutoPairInput, id = 'pair-ledger-test'): AutoPair => ({
   historyMaxBytes: input.historyMaxBytes ?? 1024 * 1024,
   historyMaxVersionsPerPath: input.historyMaxVersionsPerPath ?? 20,
 });
+// 模拟「介质一直坏着」的账本：自动修复报告修过了，账本却始终读不干净。
+//
+// 这条路径在真实文件系统里几乎造不出来（自动修复总能把账本修干净），
+// 但它正是「需要人工核对」与「旧上报状态何时作废」这两处逻辑唯一会走的路。
+const unrepairableCorruption = (): LedgerCorruption => ({
+  file: 'versions.jsonl', lines: 1, raw: ['{模拟的不可修复损坏}'],
+  slices: [{ start: 0, end: 5 }], digest: 'f'.repeat(64), tornTail: true, goodBytes: 0,
+});
+
+class UnrepairableLedger extends PairLedger {
+  constructor(pair: AutoPair, private readonly state: { broken: boolean }) { super(pair); }
+  override async read(): Promise<LedgerSnapshot> {
+    const snap = await super.read();
+    if (!this.state.broken || snap.corruption.length) return snap;
+    return { ...snap, corruption: [unrepairableCorruption()] };
+  }
+  override async repairLedger(): Promise<LedgerCorruption[]> {
+    return this.state.broken ? [unrepairableCorruption()] : [];
+  }
+}
+
 const noop = async () => {};
 
 async function main() {
@@ -428,6 +449,46 @@ async function main() {
     const events = await damageEvents();
     assert.equal(events.length, 2, '两次不同的损坏必须各报一次，不得被当成同一份');
   }));
+
+  await test('历史账本：修不掉又修好后，同样的损坏再来必须再次上报', async () => {
+    const base = trackTempDir(await fs.mkdtemp(path.resolve('test', '.aut-fixture-')));
+    const sourceRoot = path.join(base, 'source'), targetRoot = path.join(base, 'target'), local = path.join(base, 'local');
+    const d = decision();
+    const state = { broken: true };
+    const aut = new AutoSync(local, { canWrite: () => d }, { ledgerFor: pair => new UnrepairableLedger(pair, state) });
+    try {
+      await fs.mkdir(sourceRoot); await fs.mkdir(targetRoot);
+      const id = await enable(aut, { sourceRoot, targetRoot, stableMs: 500 });
+      await idle(aut, id);
+      const damageEvents = async () => {
+        const st = (await aut.status()).pairs.find(p => p.pair.id === id);
+        return (st?.recent ?? []).filter(e => /历史账本(需要人工核对|已恢复)/.test(e.action));
+      };
+
+      // 第一轮：坏着，且修不掉 → 只能提示人工核对
+      await put(sourceRoot, 'a.txt', 'x');
+      await aut.resume(id);
+      await idle(aut, id);
+      assert.equal((await damageEvents()).filter(e => /需要人工核对/.test(e.action)).length, 1, '修不掉的损坏必须提示人工核对');
+
+      // 第二轮：用户照提示把账本修好了（这一轮没有东西需要自动修复）
+      state.broken = false;
+      await put(sourceRoot, 'b.txt', 'y');
+      await aut.resume(id);
+      await idle(aut, id);
+
+      // 第三轮：同样的损坏又来了 —— 必须再次提示，不能被当成「已经报过」
+      state.broken = true;
+      await put(sourceRoot, 'c.txt', 'z');
+      await aut.resume(id);
+      await idle(aut, id);
+
+      const events = await damageEvents();
+      const manual = events.filter(e => /需要人工核对/.test(e.action));
+      assert.equal(manual.length, 2, `同样的损坏在修好之后再来一次，必须再次上报，实际报了 ${manual.length} 次`);
+      assert.ok(events.some(e => /已恢复/.test(e.action)), '账本恢复后必须如实告知用户');
+    } finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
+  });
 
   await test('拒绝源内目标和反向包含', () => fixture({}, async (aut, input) => {
     const nested = path.join(input.sourceRoot, 'nested'); await fs.mkdir(nested);

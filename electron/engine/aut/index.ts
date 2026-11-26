@@ -143,6 +143,18 @@ function aggregate(states: AutoRunState[]): AutoRunState {
   return 'off';
 }
 
+export interface AutoSyncOptions {
+  /**
+   * 测试接缝：账本实例的创建方式。
+   *
+   * 损坏恢复里有几处状态只有在「账本修不掉」时才会走到（例如提示用户人工
+   * 核对、以及旧上报状态何时作废）。这种状态在真实文件系统里几乎造不出来
+   * ——自动修复总能把账本修干净——但它恰恰是最需要被测的那条路径。
+   * 生产不传这个选项，行为与从前完全一致。
+   */
+  ledgerFor?: (pair: AutoPair) => PairLedger;
+}
+
 export class AutoSync implements AutoSyncApi {
   private data = blank();
   private readonly runtimes = new Map<string, PairRuntime>();
@@ -151,9 +163,18 @@ export class AutoSync implements AutoSyncApi {
   private active = false;
   private readonly loaded: Promise<void>;
 
-  constructor(private readonly localDirectory: string, private readonly permit: WritePermit) {
+  constructor(
+    private readonly localDirectory: string,
+    private readonly permit: WritePermit,
+    private readonly options: AutoSyncOptions = {},
+  ) {
     this.file = path.join(localDirectory, 'auto-sync.json');
     this.loaded = this.load();
+  }
+
+  /** 账本实例：生产走 PairLedger，测试可换成别的实现。 */
+  private makeLedger(pair: AutoPair): PairLedger {
+    return this.options.ledgerFor ? this.options.ledgerFor(pair) : new PairLedger(pair);
   }
 
   private async load(): Promise<void> {
@@ -293,7 +314,12 @@ export class AutoSync implements AutoSyncApi {
       // 账本已经干净了，上一次上报过的损坏随之作废。不清的话，等同样的
       // 损坏再次出现时，它会被当成「已经报过」而静默吞掉——用户刚修好的账本
       // 又坏了，却什么提示都收不到。
-      rt.reportedCorruption = undefined;
+      if (rt.reportedCorruption) {
+        rt.reportedCorruption = undefined;
+        // 作废这件事要让用户看得见：否则「账本已经好了」和「程序还在记着
+        // 一份旧账」在界面上完全一样。
+        this.event(st, '历史账本已恢复', '账本已能完整读出，先前报告的损坏已不存在；容量清理可以恢复');
+      }
     }
     if (!remote.commits.length && !remote.versions.length && !Object.keys(remote.index).length) return;
     st.history = { commits: remote.commits, versions: remote.versions };
@@ -324,7 +350,7 @@ export class AutoSync implements AutoSyncApi {
     if (!after) {
       // 复查读不出来：不能据此断言「已经干净」，也不能断言「还坏着」。
       // 本轮若确实修过，就如实说留证了；指纹留着，下一轮再核对。
-      if (found.length) this.event(st, '历史账本损坏', `${found.map(c => `${c.file}${c.tornTail ? '（尾部半行，已截回）' : '（中段损坏，坏行已隔离留证）'}`).join('、')}；损坏内容已留证在账本目录的 .corrupt-* 文件中`);
+      if (found.length) this.event(st, '历史账本损坏', `${found.map(c => `${c.file}${c.tornTail ? '（尾部半行，已截回）' : '（中段损坏，坏行已隔离留证）'}`).join('、')}；损坏内容已留证在账本目录的 .corrupt-* 文件中；修后复查读不出来，账本是否干净未知，下一轮再核对`);
       return;
     }
     const remaining = after.corruption;
@@ -422,7 +448,7 @@ export class AutoSync implements AutoSyncApi {
         st.epoch = epoch;
         await this.save();
         rt.state = 'scanning';
-        const ledger = new PairLedger(st.pair);
+        const ledger = this.makeLedger(st.pair);
         const gate = this.gateFor(st, rt, epoch);
         await this.hydrate(st, ledger);
         // 账本有损坏时**先修复再对账**：否则本轮新增的 commit/version 会
@@ -567,7 +593,7 @@ export class AutoSync implements AutoSyncApi {
     if (!this.data.activePairId) this.data.activePairId = pair.id;
     const rt = this.runtime(pair.id);
     await this.captureBaseline(st, rt);
-    await this.hydrate(st, new PairLedger(pair));
+    await this.hydrate(st, this.makeLedger(pair));
     this.event(st, '配对已添加');
     await this.save();
     this.arm(st);
@@ -657,7 +683,7 @@ export class AutoSync implements AutoSyncApi {
     if (st.epoch !== epoch || st.hold?.block) throw new Error('请先确认介质并重新对账');
     const gate = this.gateFor(st, rt, epoch);
     await checkRoot(st.pair.targetRoot);
-    const ledger = new PairLedger(st.pair);
+    const ledger = this.makeLedger(st.pair);
     const source = entry.hash ? ledger.objectPath(entry.hash) : await recyclePath(st.pair, entry.id);
     const stat = await statMaybe(source);
     if (!stat?.isFile() || stat.size !== entry.size) throw new Error('回收项内容已不可用');
@@ -696,7 +722,7 @@ export class AutoSync implements AutoSyncApi {
     if (st.epoch !== epoch || st.hold?.block) throw new Error('请先确认介质并重新对账');
     const gate = this.gateFor(st, rt, epoch);
     await checkRoot(st.pair.targetRoot);
-    const ledger = new PairLedger(st.pair);
+    const ledger = this.makeLedger(st.pair);
     const dest = await safePath(st.pair.targetRoot, version.relPath);
     const live = await statMaybe(dest);
     // 内容来源：优先介质对象库；现存文件内容一致时也可用。
@@ -743,7 +769,7 @@ export class AutoSync implements AutoSyncApi {
 
   history = (pairId: string) => this.run(async () => {
     const st = this.mustFind(pairId);
-    const ledger = new PairLedger(st.pair);
+    const ledger = this.makeLedger(st.pair);
     try {
       const remote = await ledger.read();
       if (remote.commits.length || remote.versions.length) {
