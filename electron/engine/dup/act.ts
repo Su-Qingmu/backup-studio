@@ -221,8 +221,20 @@ async function moveFile(source: string, destination: string, overwrite = false):
  *
  * 记录原路径映射，随时可还原；只写本机。
  */
+/**
+ * 隔离区索引写入器。
+ *
+ * 默认走原子写入；测试可以注入一个**确定的**失败，用来验证
+ * 「文件已还原、索引更新失败」这条契约——不依赖 chmod、只读位或 ACL，
+ * 那三种权限模型在 POSIX / Windows / macOS 上互不等价。
+ */
+export type QuarantineIndexWriter = (filePath: string, data: unknown) => Promise<void>;
+
 export class QuarantineStore {
-  constructor(readonly directory: string) {}
+  constructor(
+    readonly directory: string,
+    private readonly writeIndex: QuarantineIndexWriter = writeJsonAtomic,
+  ) {}
 
   private get file(): string {
     return path.join(this.directory, 'index.json');
@@ -328,7 +340,7 @@ export class QuarantineStore {
   }
 
   private async write(items: QuarantineEntry[]): Promise<void> {
-    await writeJsonAtomic(this.file, { version: 1, updatedAt: Date.now(), items } satisfies QuarantineFile);
+    await this.writeIndex(this.file, { version: 1, updatedAt: Date.now(), items } satisfies QuarantineFile);
   }
 
   /**

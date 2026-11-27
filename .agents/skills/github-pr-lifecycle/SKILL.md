@@ -43,7 +43,13 @@ description: 在 Backup Studio 仓库完成 GitHub Pull Request 的完整生命�
 
 ### 0.2 工具调用路径
 
-本机**没有安装 `gh` CLI**，所有 GitHub 操作走 REST API。仓库内置了一个封装好的助手：
+GitHub 平台操作（PR 查询、Review、合并、CI 状态）**优先使用 `gh` CLI**；**仅当本机未安装 `gh` CLI 时**，回退到本 Skill 原有的 REST API 规则。
+
+- `gh` 位于 `C:\Program Files\GitHub CLI\gh.exe`（v2.105.0）；当前 PowerShell 会话 PATH 未刷新时用全路径调用。
+- `gh` 未登录：用 `git credential-manager get` 取 token（输入 `protocol=https\nhost=github.com\n`），经 `$env:GH_TOKEN` 与 `$env:GITHUB_TOKEN` 注入后调用 `gh`（现成封装见 `D:\My file\桌面\backup-studio-automation\ghx.ps1`，该目录已删除则按同模式自写）；**token 值不得打印到 stdout、日志或报告**。
+- 代码推送：新建 PR 用 `gh pr create`（会自动推送 head 分支）；向既有分支推送提交用 `git push`（代理写法见 [合并与门禁策略](./references/merge-policy.md)）。安全红线不变：不得向 `main` 直接推送、不得强制推送。
+
+本机未安装 `gh` CLI 时，回退到内置助手：
 
 ```powershell
 node .agents/skills/github-pr-lifecycle/scripts/gh-api.mjs get repos/Su-Qingmu/backup-studio/pulls/16 --fields state,merged,head.sha
@@ -373,7 +379,7 @@ CI 状态必须准确区分：`Success` / `Failure` / `Pending` / `Cancelled` / 
 7. 明确要求每次任务先检查远程仓库。
 8. 覆盖 CI 基线失败。
 9. 覆盖合并后验证。
-10. **不存在无法执行或依赖不存在工具的要求**（本机无 `gh` CLI，所有 GitHub 调用示例必须用 `scripts/gh-api.mjs` 或 REST API）。
+10. **不存在无法执行或依赖不存在工具的要求**（GitHub 调用示例：本机装有 `gh` CLI 时优先用 `gh`；未安装时必须用 `scripts/gh-api.mjs` 或 REST API）。
 11. 辅助文档被 `SKILL.md` 正确引用，链接路径真实可解析。
 
 **不要为了验证本 Skill 而擅自执行真实 PR 合并。** 可以做静态检查与模拟流程检查。

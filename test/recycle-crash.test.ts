@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 import type { RecycleBin } from '../shared/types';
+import { registerTempCleanup, trackTempDir } from './harness';
 
 // The service spawns copyWorker.js next to itself, so the crash tests must use
 // the Electron build (dist-electron), exactly like test/transaction-recovery.test.ts.
@@ -15,12 +16,14 @@ const { JournalStore } = require('../dist-electron/electron/engine/journal.js') 
 const { historyDir, readManifest } = require('../dist-electron/electron/engine/manifest.js') as typeof import('../electron/engine/manifest');
 const { initializeRecycle } = require('../dist-electron/electron/engine/recycle.js') as typeof import('../electron/engine/recycle');
 
+registerTempCleanup();
+
 const syncMode = 'mirror-archive' as const;
 const crashExitCode = 86;
 const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 
 async function fixture(t: TestContext) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'bs-recycle-crash-'));
+  const root = trackTempDir(await fs.mkdtemp(path.join(os.tmpdir(), 'bs-recycle-crash-')));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const source = path.join(root, 'source');
   const target = path.join(root, 'target');
