@@ -49,6 +49,23 @@ export function parseThemeConfig(raw: string): ThemeMode {
  *
  * 文件不存在（首次运行）或读取失败一律回退 'system'。
  */
+/**
+ * 读取主题偏好，路径在**读取动作内部**解析。
+ *
+ * 路径解析本身也可能失败：app.getPath('userData') 拿不到路径时会抛错
+ * （见 electron.d.ts）。抽取之前，整段逻辑（含路径解析）都包在 try 里，
+ * 任何失败一律按首次运行处理；把路径解析挪到调用方之后，这个保证就丢了
+ * —— 启动会在建窗之前中断。所以这里显式提供「由调用方提供路径解析函数」的
+ * 入口，把路径解析与文件读取一起兜住。
+ */
+export function resolveThemeMode(resolveFile: () => string): ThemeMode {
+  try {
+    return readThemeMode(resolveFile());
+  } catch {
+    return FALLBACK_THEME_MODE;
+  }
+}
+
 export function readThemeMode(file: string): ThemeMode {
   try {
     return parseThemeConfig(fs.readFileSync(file, 'utf8'));

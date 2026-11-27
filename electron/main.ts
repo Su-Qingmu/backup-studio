@@ -13,7 +13,7 @@ import type { AutoPairInput } from '../shared/aut-types';
 import type { DupActRequest, DupItemAction } from '../shared/dup-types';
 import type { BackupRevealState } from '../shared/reveal-types';
 import type { ThemeMode, ThemeState } from '../shared/theme-types';
-import { isThemeMode, readThemeMode, writeThemeMode } from './theme-store';
+import { isThemeMode, resolveThemeMode, writeThemeMode } from './theme-store';
 let mainWindow: BrowserWindow | null = null;
 let service: BackupService | null = null;
 let autoSync: AutoSync | null = null;
@@ -64,7 +64,7 @@ function themeConfigPath(): string {
  * （跟随系统）：一个坏配置文件不能让应用起不来。
  */
 function loadThemeMode(): ThemeMode {
-  return readThemeMode(themeConfigPath());
+  return resolveThemeMode(themeConfigPath);
 }
 
 /**

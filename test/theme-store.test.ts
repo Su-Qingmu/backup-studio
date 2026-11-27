@@ -7,6 +7,7 @@ import {
   isThemeMode,
   parseThemeConfig,
   readThemeMode,
+  resolveThemeMode,
   writeThemeMode,
 } from '../electron/theme-store';
 import type { ThemeMode } from '../shared/theme-types';
@@ -115,14 +116,30 @@ async function main() {
     assert.equal(readThemeMode(file), FALLBACK_THEME_MODE);
   });
 
-  await test('坏文件不会覆盖上一次的好偏好（读取失败不等于清空）', () => {
+  await test('路径解析本身失败也按首次运行处理，不得让启动中断', () => {
+    // app.getPath('userData') 拿不到路径时会抛错（见 electron.d.ts）。
+    // 抽取前这段逻辑整体包在 try 里；路径解析一旦挪到调用方，这个保证就没了，
+    // 启动会在建窗之前中断——所以这里显式锁住「解析失败也回退」。
+    assert.equal(
+      resolveThemeMode(() => {
+        throw new Error('userData 不可用');
+      }),
+      FALLBACK_THEME_MODE,
+    );
+  });
+
+  await test('路径解析正常但文件不存在时同样回退', () => {
+    const dir = tempDir();
+    assert.equal(resolveThemeMode(() => path.join(dir, 'theme.json')), FALLBACK_THEME_MODE);
+  });
+
+  await test('坏文件不会挡住下一次正常写入', () => {
     const dir = tempDir();
     const file = path.join(dir, 'theme.json');
     writeThemeMode(file, 'dark');
     fs.writeFileSync(file, 'not json at all', 'utf8');
-    // 坏文件按首次运行处理，但**不得**把偏好改写成 system：
-    // 这里断言的是「读不出来时保持保守」，而不是把用户选择悄悄换掉。
-    assert.equal(readThemeMode(file), FALLBACK_THEME_MODE);
+    writeThemeMode(file, 'light');
+    assert.equal(readThemeMode(file), 'light');
   });
 
   console.log(`\n${runner.summary()}`);
