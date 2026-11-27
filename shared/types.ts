@@ -217,6 +217,10 @@ export interface HealthReport {
   volumeHealthKnown?: boolean;
   /** 本次判定对应的介质身份指纹；换介质后旧结论不再适用 */
   mediaIdentity?: string | null;
+  /** 目标介质的基础事实：界面据此说明哪些证据不适用 */
+  target?: TargetFacts;
+  /** 平台无关的一句话摘要：查到了什么、没查到什么 */
+  summary?: string;
 }
 
 /**
@@ -368,6 +372,23 @@ export interface AppState {
  */
 export type RiskLevel = 'L0' | 'L1' | 'L2';
 
+/**
+ * 证据的适用性状态。
+ *
+ * 关键在于把四种情况分开说：
+ * - ok：查过，正常；
+ * - warning：查过，有发现；
+ * - error：查过，发现异常；
+ * - unavailable：本应适用，但权限或系统接口不可用；
+ * - not-applicable：对当前平台 / 文件系统 / 挂载类型压根不适用。
+ *
+ * 一律显示成「能力缺失」时，用户会把「应用无法检测」误读成「目标介质存在异常」。
+ */
+export type EvidenceStatus = 'ok' | 'warning' | 'error' | 'unavailable' | 'not-applicable';
+
+/** 证据作用域：界面按类别分组，平台无关的证据始终显示 */
+export type EvidenceScope = 'target' | 'index' | 'io' | 'volume' | 'filesystem' | 'device';
+
 /** 单条判定证据 */
 export interface EvidenceItem {
   /** 证据类别，如「介质身份」「IO 错误」「文件校验」 */
@@ -376,6 +397,26 @@ export interface EvidenceItem {
   detail: string;
   /** 证据采集时间 */
   at: number;
+  /** 适用性状态 */
+  status: EvidenceStatus;
+  /** 作用域 */
+  scope: EvidenceScope;
+}
+
+/** 目标介质的类别 */
+export type TargetKind = 'local-disk' | 'network' | 'fuse' | 'memory' | 'virtual' | 'unknown';
+
+/** 目标介质的基础事实：决定哪些诊断适用、哪些不适用 */
+export interface TargetFacts {
+  kind: TargetKind;
+  /** 文件系统名，如 ext4 / tmpfs / NTFS */
+  fileSystem: string | null;
+  /** 挂载点（Linux） */
+  mountPoint: string | null;
+  /** 挂载来源（Linux） */
+  source: string | null;
+  /** 挂载是否只读 */
+  readOnly: boolean | null;
 }
 
 /** 介质判定结果 */

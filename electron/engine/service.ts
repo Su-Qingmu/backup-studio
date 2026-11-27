@@ -1468,7 +1468,7 @@ export class BackupService extends EventEmitter {
     if (typeof targetRoot !== 'string' || !path.isAbsolute(targetRoot)) throw new Error('请选择本机目标目录');
     return this.diagnostic(async () => {
       const report = await this.inspectTarget(targetRoot);
-      const extra = { kind: '重新枚举', detail: '刷新应用检测；不重置控制器。若异常持续，请更换 USB 端口、线缆或主机后重试。', at: now() };
+      const extra = { kind: '重新枚举', detail: '刷新应用检测；不重置控制器。若异常持续，请更换 USB 端口、线缆或主机后重试。', at: now(), status: 'ok' as const, scope: 'target' as const };
       report.assessment.evidence.push(extra);
       if (this.state.targetRoot === targetRoot) {
         if (report.condition === 'verified' && report.assessment.level === 'L0') {

@@ -780,7 +780,7 @@ export function createMockApi(): BackupAPI {
     async health(root: string) {
       // 演示卷需人工检查：结论是「阻断」，许可必须与结论一致，
       // 否则界面会拿着放行许可显示一条「保持只读」的诊断。
-      const assessment = { level: 'L1' as const, confidence: 0.95, writable: false, at: Date.now(), suggestion: '演示卷需人工检查，必须保持只读。', condition: 'filesystem-repair' as const, targetRoot: root, evidence: [{ kind: '演示卷', detail: 'NTFS / Full Repair Needed / 脏位置位', at: Date.now() }] };
+      const assessment = { level: 'L1' as const, confidence: 0.95, writable: false, at: Date.now(), suggestion: '演示卷需人工检查，必须保持只读。', condition: 'filesystem-repair' as const, targetRoot: root, evidence: [{ kind: '演示卷', detail: 'NTFS / Full Repair Needed / 脏位置位', at: Date.now(), status: 'error' as const, scope: 'volume' as const }] };
       current = {
         ...current,
         assessment,
