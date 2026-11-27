@@ -74,6 +74,8 @@ interface PairRuntime {
   reportedCorruptionDetail?: LedgerCorruption[];
   /** 「无法确认」是否已经通知过：证据留着，但不必每轮重复刷屏。 */
   unverifiedNotified?: boolean;
+  /** 已排定的下一次请求的到期时刻：防止「更晚的定时器」顶掉「更早的请求」。 */
+  timerDue?: number;
 }
 
 const blank = (): Local => ({ version: 2, pairs: [] });
@@ -259,6 +261,7 @@ export class AutoSync implements AutoSyncApi {
     rt.closeWatcher = undefined;
     clearTimeout(rt.timer);
     rt.timer = undefined;
+    rt.timerDue = undefined;
   }
 
   private arm(st: PairState) {
@@ -270,10 +273,24 @@ export class AutoSync implements AutoSyncApi {
     this.schedule(st, st.queue.retryAt ? Math.max(0, st.queue.retryAt - Date.now()) : 0);
   }
 
+  /**
+   * 排定下一次请求。
+   *
+   * **不许用「更晚」的定时器顶掉「更早」的**：被顶掉的那次请求就没人接了，
+   * 这一轮同步会被推迟到下一个轮询周期（默认 30 秒）——
+   * 用户看到的却是「按了重新对账，界面一直显示待同步，什么也没发生」。
+   */
   private schedule(st: PairState, ms: number) {
     const rt = this.runtime(st.pair.id);
+    const due = Date.now() + ms;
+    if (rt.timerDue !== undefined && rt.timerDue <= due) return;
     clearTimeout(rt.timer);
-    rt.timer = setTimeout(() => this.request(st), ms);
+    rt.timerDue = due;
+    rt.timer = setTimeout(() => {
+      rt.timer = undefined;
+      rt.timerDue = undefined;
+      this.request(st);
+    }, ms);
   }
 
   /**
@@ -478,7 +495,17 @@ export class AutoSync implements AutoSyncApi {
     const generation = rt.generation;
     void this.run(async () => {
       rt.requested = false;
-      if (!st.pair.enabled || !this.active || st.hold || generation !== rt.generation) return;
+      if (!st.pair.enabled || !this.active || st.hold) return;
+      if (generation !== rt.generation) {
+        // 代际变了（期间重新武装过）：本轮作废。
+        //
+        // 但「这一轮该做的活」不能跟着作废：立即重排一轮。
+        // 不重排的话，这一轮的请求就此消失——队列里的脏标记永远挂着，
+        // 同步再也不发起，界面一直显示「待同步」，
+        // 直到下一个轮询周期（默认 30 秒）才重新动。
+        this.schedule(st, 0);
+        return;
+      }
       const q = st.queue;
       if (q.retryAt > Date.now()) { this.schedule(st, q.retryAt - Date.now()); return; }
       q.dirty = true;

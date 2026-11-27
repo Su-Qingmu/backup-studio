@@ -957,6 +957,33 @@ async function main() {
     }
     finally { await next.suspend(); }
   }));
+  await test('同步请求不得被丢：连续对账后待同步标记必须很快归零', async () => {
+    const base = trackTempDir(await fs.mkdtemp(path.resolve('test', '.aut-fixture-')));
+    const sourceRoot = path.join(base, 'source'), targetRoot = path.join(base, 'target'), local = path.join(base, 'local');
+    const d = decision();
+    const aut = new AutoSync(local, { canWrite: () => d });
+    try {
+      await fs.mkdir(sourceRoot); await fs.mkdir(targetRoot);
+      const id = await enable(aut, { sourceRoot, targetRoot, stableMs: 500 });
+      await idle(aut, id);
+      const before = pairOf(await aut.status(), id).lastSync ?? 0;
+      // 连续对账 + 连续写源端：写入会触发监听器发起的请求，
+      // 与对账发起的请求撞在一起时最容易出现「请求被吞掉」——
+      // 排队中的那一轮因为代际变了被作废，同时新请求又被丢弃，
+      // 这一轮的活就此消失：脏标记永远挂着，同步再也不发起。
+      for (let i = 0; i < 12; i++) {
+        await put(sourceRoot, 'f' + i + '.txt', String(i));
+        await aut.resume(id);
+      }
+      // 待同步标记必须很快归零：轮询周期是 30 秒，
+      // 被吞掉的请求要等满一个周期才有人接——那正是「按了重新对账却没反应」。
+      await until(aut, s => {
+        const p = pairOf(s, id);
+        return p.state === 'idle' && p.pending === 0 && (p.lastSync ?? 0) > before;
+      });
+    } finally { await aut.suspend(); await fs.rm(base, { recursive: true }); }
+  });
+
   await test('对账新增、修改、排除与默认保留删除', () => fixture({}, async (aut, input) => {
     await put(input.sourceRoot, 'file', 'new'); await put(input.sourceRoot, 'ignore.tmp', 'skip');
     const id = await enable(aut, input); await idle(aut, id); assert.equal(await get(input.targetRoot, 'file'), 'new');
