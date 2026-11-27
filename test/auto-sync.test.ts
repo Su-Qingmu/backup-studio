@@ -1302,8 +1302,6 @@ async function main() {
     let watcherRequestFinished = false;
     let removeFinished = false;
     let scheduledAfterRemove = false;
-    let finishWatcherRequest!: () => void;
-    const watcherFinished = new Promise<void>(resolve => { finishWatcherRequest = resolve; });
     const blocked = new Promise<void>(resolve => { releaseBlock = resolve; });
     const enteredBlock = new Promise<void>(resolve => { enterBlock = resolve; });
     const permit: WritePermit = {
@@ -1317,7 +1315,6 @@ async function main() {
       onRequestFinished: () => {
         if (watcherRequestQueued && !watcherRequestFinished) {
           watcherRequestFinished = true;
-          finishWatcherRequest();
         }
       },
       onSchedule: (_ms) => { if (removeFinished) scheduledAfterRemove = true; },
@@ -1343,7 +1340,7 @@ async function main() {
       releaseBlock();
       await Promise.all([resumeBeforeRemove, remove]);
       removeFinished = true;
-      await watcherFinished;
+      await waitUntil(async () => watcherRequestFinished, '解绑后的旧请求已完成', 12_000);
 
       assert.equal((await aut.status()).pairs.length, 0, '配对应已解除');
       assert.equal(scheduledAfterRemove, false, '解除配对后的旧请求不得重排');

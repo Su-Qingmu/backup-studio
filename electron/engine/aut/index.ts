@@ -289,7 +289,7 @@ export class AutoSync implements AutoSyncApi {
   private schedule(st: PairState, ms: number) {
     // 旧代际回调可能在 removePair 后才出队；不得重建已解除配对的 runtime。
     if (!this.isRegistered(st)) return;
-    try { this.options.onSchedule?.(ms); } catch { /* 测试接缝不得改变调度行为 */ }
+    this.notifyScheduleHook(ms);
     const rt = this.runtime(st.pair.id);
     const due = Date.now() + ms;
     if (rt.timerDue !== undefined && rt.timerDue <= due) return;
@@ -307,6 +307,22 @@ export class AutoSync implements AutoSyncApi {
    * 只有基线中存在、之后消失的条目才算受管删除；
    * 软件未运行期间发生的删除不在基线里，按未受管处理（备份端保留）。
    */
+  /** 调用测试 hook 时同步/异步异常均不得影响生产调度路径。 */
+  private notifyTestHook(hook: (() => void | Promise<void>) | undefined): void {
+    try {
+      const result = hook?.();
+      if (result) void Promise.resolve(result).catch(() => undefined);
+    } catch { /* 测试接缝不得改变生产行为 */ }
+  }
+
+  /** 调用排程 hook；拒绝结果被消费，不泄漏未处理 rejection。 */
+  private notifyScheduleHook(ms: number): void {
+    try {
+      const result = this.options.onSchedule?.(ms);
+      if (result) void Promise.resolve(result).catch(() => undefined);
+    } catch { /* 测试接缝不得改变生产行为 */ }
+  }
+
   private async captureBaseline(st: PairState, rt: PairRuntime, replace = true): Promise<void> {
     try {
       const exclude = exclusion(st.pair);
@@ -582,10 +598,8 @@ export class AutoSync implements AutoSyncApi {
       st.hold = { reason: '本机状态无法持久化，已停止写入', error: true };
       this.stopIO(st);
     });
-    try { this.options.onRequestQueued?.(); } catch { /* 测试接缝不得改变队列 */ }
-    void queued.finally(() => {
-      try { this.options.onRequestFinished?.(); } catch { /* 测试接缝不得改变队列 */ }
-    });
+    this.notifyTestHook(this.options.onRequestQueued);
+    void queued.finally(() => this.notifyTestHook(this.options.onRequestFinished));
   }
 
   private async pairStatus(st: PairState): Promise<AutoPairStatus> {
