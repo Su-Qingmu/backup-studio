@@ -806,6 +806,24 @@ async function main() {
     assert.equal(await ledger.verifyRecovered([corruption]), 'unverified', '目标路径对不上时不得说「已恢复」');
   }));
 
+  await test('历史账本：没有可比对的证据时不得说「已恢复」', () => fixture({}, async (_aut, input) => {
+    const pair = makePair(input);
+    const ledger = new PairLedger(pair);
+    await fs.mkdir(ledger.root, { recursive: true });
+    await ledger.writeMeta(noop);
+    // 坏文件里一条完好记录都没有：没有任何可比对的连续性证据
+    await fs.writeFile(ledger.versionsFile, '{只有坏行}\n', 'utf8');
+    const snap = await ledger.read();
+    assert.equal(snap.corruption.length, 1, '必须如实报告损坏');
+    assert.equal(snap.corruption[0].intact.length, 0, '文件里没有读到任何完好记录');
+
+    // 用户把坏行删了，文件空了
+    await fs.writeFile(ledger.versionsFile, '', 'utf8');
+    assert.equal(await ledger.verifyRecovered([snap.corruption[0]]), 'unverified', '没有连续性证据时不得说「已恢复」');
+    // 连「先前坏的是哪几处」都不知道时，同样不得说「已恢复」
+    assert.equal(await ledger.verifyRecovered([]), 'unverified', '没有任何证据时不得说「已恢复」');
+  }));
+
   await test('历史账本：无法确认时证据必须留着，下一轮能确认了仍要说「已恢复」', async () => {
     const base = trackTempDir(await fs.mkdtemp(path.resolve('test', '.aut-fixture-')));
     const sourceRoot = path.join(base, 'source'), targetRoot = path.join(base, 'target'), local = path.join(base, 'local');
