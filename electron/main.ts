@@ -1,6 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
-import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { BackupService, type StartOptions } from './engine/service';
@@ -13,7 +12,8 @@ import type { AppState, SyncMode } from '../shared/types';
 import type { AutoPairInput } from '../shared/aut-types';
 import type { DupActRequest, DupItemAction } from '../shared/dup-types';
 import type { BackupRevealState } from '../shared/reveal-types';
-import type { ThemeConfig, ThemeMode, ThemeState } from '../shared/theme-types';
+import type { ThemeMode, ThemeState } from '../shared/theme-types';
+import { isThemeMode, readThemeMode, writeThemeMode } from './theme-store';
 let mainWindow: BrowserWindow | null = null;
 let service: BackupService | null = null;
 let autoSync: AutoSync | null = null;
@@ -56,43 +56,26 @@ function themeConfigPath(): string {
   return path.join(app.getPath('userData'), 'theme.json');
 }
 
-/** 只接受白名单内的三个字面量，防止配置文件被改坏后把 themeSource 设成怪值。 */
-function isThemeMode(value: unknown): value is ThemeMode {
-  return value === 'light' || value === 'dark' || value === 'system';
-}
-
 /**
  * 读取持久化的主题偏好。
  *
- * 文件缺失（首次运行）或任何读取/解析失败一律回退 'system'（跟随系统）：
- * 一个坏配置文件不能让应用起不来，也不该改变明暗之外的任何行为。
+ * 白名单校验、损坏回退都在 theme-store 里（那里是纯 Node 逻辑，可直接跑测试）；
+ * 这里只负责把 userData 下的路径喂给它。文件缺失或内容损坏一律回退 'system'
+ * （跟随系统）：一个坏配置文件不能让应用起不来。
  */
 function loadThemeMode(): ThemeMode {
-  try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(themeConfigPath(), 'utf8'));
-    if (parsed && typeof parsed === 'object') {
-      const mode = (parsed as Partial<ThemeConfig>).mode;
-      if (isThemeMode(mode)) return mode;
-    }
-  } catch {
-    // 文件不存在或内容损坏：按首次运行处理
-  }
-  return 'system';
+  return readThemeMode(themeConfigPath());
 }
 
 /**
  * 写入主题偏好。
  *
- * 先写临时文件再 rename：进程在写配置文件时崩溃，不会留下半截 JSON 把
- * 下次启动的偏好读坏。写失败只意味着「这次选择留不到下次启动」——本次
- * 界面已经生效，不抛异常、不影响主题切换本身。
+ * 写失败只意味着「这次选择留不到下次启动」——本次界面已经生效，
+ * 因此吞掉异常，不影响主题切换本身。
  */
 function saveThemeMode(mode: ThemeMode): void {
   try {
-    const file = themeConfigPath();
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(`${file}.tmp`, JSON.stringify({ mode }), 'utf8');
-    fs.renameSync(`${file}.tmp`, file);
+    writeThemeMode(themeConfigPath(), mode);
   } catch {
     // 持久化失败不应影响主题切换本身
   }
