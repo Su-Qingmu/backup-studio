@@ -8,30 +8,32 @@ import { buildPlan } from '../electron/engine/planner';
 import { readManifest, writeManifest } from '../electron/engine/manifest';
 import { CopyPool } from '../electron/engine/pool';
 import { BackupService } from '../electron/engine/service';
-import { startWithPermit } from './permit-helper';
 import { assessMedia, identifyMedia, probeMedia, sameMedia } from '../electron/engine/media';
 import { JournalStore, crc32, partFileName } from '../electron/engine/journal';
+import { CASE_INSENSITIVE_PATHS } from '../electron/engine/path-identity';
+import { createRunner, registerTempCleanup, trackTempDir } from './harness';
+import { startWithPermit } from './permit-helper';
+import { capabilityMismatch, probeTempFsCapability } from './fs-capability';
 import type { MediaIdentity, SyncMode } from '../shared/types';
 
 const WORKER_PATH = path.join(process.cwd(), 'dist-electron', 'electron', 'engine', 'copyWorker.js');
 
-let passed = 0;
-let failed = 0;
+const runner = createRunner({ label: '结果' });
 
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
-  try {
-    await fn();
-    passed += 1;
-    console.log(`  PASS  ${name}`);
-  } catch (err) {
-    failed += 1;
-    console.log(`  FAIL  ${name}`);
-    console.log(`        ${err instanceof Error ? err.message : String(err)}`);
-  }
+  await runner.test(name, fn);
 }
 
+/** 跳过必须单独计数：当前平台跑不了的用例不算通过 */
+function skip(name: string, reason: string): void {
+  runner.skip(name, reason);
+}
+
+registerTempCleanup();
+
 async function makeTemp(prefix: string): Promise<string> {
-  return fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  // 登记到统一清理表：测试跑完（哪怕失败）不留临时目录
+  return trackTempDir(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
 }
 
 let bigSourceCache: string | null = null;
@@ -892,7 +894,7 @@ async function main(): Promise<void> {
     // 隔离未撤销时禁止写入
     await assert.rejects(
       () =>
-        service.start({
+        startWithPermit(service, {
           sourceRoot: source,
           targetRoot: target,
           syncMode: 'mirror',
@@ -941,7 +943,7 @@ async function main(): Promise<void> {
     // 中断记录存在时，start 应拒绝沿用旧计划
     await assert.rejects(
       () =>
-        service.start({
+        startWithPermit(service, {
           sourceRoot: source,
           targetRoot: target,
           syncMode: 'mirror',
@@ -986,7 +988,10 @@ async function main(): Promise<void> {
 
   await test('FR-06：真实样本回放，卷告警与脏位优先，SMART 不伪造', async () => {
     // 只向假执行器传递盘符，真实文件系统只访问测试目录。
-    if (process.platform !== 'win32') return;
+    if (process.platform !== 'win32') {
+      skip('FR-06：真实样本回放，卷告警与脏位优先，SMART 不伪造', '卷级采样回放依赖 Windows 的磁盘诊断接口');
+      return;
+    }
     const result = await dirtySample(await makeTemp('bs-health-'));
     assert.equal(result.assessment.level, 'L1');
     assert.equal(result.assessment.writable, false);
@@ -1275,33 +1280,343 @@ async function main(): Promise<void> {
     );
   });
 
-  if (process.platform === 'win32') {
-    await test('Windows 大小写变更：并发拷贝与大量删除不误删仅大小写变化的源端文件', async () => {
-      const source = await makeTemp('bs-case-src-');
-      const target = await makeTemp('bs-case-dst-');
-      const userData = await makeTemp('bs-case-ud-');
-      await writeFile(source, 'zzz_target.txt', 'MUST-SURVIVE');
-      await writeFile(target, 'ZZZ_TARGET.txt', 'old-small');
-      for (let i = 0; i < 60; i += 1) {
-        await writeFile(target, `aaa_del_${String(i).padStart(2, '0')}.txt`, 'x');
-      }
+  await test('可靠性：预览之后出现的同名文件不被覆盖，任务报失败并要求重扫', async () => {
+    const source = await makeTemp('bs-stale-src-');
+    const target = await makeTemp('bs-stale-dst-');
+    const userData = await makeTemp('bs-stale-ud-');
+    await writeFile(source, 'report.txt', 'source-content');
 
-      const service = new BackupService(userData);
-      await service.plan(source, target, 'mirror');
+    const service = new BackupService(userData);
+    const plan = await service.plan(source, target, 'copy');
+    assert.equal(plan.summary.copy, 1, '预览应显示新增 1');
+    assert.equal(plan.summary.update, 0, '预览应显示更新 0');
+    assert.equal(plan.summary.delete, 0, '预览应显示删除 0');
+    assert.equal(plan.requiresConfirmation, false, '没有删除就不需要二次确认');
+
+    // 预览之后、开始之前，用户把另一份同名文件放进目标目录，且仅此一份。
+    await writeFile(target, 'report.txt', 'only-copy');
+
+    await startWithPermit(service, {
+      sourceRoot: source,
+      targetRoot: target,
+      syncMode: 'copy',
+      allowMassDelete: true,
+      resume: true,
+    });
+
+    // 目标被占用：那份文件的原字节必须原样保留，不得被覆盖。
+    assert.equal(await fs.readFile(path.join(target, 'report.txt'), 'utf8'), 'only-copy',
+      '预览之后出现的同名文件不得被覆盖');
+    // 任务不得报完成，也不得被当成取消或中断蒙混过去。
+    assert.equal(service.getState().phase, 'failed', '发生冲突时必须报失败');
+    // 必须如实报告计划已过期并要求重扫。
+    const logs = service.getState().logs.map((entry) => entry.text).join('\n');
+    assert.match(logs, /计划已过期/, '必须报告计划已过期');
+    assert.match(logs, /重新扫描/, '必须要求重新扫描');
+  });
+
+  await test('可靠性：目标保持为空时新增照常完成', async () => {
+    const source = await makeTemp('bs-add-src-');
+    const target = await makeTemp('bs-add-dst-');
+    const userData = await makeTemp('bs-add-ud-');
+    await writeFile(source, 'report.txt', 'source-content');
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'copy');
+    await startWithPermit(service, {
+      sourceRoot: source,
+      targetRoot: target,
+      syncMode: 'copy',
+      allowMassDelete: true,
+      resume: true,
+    });
+    assert.equal(service.getState().phase, 'completed');
+    assert.equal(await fs.readFile(path.join(target, 'report.txt'), 'utf8'), 'source-content',
+      '目标保持为空时新增照常完成');
+  });
+
+/**
+ * 让「降级复制在写入途中被中断」这件事在**两套实现**上都能复现。
+ *
+ * 降级提交有两代实现：旧的走 fs.copyFile（内核拷贝，不经 JS 的 fs.open），
+ * 新的走 fs.open('wx') + 句柄写入。注入点如果只认其中一种写法，同一条断言
+ * 在另一套实现上就根本没被触发——那样的「负向对照失败」证明不了任何事。
+ * 这里两种写法都挂上同一个钩子。
+ *
+ * 返回还原函数。
+ */
+function patchDegradedInterrupt(destPath: string, sourcePath: string): () => void {
+  const originalCopy = fs.copyFile;
+  const originalOpen = fs.open;
+  const originalReadFile = fs.readFile;
+  const patched = fs as unknown as { copyFile: typeof fs.copyFile; open: typeof fs.open };
+  // 旧实现：只写一半内容就报错。
+  patched.copyFile = (async (from, to, flags) => {
+    if (String(to) !== destPath) return originalCopy(from, to, flags);
+    const data = await originalReadFile(String(from));
+    await fs.writeFile(String(to), data.subarray(0, Math.floor(data.length / 2)));
+    throw Object.assign(new Error('simulated write interruption'), { code: 'ENOSPC' });
+  }) as typeof fs.copyFile;
+  // 新实现：第一块写完后报错。
+  patched.open = (async (file, flags, mode) => {
+    const handle = await originalOpen(file, flags, mode);
+    if (String(file) === destPath && typeof flags === 'string' && flags.includes('wx')) {
+      const originalWrite = handle.write.bind(handle) as (
+        buffer: Buffer, offset: number, length: number, position: number,
+      ) => Promise<{ bytesWritten: number }>;
+      let chunks = 0;
+      (handle as unknown as {
+        write: (buffer: Buffer, offset: number, length: number, position: number) => Promise<{ bytesWritten: number }>;
+      }).write = async (buffer: Buffer, offset: number, length: number, position: number) => {
+        chunks += 1;
+        if (chunks > 1) {
+          throw Object.assign(new Error('simulated write interruption'), { code: 'ENOSPC' });
+        }
+        return originalWrite(buffer, offset, length, position);
+      };
+    }
+    return handle;
+  }) as typeof fs.open;
+  void sourcePath;
+  return () => { patched.copyFile = originalCopy; patched.open = originalOpen; };
+}
+
+/**
+ * 让「目标在写入途中被外部替换」这件事在**两套实现**上都能复现。
+ *
+ * 旧实现：copyFile 写完后立刻被替换，引擎随后按路径打开目标——打开到的
+ * 已经是那份外来文件，于是「内容对不上 → 按 dev/ino 判断是自己的 → 删掉」。
+ * 新实现：句柄写入第一批数据后目标被替换，句柄仍绑定我们创建的实体。
+ */
+function patchDegradedReplacement(destPath: string, foreignContent: string): () => void {
+  const originalCopy = fs.copyFile;
+  const originalOpen = fs.open;
+  const originalUnlink = fs.unlink;
+  const originalWriteFile = fs.writeFile;
+  const patched = fs as unknown as { copyFile: typeof fs.copyFile; open: typeof fs.open };
+  const replace = async () => {
+    await originalUnlink(destPath).catch(() => undefined);
+    await originalWriteFile(destPath, foreignContent, 'utf8');
+  };
+  patched.copyFile = (async (from, to, flags) => {
+    const result = await originalCopy(from, to, flags);
+    if (String(to) === destPath) await replace();
+    return result;
+  }) as typeof fs.copyFile;
+  patched.open = (async (file, flags, mode) => {
+    const handle = await originalOpen(file, flags, mode);
+    if (String(file) === destPath && typeof flags === 'string' && flags.includes('wx')) {
+      const originalWrite = handle.write.bind(handle) as (
+        buffer: Buffer, offset: number, length: number, position: number,
+      ) => Promise<{ bytesWritten: number }>;
+      let replaced = false;
+      (handle as unknown as {
+        write: (buffer: Buffer, offset: number, length: number, position: number) => Promise<{ bytesWritten: number }>;
+      }).write = async (buffer: Buffer, offset: number, length: number, position: number) => {
+        const result = await originalWrite(buffer, offset, length, position);
+        if (!replaced) { replaced = true; await replace(); }
+        return result;
+      };
+    }
+    return handle;
+  }) as typeof fs.open;
+  return () => { patched.copyFile = originalCopy; patched.open = originalOpen; };
+}
+
+  await test('可靠性：降级复制中途中断不得在目标留下半截文件', async () => {
+    const source = await makeTemp('bs-degrade-int-src-');
+    const target = await makeTemp('bs-degrade-int-dst-');
+    const userData = await makeTemp('bs-degrade-int-ud-');
+    // 大于一次写入的块（1 MB），保证写到一半被打断时确有内容落在目标上。
+    await writeFile(source, 'payload.bin', 'P'.repeat(3 * 1024 * 1024));
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'copy');
+
+    const destPath = path.join(target, 'payload.bin');
+    const originalLink = fs.link;
+    const patched = fs as unknown as { link: typeof fs.link };
+    // 模拟 exFAT / FAT32：硬链接不可用，提交走降级分支。
+    patched.link = (async () => {
+      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    }) as typeof fs.link;
+    // 模拟降级复制写到一半被中断（介质空间耗尽）。
+    const restore = patchDegradedInterrupt(destPath, path.join(source, 'payload.bin'));
+
+    try {
       await startWithPermit(service, {
         sourceRoot: source,
         targetRoot: target,
-        syncMode: 'mirror',
+        syncMode: 'copy',
         allowMassDelete: true,
         resume: true,
       });
-      assert.equal(service.getState().phase, 'completed');
-      assert.equal(await fs.readFile(path.join(target, 'zzz_target.txt'), 'utf8'), 'MUST-SURVIVE');
-    });
-  }
+    } finally {
+      restore();
+      patched.link = originalLink;
+    }
 
-  console.log(`\n结果：${passed} 通过 / ${failed} 失败\n`);
-  if (failed > 0) process.exitCode = 1;
+    assert.equal(service.getState().phase, 'failed', '降级复制中断后任务不得报完成');
+    assert.equal(await exists(target, 'payload.bin'), false,
+      '复制中断后不得在目标路径留下半截文件：那会被下一次规划当成已存在的目标，备份从此卡住');
+  });
+
+  await test('可靠性：降级复制期间目标被并发替换时不得删除替换进来的文件', async () => {
+    const source = await makeTemp('bs-degrade-repl-src-');
+    const target = await makeTemp('bs-degrade-repl-dst-');
+    const userData = await makeTemp('bs-degrade-repl-ud-');
+    await writeFile(source, 'payload.bin', 'P'.repeat(3 * 1024 * 1024));
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'copy');
+
+    const destPath = path.join(target, 'payload.bin');
+    const originalLink = fs.link;
+    const patched = fs as unknown as { link: typeof fs.link };
+    patched.link = (async () => {
+      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    }) as typeof fs.link;
+    // 在降级写入刚落下数据后，外部把目标路径换成另一个文件：
+    // 那是用户自己的内容，备份既不得覆盖它，也不得把它当成自己的删掉。
+    const restore = patchDegradedReplacement(destPath, 'FOREIGN-CONTENT');
+
+    try {
+      await startWithPermit(service, {
+        sourceRoot: source,
+        targetRoot: target,
+        syncMode: 'copy',
+        allowMassDelete: true,
+        resume: true,
+      });
+    } finally {
+      restore();
+      patched.link = originalLink;
+    }
+
+    assert.equal(await fs.readFile(destPath, 'utf8'), 'FOREIGN-CONTENT',
+      '并发替换进来的文件是用户的内容：不得被覆盖，也不得被当成自己的删掉');
+    assert.equal(service.getState().phase, 'failed',
+      '目标被并发替换后这次提交并不成立，任务不得报完成');
+  });
+
+  await test('可靠性：降级复制期间目标目录被替换时不得写进替换后的路径', async () => {
+    const source = await makeTemp('bs-degrade-dir-src-');
+    const target = await makeTemp('bs-degrade-dir-dst-');
+    const userData = await makeTemp('bs-degrade-dir-ud-');
+    await writeFile(source, 'sub/payload.bin', 'P'.repeat(1024));
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'copy');
+
+    const destDir = path.join(target, 'sub');
+    const destPath = path.join(destDir, 'payload.bin');
+    const originalLink = fs.link;
+    const originalOpen = fs.open;
+    const originalRm = fs.rm;
+    const originalWriteFile = fs.writeFile;
+    const patched = fs as unknown as { link: typeof fs.link; open: typeof fs.open };
+    patched.link = (async () => {
+      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    }) as typeof fs.link;
+    // 目标目录在提交前被换成一个普通文件：备份必须发现写不进去并如实报失败，
+    // 而不是把这个「目录」当成可写目标、把数据落到别处。
+    patched.open = (async (file: any, flags: any, mode?: any) => {
+      if (String(file) === destPath) {
+        await originalRm(destDir, { recursive: true, force: true });
+        await originalWriteFile(destDir, 'NOT-A-DIRECTORY', 'utf8');
+      }
+      return originalOpen(file, flags, mode);
+    }) as typeof fs.open;
+
+    try {
+      await startWithPermit(service, {
+        sourceRoot: source,
+        targetRoot: target,
+        syncMode: 'copy',
+        allowMassDelete: true,
+        resume: true,
+      });
+    } finally {
+      patched.link = originalLink;
+      patched.open = originalOpen;
+    }
+
+    assert.equal(service.getState().phase, 'failed', '目标目录被替换后任务不得报完成');
+    assert.equal(await fs.readFile(destDir, 'utf8'), 'NOT-A-DIRECTORY',
+      '被替换掉的目标目录不得被写坏');
+  });
+
+  await test('可靠性：介质不支持硬链接时仍不覆盖预览之后出现的同名文件', async () => {
+    const source = await makeTemp('bs-stale2-src-');
+    const target = await makeTemp('bs-stale2-dst-');
+    const userData = await makeTemp('bs-stale2-ud-');
+    await writeFile(source, 'report.txt', 'source-content');
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'copy');
+    await writeFile(target, 'report.txt', 'only-copy');
+
+    // 模拟 exFAT / FAT32：硬链接不可用，提交要走独占复制分支。
+    const originalLink = fs.link;
+    const patched = fs as unknown as { link: typeof fs.link };
+    patched.link = (async () => {
+      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    }) as typeof fs.link;
+    try {
+      await startWithPermit(service, {
+        sourceRoot: source,
+        targetRoot: target,
+        syncMode: 'copy',
+        allowMassDelete: true,
+        resume: true,
+      });
+    } finally {
+      patched.link = originalLink;
+    }
+
+    assert.equal(await fs.readFile(path.join(target, 'report.txt'), 'utf8'), 'only-copy',
+      '降级到独占复制时也不得覆盖');
+    assert.equal(service.getState().phase, 'failed', '降级分支同样必须报失败');
+  });
+
+  await test('大小写变更：并发拷贝与大量删除不误删仅大小写变化的源端文件', async () => {
+    // 该用例依赖「文件系统不区分大小写」这一实际能力：按探测结果决定跑还是跳过，
+    // 不按 process.platform 猜——Linux 挂 NTFS/exFAT 时同样可能不区分大小写。
+    // 探测放在用例内部：探测失败必须让用例失败，不能绕过汇总。
+    const capability = await probeTempFsCapability('bs-fs-probe-');
+    if (!capability.caseInsensitive) {
+      skip('大小写变更：并发拷贝与大量删除不误删仅大小写变化的源端文件', '当前文件系统区分大小写，无法构造「仅大小写不同」的同名场景');
+      return;
+    }
+    const mismatch = capabilityMismatch(capability, CASE_INSENSITIVE_PATHS);
+    if (mismatch) {
+      skip('大小写变更：并发拷贝与大量删除不误删仅大小写变化的源端文件', mismatch);
+      return;
+    }
+    const source = await makeTemp('bs-case-src-');
+    const target = await makeTemp('bs-case-dst-');
+    const userData = await makeTemp('bs-case-ud-');
+    await writeFile(source, 'zzz_target.txt', 'MUST-SURVIVE');
+    await writeFile(target, 'ZZZ_TARGET.txt', 'old-small');
+    for (let i = 0; i < 60; i += 1) {
+      await writeFile(target, `aaa_del_${String(i).padStart(2, '0')}.txt`, 'x');
+    }
+
+    const service = new BackupService(userData);
+    await service.plan(source, target, 'mirror');
+    await startWithPermit(service, {
+      sourceRoot: source,
+      targetRoot: target,
+      syncMode: 'mirror',
+      allowMassDelete: true,
+      resume: true,
+    });
+    assert.equal(service.getState().phase, 'completed');
+    assert.equal(await fs.readFile(path.join(target, 'zzz_target.txt'), 'utf8'), 'MUST-SURVIVE');
+  });
+
+  console.log(`\n${runner.summary()}\n`);
+  if (runner.failed > 0) process.exitCode = 1;
 }
 
 void main();

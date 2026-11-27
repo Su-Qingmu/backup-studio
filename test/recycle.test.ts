@@ -11,25 +11,24 @@ import { CASE_INSENSITIVE_PATHS } from '../electron/engine/path-identity';
 import { readManifest } from '../electron/engine/manifest';
 import { scanTree } from '../electron/engine/scan';
 import { buildPlan } from '../electron/engine/planner';
+import { createRunner, registerTempCleanup, trackTempDir } from './harness';
 import type { SyncMode } from '../shared/types';
 
-let passed = 0;
-let failed = 0;
+const runner = createRunner({ label: '结果' });
 
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
-  try {
-    await fn();
-    passed += 1;
-    console.log(`  PASS  ${name}`);
-  } catch (err) {
-    failed += 1;
-    console.log(`  FAIL  ${name}`);
-    console.log(`        ${err instanceof Error ? err.message : String(err)}`);
-  }
+  await runner.test(name, fn);
 }
 
+/** 跳过必须单独计数：当前平台跑不了的用例不算通过 */
+function skip(name: string, reason: string): void {
+  runner.skip(name, reason);
+}
+
+registerTempCleanup();
+
 async function makeTemp(prefix: string): Promise<string> {
-  return fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  return trackTempDir(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
 }
 
 async function writeFile(root: string, rel: string, content: string): Promise<void> {
@@ -540,8 +539,9 @@ async function main(): Promise<void> {
     try {
       await fs.link(first, second);
     } catch (err) {
-      if (['EPERM', 'EACCES', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP'].includes((err as NodeJS.ErrnoException).code ?? '')) {
-        console.log('        SKIP: 当前文件系统不支持创建硬链接');
+      if (['ENOSYS', 'ENOTSUP', 'EOPNOTSUPP'].includes((err as NodeJS.ErrnoException).code ?? '')) {
+        // 只有「文件系统不支持」才算不适用；权限类错误说明是此处被拒绝，不能当成不支持
+        skip('回收站：硬链接副本按同一物理实体计一次占用', '当前文件系统不支持创建硬链接');
         return;
       }
       throw err;
@@ -658,8 +658,8 @@ async function main(): Promise<void> {
     assert.equal(ledger.entries.find((e) => e.txId === 'tx-other')?.contentState, 'verified');
   });
 
-  console.log(`\n结果：${passed} 通过 / ${failed} 失败\n`);
-  if (failed > 0) process.exitCode = 1;
+  console.log(`\n${runner.summary()}\n`);
+  if (runner.failed > 0) process.exitCode = 1;
 }
 
 void main();

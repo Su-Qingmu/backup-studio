@@ -7,21 +7,20 @@ import { createWritePermit } from '../electron/engine/aut/bridge';
 import type { WriteDecision } from '../electron/engine/aut/permit';
 import type { AutoPair } from '../shared/aut-types';
 import type { HealthReport, WriteGate } from '../shared/types';
+import { createRunner, registerTempCleanup, trackTempDir } from './harness';
 
-let passed = 0;
-let failed = 0;
+const runner = createRunner({ label: '结果' });
 
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
-  try {
-    await fn();
-    passed += 1;
-    console.log(`  PASS  ${name}`);
-  } catch (err) {
-    failed += 1;
-    console.log(`  FAIL  ${name}`);
-    console.log(`        ${err instanceof Error ? err.message : String(err)}`);
-  }
+  await runner.test(name, fn);
 }
+
+/** 跳过必须单独计数：当前平台跑不了的用例不算通过 */
+function skip(name: string, reason: string): void {
+  runner.skip(name, reason);
+}
+
+registerTempCleanup();
 
 const pair = (targetRoot: string): AutoPair => ({
   id: 'gate-test',
@@ -67,7 +66,7 @@ const healthyGate = (): WriteGate => ({
 });
 
 async function main() {
-  const service = new BackupService(await fs.mkdtemp(path.join(os.tmpdir(), 'bs-gate-')));
+  const service = new BackupService(trackTempDir(await fs.mkdtemp(path.join(os.tmpdir(), 'bs-gate-'))));
 
   await test('写入闸门：目标不可达时禁止写入', async () => {
     const gate = await service.writeGate(path.join(os.tmpdir(), 'bs-not-exists-' + Date.now()));
@@ -79,7 +78,7 @@ async function main() {
   });
 
   await test('写入闸门：可达目标按卷级事实决定是否放行', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bs-gate-ok-'));
+    const dir = trackTempDir(await fs.mkdtemp(path.join(os.tmpdir(), 'bs-gate-ok-')));
     try {
       const gate = await service.writeGate(dir);
       assert.equal(gate.reachable, true);
@@ -103,12 +102,16 @@ async function main() {
     // 真机取证回放：拔盘演练后的 U 盘处于「Full Repair Needed + 脏位」状态。
     // 该盘可能已被修复或拔下，因此按实际探测结果断言，不做硬编码。
     const removable = process.platform === 'win32' ? 'E:\\' : '';
-    if (!removable) return;
+    if (!removable) {
+      skip('写入闸门：卷需人工检查时禁止写入并标记 repair-required', '真机卷取证回放只在 Windows 上进行');
+      return;
+    }
     let gate: WriteGate;
     try {
       gate = await service.writeGate(removable);
-    } catch {
-      return;
+    } catch (err) {
+      // 取证异常不是「环境不适用」：实现无条件抛错时这条用例必须失败
+      assert.fail(`写入闸门取证回放不应抛错：${(err as Error).message}`);
     }
     if (gate.volumeHealth === 'repair-required') {
       assert.equal(gate.allowed, false, '卷需修复时必须禁止写入');
@@ -128,7 +131,7 @@ async function main() {
   });
 
   await test('写入闸门：隔离观察时禁止写入', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bs-gate-quar-'));
+    const dir = trackTempDir(await fs.mkdtemp(path.join(os.tmpdir(), 'bs-gate-quar-')));
     try {
       await service.quarantine(dir, '测试隔离');
       const gate = await service.writeGate(dir);
@@ -199,8 +202,8 @@ async function main() {
     assert.ok(actual.evidence.length > 0, '拒写原因必须附证据');
   });
 
-  console.log(`\n结果：${passed} 通过 / ${failed} 失败`);
-  process.exit(failed === 0 ? 0 : 1);
+  console.log(`\n${runner.summary()}`);
+  process.exit(runner.failed === 0 ? 0 : 1);
 }
 
 void main();
