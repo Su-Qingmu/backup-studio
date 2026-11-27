@@ -160,7 +160,11 @@ export interface AutoSyncOptions {
    */
   ledgerFor?: (pair: AutoPair) => PairLedger;
   /** 测试接缝：通知一个请求已进入串行队列。 */
-  onRequestQueued?: (pair: AutoPair) => void;
+  onRequestQueued?: () => void;
+  /** 测试接缝：通知一个串行请求已执行完毕。 */
+  onRequestFinished?: () => void;
+  /** 测试接缝：通知一个配对将要被排程。 */
+  onSchedule?: (ms: number) => void;
 }
 
 export class AutoSync implements AutoSyncApi {
@@ -285,6 +289,7 @@ export class AutoSync implements AutoSyncApi {
   private schedule(st: PairState, ms: number) {
     // 旧代际回调可能在 removePair 后才出队；不得重建已解除配对的 runtime。
     if (!this.isRegistered(st)) return;
+    try { this.options.onSchedule?.(ms); } catch { /* 测试接缝不得改变调度行为 */ }
     const rt = this.runtime(st.pair.id);
     const due = Date.now() + ms;
     if (rt.timerDue !== undefined && rt.timerDue <= due) return;
@@ -500,8 +505,7 @@ export class AutoSync implements AutoSyncApi {
     if (rt.requested) return;
     rt.requested = true;
     const generation = rt.generation;
-    this.options.onRequestQueued?.(st.pair);
-    void this.run(async () => {
+    const queued = this.run(async () => {
       rt.requested = false;
       // 请求被入队之后，前面的 removePair 可能已经把它从注册表摘掉。
       // 必须在任何代际重排 / IO 前再次验证对象仍注册。
@@ -577,6 +581,10 @@ export class AutoSync implements AutoSyncApi {
       rt.state = 'error';
       st.hold = { reason: '本机状态无法持久化，已停止写入', error: true };
       this.stopIO(st);
+    });
+    try { this.options.onRequestQueued?.(); } catch { /* 测试接缝不得改变队列 */ }
+    void queued.finally(() => {
+      try { this.options.onRequestFinished?.(); } catch { /* 测试接缝不得改变队列 */ }
     });
   }
 

@@ -1299,6 +1299,11 @@ async function main() {
     let releaseBlock!: () => void;
     let expectWatcherRequest = false;
     let watcherRequestQueued = false;
+    let watcherRequestFinished = false;
+    let removeFinished = false;
+    let scheduledAfterRemove = false;
+    let finishWatcherRequest!: () => void;
+    const watcherFinished = new Promise<void>(resolve => { finishWatcherRequest = resolve; });
     const blocked = new Promise<void>(resolve => { releaseBlock = resolve; });
     const enteredBlock = new Promise<void>(resolve => { enterBlock = resolve; });
     const permit: WritePermit = {
@@ -1307,9 +1312,16 @@ async function main() {
         return d;
       },
     };
-    const aut = new AutoSync(local, permit, { onRequestQueued: () => {
-      if (expectWatcherRequest) watcherRequestQueued = true;
-    } });
+    const aut = new AutoSync(local, permit, {
+      onRequestQueued: () => { if (expectWatcherRequest) watcherRequestQueued = true; },
+      onRequestFinished: () => {
+        if (watcherRequestQueued && !watcherRequestFinished) {
+          watcherRequestFinished = true;
+          finishWatcherRequest();
+        }
+      },
+      onSchedule: (_ms) => { if (removeFinished) scheduledAfterRemove = true; },
+    });
     try {
       await fs.mkdir(sourceRoot); await fs.mkdir(targetRoot);
       await put(sourceRoot, 'initial.txt', 'initial');
@@ -1326,16 +1338,20 @@ async function main() {
       // 已经进入队列。removePair 先入队，因此该请求必定排在解绑之后。
       expectWatcherRequest = true;
       await put(sourceRoot, 'after-remove.txt', 'must-not-write');
-      await waitUntil(async () => watcherRequestQueued, 'watcher 的旧配对请求已排在 removePair 之后');
+      // watcher 通知为主；短轮询只作测试兜底，确认请求确实入队再放行。
+      await waitUntil(async () => watcherRequestQueued, 'watcher 的旧配对请求已排在 removePair 之后', 12_000);
       releaseBlock();
       await Promise.all([resumeBeforeRemove, remove]);
-      await wait(900);
+      removeFinished = true;
+      await watcherFinished;
 
       assert.equal((await aut.status()).pairs.length, 0, '配对应已解除');
+      assert.equal(scheduledAfterRemove, false, '解除配对后的旧请求不得重排');
       await assert.rejects(get(targetRoot, 'after-remove.txt'), { code: 'ENOENT' }, '旧请求不得在解除配对后写入旧目标');
     } finally {
+      // 先释放可能阻塞中的许可，再等同步队列排空，确保失败时也能清理夹具。
       releaseBlock();
-      await aut.suspend();
+      await Promise.allSettled([aut.suspend()]);
       await fs.rm(base, { recursive: true });
     }
   });
