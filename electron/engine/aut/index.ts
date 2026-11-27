@@ -72,6 +72,8 @@ interface PairRuntime {
   reportedCorruption?: string;
   /** 已经报过的那份损坏的具体记录：判定「账本是否真的回来了」要用。 */
   reportedCorruptionDetail?: LedgerCorruption[];
+  /** 「无法确认」是否已经通知过：证据留着，但不必每轮重复刷屏。 */
+  unverifiedNotified?: boolean;
 }
 
 const blank = (): Local => ({ version: 2, pairs: [] });
@@ -323,10 +325,10 @@ export class AutoSync implements AutoSyncApi {
         // 更是什么都没验证成。两种情况下都宣布「已恢复」都是没有依据的。
         // 证据不足时只说「无法确认」，把话说到能说到的那一步为止。
         const verdict = await ledger.verifyRecovered(rt.reportedCorruptionDetail ?? []);
-
-        rt.reportedCorruption = undefined;
-        rt.reportedCorruptionDetail = undefined;
         if (verdict === 'recovered') {
+          rt.reportedCorruption = undefined;
+          rt.reportedCorruptionDetail = undefined;
+          rt.unverifiedNotified = false;
           // 作废这件事要让用户看得见：否则「账本已经好了」和「程序还在记着
           // 一份旧账」在界面上完全一样。
           //
@@ -336,10 +338,20 @@ export class AutoSync implements AutoSyncApi {
           // 由另一条事件（历史账本曾损坏）如实交代。
           this.event(st, '历史账本已恢复', '账本已能完整读出，先前报告的损坏已不存在');
         } else if (verdict === 'vanished') {
+          rt.reportedCorruption = undefined;
+          rt.reportedCorruptionDetail = undefined;
+          rt.unverifiedNotified = false;
           this.event(st, '历史账本已消失', '账本目录已不存在，先前报告的损坏已无处核对；介质上的历史请自行确认');
         } else {
           // 验证没成功就如实说没成功：不能替用户下「已经好了」的结论。
-          this.event(st, '历史账本无法确认', '无法确认先前损坏的账本是否已经回来（账本读不出来或内容对不上）；先前的损坏仍然有效，下一轮再核对');
+          //
+          // 证据**必须留着**：清掉它等于把「下一轮再核对」变成空话——
+          // 下一轮就再也无从核对了。这里只把重复的提示压下去，
+          // 核对本身每一轮都在继续；证据一变，提示就重新出。
+          if (!rt.unverifiedNotified) {
+            rt.unverifiedNotified = true;
+            this.event(st, '历史账本无法确认', '无法确认先前损坏的账本是否已经回来（账本读不出来或内容对不上）；先前的损坏记录仍然有效，程序会保留证据并在下一轮再核对');
+          }
         }
       }
     }
@@ -387,6 +399,7 @@ export class AutoSync implements AutoSyncApi {
       rt.reportedCorruption = undefined;
       // 修好了就没有「先前那份损坏」可言了，别留着过期证据。
       rt.reportedCorruptionDetail = undefined;
+      rt.unverifiedNotified = false;
       return;
     }
     // 还坏着：如告诉用户需要人工核对。同一份损坏不重复上报——
@@ -397,6 +410,8 @@ export class AutoSync implements AutoSyncApi {
     rt.reportedCorruption = fingerprint;
     // 把明细也留一份：下一轮判定「这份账本是不是真的回来了」需要拿它做比对。
     rt.reportedCorruptionDetail = [...remaining];
+    // 换了一份损坏：上一轮的「无法确认」提示随之作废。
+    rt.unverifiedNotified = false;
     const detail = remaining.map(c => `${c.file}(${c.lines} 行)`).join('、');
     this.event(st, '历史账本需要人工核对', `读不出来的内容：${detail}；自动修复未能处理，请人工核对介质上的账本文件`);
   }
@@ -641,6 +656,13 @@ export class AutoSync implements AutoSyncApi {
       st.epoch = undefined;
       delete st.publish;
       rt.session.counted.clear();
+      // 旧介质的损坏证据不得沿用到新介质上：
+      // 先前报过的损坏说的是**那一份**账本，拿它去核对新介质，
+      // 得到的「已消失」「无法确认」都是拿旧证据说新介质的谎话。
+      rt.corruptionFingerprint = undefined;
+      rt.reportedCorruption = undefined;
+      rt.reportedCorruptionDetail = undefined;
+      rt.unverifiedNotified = false;
       await this.captureBaseline(st, rt);
     }
     this.event(st, '配对设置已更新');

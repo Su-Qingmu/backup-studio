@@ -114,6 +114,43 @@ export interface LedgerCorruption {
   tornTail: boolean;
   /** 尾部半行时：最后一条完好记录之后的字节偏移 */
   goodBytes: number;
+  /**
+   * 连续性证据：损坏发生时，同一文件里读到过的完好记录。
+   *
+   * meta（pair.json）只证明「这份账本属于这个配对」，**不证明历史连续**：
+   * 账本被换成空文件、或换成损坏前的陈旧副本时，meta 照样对得上，
+   * 而先前那份历史其实已经没了。只有先前读到的完好记录**现在仍在账本里**
+   * （同 id、同内容），才谈得上「还是那份历史」。
+   *
+   * 证据不足时一律判「无法确认」——宁可少说，不可说错。
+   */
+  intact: LedgerIntactRow[];
+}
+
+/** 连续性证据里的一条记录：记录 id + 该行内容的摘要。 */
+export interface LedgerIntactRow {
+  /** 记录 id（提交、版本、墓碑都有 id） */
+  id: string;
+  /** 该行内容的摘要（sha256，按解析后的对象计算） */
+  digest: string;
+}
+
+/** 连续性证据最多保留多少条（取最近的那些）。 */
+const INTACT_ANCHOR_LIMIT = 64;
+
+/**
+ * 按账本文件名取回该文件的行校验器。
+ *
+ * 连续性复核必须用**同一套**判据：校验器不一致时，坏行会被当成好行，
+ * 于是「记录还在」的结论建立在一次不同的解读上。
+ */
+function validatorFor(file: string): ((row: unknown) => boolean) | undefined {
+  switch (path.basename(file)) {
+    case 'commits.jsonl': return isCommitRow;
+    case 'versions.jsonl': return isVersionRow;
+    case 'tombstones.jsonl': return isTombstoneRow;
+    default: return undefined;
+  }
 }
 
 /**
@@ -245,11 +282,34 @@ export class PairLedger {
     const m = meta as { id?: unknown; sourceRoot?: unknown; targetRoot?: unknown };
     if (m.id !== this.pair.id) return 'unverified';
     if (m.sourceRoot !== this.pair.sourceRoot || m.targetRoot !== this.pair.targetRoot) return 'unverified';
-    // 先前损坏的那些文件，现在必须读得出来（内容完整、无半行）。
-    for (const c of corruption) {
-      try { await fs.readFile(path.join(this.root, c.file)); }
-      catch { return 'unverified'; }
-    }
+    // 连「先前坏的是哪几处」都不知道，就谈不上确认：没有可比对的证据。
+    if (!corruption.length) return 'unverified';
+    // 连续性复核：先前损坏时读到过的完好记录，现在必须仍然在账本里。
+    //
+    // meta 对得上只说明「这是同一对配对的账本目录」，**不说明历史是连续的**：
+    // 目录被换成空壳、日志被换成空文件时，meta 照样对得上，
+    // 而先前那份历史已经没了 —— 这时宣布「已恢复」是报一件没发生的事。
+    try {
+      for (const c of corruption) {
+        const anchors = c.intact ?? [];
+        // 没有锚点就没有连续性证据：宁可说「无法确认」，不可说「已恢复」。
+        if (!anchors.length) return 'unverified';
+        const file = path.join(this.root, c.file);
+        const { rows, corruption: nowCorrupt } = await this.readJsonl<unknown>(file, validatorFor(c.file));
+        // 文件仍然读不干净 → 显然没恢复。
+        if (nowCorrupt) return 'unverified';
+        const current = new Map<string, string>();
+        for (const row of rows) {
+          const rowId = (row as { id?: unknown }).id;
+          if (typeof rowId !== 'string') continue;
+          current.set(rowId, createHash('sha256').update(JSON.stringify(row)).digest('hex'));
+        }
+        for (const anchor of anchors) {
+          // 记录不见了，或内容变了：这份历史已经不是先前那份了。
+          if (current.get(anchor.id) !== anchor.digest) return 'unverified';
+        }
+      }
+    } catch { return 'unverified'; }
     return 'recovered';
   }
 
@@ -273,6 +333,7 @@ export class PairLedger {
     const rows: T[] = [];
     const bad: string[] = [];
     const slices: Array<{ start: number; end: number }> = [];
+    const intact: LedgerIntactRow[] = [];
     let goodBytes = 0;
     let sawBad = false;
     let goodAfterBad = false;
@@ -296,6 +357,13 @@ export class PairLedger {
         // 读不出来。这类行按损坏处理：跳过 + 留证，不让它拖垮整份账本。
         if (isValid && !isValid(parsed)) throw new Error('行结构不合法');
         rows.push(parsed as T);
+        // 连续性证据：这条记录被读到了，就是「这份历史还在」的凭据。
+        // 摘要按**解析后的对象**算：重建账本时行会被重新序列化，
+        // 按原始字节算摘要会因为格式差异把同一份历史误判成「变了」。
+        const rowId = (parsed as { id?: unknown }).id;
+        if (typeof rowId === 'string') {
+          intact.push({ id: rowId, digest: createHash('sha256').update(JSON.stringify(parsed)).digest('hex') });
+        }
         // 坏行之后还有读得出来的记录 → 中段损坏，不是尾部半行。
         if (sawBad) goodAfterBad = true;
         else goodBytes = next;
@@ -329,6 +397,8 @@ export class PairLedger {
         digest: digest.digest('hex'),
         tornTail,
         goodBytes,
+        // 只留尾部若干条：最近的记录最可能是「回滚/换壳」时会缺的那几条。
+        intact: intact.slice(-INTACT_ANCHOR_LIMIT),
       },
     };
   }
