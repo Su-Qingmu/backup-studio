@@ -1313,10 +1313,9 @@ async function main() {
     const aut = new AutoSync(local, permit, {
       onRequestQueued: () => { if (expectWatcherRequest) watcherRequestQueued = true; },
       onRequestFinished: () => {
-        if (watcherRequestQueued && !watcherRequestFinished) {
-          watcherRequestFinished = true;
-        }
+        if (watcherRequestQueued && !watcherRequestFinished) watcherRequestFinished = true;
       },
+      onPairRemoved: () => { removeFinished = true; },
       onSchedule: (_ms) => { if (removeFinished) scheduledAfterRemove = true; },
     });
     try {
@@ -1339,7 +1338,6 @@ async function main() {
       await waitUntil(async () => watcherRequestQueued, 'watcher 的旧配对请求已排在 removePair 之后', 12_000);
       releaseBlock();
       await Promise.all([resumeBeforeRemove, remove]);
-      removeFinished = true;
       await waitUntil(async () => watcherRequestFinished, '解绑后的旧请求已完成', 12_000);
 
       assert.equal((await aut.status()).pairs.length, 0, '配对应已解除');

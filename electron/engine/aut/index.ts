@@ -162,7 +162,9 @@ export interface AutoSyncOptions {
   /** 测试接缝：通知一个请求已进入串行队列。 */
   onRequestQueued?: () => void;
   /** 测试接缝：通知一个串行请求已执行完毕。 */
-  onRequestFinished?: () => void;
+  onRequestFinished?: () => void | Promise<void>;
+  /** 测试接缝：通知一个配对已从注册列表移除。 */
+  onPairRemoved?: () => void | Promise<void>;
   /** 测试接缝：通知一个配对将要被排程。 */
   onSchedule?: (ms: number) => void;
 }
@@ -735,6 +737,7 @@ export class AutoSync implements AutoSyncApi {
     this.stopIO(st);
     this.runtimes.delete(st.pair.id);
     this.data.pairs = this.data.pairs.filter(p => p.pair.id !== st.pair.id);
+    this.notifyTestHook(this.options.onPairRemoved);
     if (this.data.activePairId === st.pair.id) delete this.data.activePairId;
     // 介质上的历史记录保留：解除配对不删除备份介质里的任何东西。
     await this.save();
