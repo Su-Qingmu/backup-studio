@@ -159,6 +159,8 @@ export interface AutoSyncOptions {
    * 生产不传这个选项，行为与从前完全一致。
    */
   ledgerFor?: (pair: AutoPair) => PairLedger;
+  /** 测试接缝：通知一个请求已进入串行队列。 */
+  onRequestQueued?: (pair: AutoPair) => void;
 }
 
 export class AutoSync implements AutoSyncApi {
@@ -281,6 +283,8 @@ export class AutoSync implements AutoSyncApi {
    * 用户看到的却是「按了重新对账，界面一直显示待同步，什么也没发生」。
    */
   private schedule(st: PairState, ms: number) {
+    // 旧代际回调可能在 removePair 后才出队；不得重建已解除配对的 runtime。
+    if (!this.isRegistered(st)) return;
     const rt = this.runtime(st.pair.id);
     const due = Date.now() + ms;
     if (rt.timerDue !== undefined && rt.timerDue <= due) return;
@@ -289,7 +293,7 @@ export class AutoSync implements AutoSyncApi {
     rt.timer = setTimeout(() => {
       rt.timer = undefined;
       rt.timerDue = undefined;
-      this.request(st);
+      if (this.isRegistered(st)) this.request(st);
     }, ms);
   }
 
@@ -489,13 +493,19 @@ export class AutoSync implements AutoSyncApi {
   }
 
   private request(st: PairState) {
+    // watcher / timer 回调持有旧 PairState 闭包。解除配对后它可能仍已排进
+    // 串行队列；不得为了这条陈旧请求重新创建 runtime 或写入旧目标。
+    if (!this.isRegistered(st)) return;
     const rt = this.runtime(st.pair.id);
     if (rt.requested) return;
     rt.requested = true;
     const generation = rt.generation;
+    this.options.onRequestQueued?.(st.pair);
     void this.run(async () => {
       rt.requested = false;
-      if (!st.pair.enabled || !this.active || st.hold) return;
+      // 请求被入队之后，前面的 removePair 可能已经把它从注册表摘掉。
+      // 必须在任何代际重排 / IO 前再次验证对象仍注册。
+      if (!this.isRegistered(st) || !st.pair.enabled || !this.active || st.hold) return;
       if (generation !== rt.generation) {
         // 代际变了（期间重新武装过）：本轮作废。
         //
@@ -733,6 +743,11 @@ export class AutoSync implements AutoSyncApi {
   private find(pairId: string): PairState | undefined {
     if (typeof pairId !== 'string' || !pairId) return undefined;
     return this.data.pairs.find(p => p.pair.id === pairId);
+  }
+
+  /** 按对象身份判断配对仍注册；同一 ID 的新配对不是旧配对的延续。 */
+  private isRegistered(st: PairState): boolean {
+    return this.data.pairs.some(pair => pair === st);
   }
 
   resume = (pairId: string) => this.run(async () => {

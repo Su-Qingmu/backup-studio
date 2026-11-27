@@ -1290,6 +1290,56 @@ async function main() {
     assert.equal(commits.length, 1);
   }));
 
+  await test('解除配对时已排队的旧请求不得重排并写入旧目标', async () => {
+    const base = trackTempDir(await fs.mkdtemp(path.resolve('test', '.aut-fixture-')));
+    const sourceRoot = path.join(base, 'source'), targetRoot = path.join(base, 'target'), local = path.join(base, 'local');
+    const d = decision();
+    let blockNext = false;
+    let enterBlock!: () => void;
+    let releaseBlock!: () => void;
+    let expectWatcherRequest = false;
+    let watcherRequestQueued = false;
+    const blocked = new Promise<void>(resolve => { releaseBlock = resolve; });
+    const enteredBlock = new Promise<void>(resolve => { enterBlock = resolve; });
+    const permit: WritePermit = {
+      canWrite: async () => {
+        if (blockNext) { blockNext = false; enterBlock(); await blocked; }
+        return d;
+      },
+    };
+    const aut = new AutoSync(local, permit, { onRequestQueued: () => {
+      if (expectWatcherRequest) watcherRequestQueued = true;
+    } });
+    try {
+      await fs.mkdir(sourceRoot); await fs.mkdir(targetRoot);
+      await put(sourceRoot, 'initial.txt', 'initial');
+      const status = await aut.addPair({ sourceRoot, targetRoot, stableMs: 500 });
+      const id = status.pairs[0].pair.id;
+      await aut.start(); await aut.setEnabled(id, true); await idle(aut, id);
+
+      // 让一次 API 操作占住串行队列，随后 enqueue removePair。
+      blockNext = true;
+      const resumeBeforeRemove = aut.resume(id);
+      await enteredBlock;
+      const remove = aut.removePair(id);
+      // watcher 仍在本轮已提交前打开；明确等待源端变化对应的旧 PairState 请求
+      // 已经进入队列。removePair 先入队，因此该请求必定排在解绑之后。
+      expectWatcherRequest = true;
+      await put(sourceRoot, 'after-remove.txt', 'must-not-write');
+      await waitUntil(async () => watcherRequestQueued, 'watcher 的旧配对请求已排在 removePair 之后');
+      releaseBlock();
+      await Promise.all([resumeBeforeRemove, remove]);
+      await wait(900);
+
+      assert.equal((await aut.status()).pairs.length, 0, '配对应已解除');
+      await assert.rejects(get(targetRoot, 'after-remove.txt'), { code: 'ENOENT' }, '旧请求不得在解除配对后写入旧目标');
+    } finally {
+      releaseBlock();
+      await aut.suspend();
+      await fs.rm(base, { recursive: true });
+    }
+  });
+
   // —— 无硬链接文件系统上的撤回 ——
   await test('介质不支持硬链接时撤回仍可用且不覆盖已有文件', () => fixture({ syncDeletes: true }, async (aut, input) => {
     // exFAT/FAT32 不支持硬链接，撤回必须退回复制路径而不是直接失败。
