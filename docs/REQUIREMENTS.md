@@ -53,6 +53,8 @@ Backup Studio 是一个**高性能本地目录备份工具**。核心命题是�
 | 分片命名 | `.part` 临时文件名后缀改用相对路径 SHA-256 前 24 位十六进制（96 bit），消除大批量文件下的命名碰撞 | `electron/engine/journal.ts` |
 | 目录边界校验 | 源目录与目标目录同路径、或互为父子嵌套时直接拒绝，防止递归备份与镜像删除互相冲突 | `electron/engine/service.ts` |
 | 空目录与源端元数据目录 | 源端新增空目录同步到目标端；源端同名 `.backup-studio` 用户目录**不再被跳过**（仅目标端排除元数据目录） | `electron/engine/planner.ts`、`electron/engine/scan.ts` |
+| 引擎保留路径 | 目标端 `.backup-studio` 下的 `parts/`、`history/`、`history-index/`、`recycle/`、`aut-history/`、`aut-recycle/`、`manifest.json`、`journal-mirror.json` 是引擎私有状态。源端出现同名路径时**在写入前阻断**（不复制、不覆盖、不删除），且目标端不被写入任何内容；源端整体是一份备份时（严格识别引擎清单：`version=1` + `files` + `sourceRoot` + `updatedAt`），其引擎状态不重复备份，同名目录里的其它文件照常备份 | `electron/engine/reserved.ts`、`electron/engine/manifest.ts`、`electron/engine/service.ts` |
+| 提交期回读 | 报「完成」之前，清理阶段之后必须逐个复核已登记文件：存在性与大小一致；本次写入的文件再做 SHA-256 回读（对照登记的源端哈希）。任一不符即判失败，绝不带着假清单报完成 | `electron/engine/verify.ts`、`electron/engine/service.ts` |
 | 复制线程自愈 | worker `error` / 异常退出时终止旧线程、回调当前任务失败并重建槽位，避免池任务永久挂起 | `electron/engine/pool.ts` |
 | 多线程复制 | `worker_threads` 池，线程数 `max(2, min(8, cpus-1))`；先写 `.part` 临时件再 `rename` 原子落盘 | `electron/engine/pool.ts`、`electron/engine/copyWorker.ts` |
 | 完整性校验 | 落盘后 `fsync` → 回读整份文件重算 SHA-256 比对；校验失败返回 `VERIFY_FAILED` 并**保留临时件**，不再整份重传 | `electron/engine/copyWorker.ts` |
@@ -73,12 +75,13 @@ Backup Studio 是一个**高性能本地目录备份工具**。核心命题是�
 | 明暗主题 | 设计令牌集中在 `tokens.css`；主题切换持久化到 localStorage，并同步到 Electron 原生窗口（**原生窗口侧未取证**，见 REQ-UI-001） | `src/styles/tokens.css`、`src/App.tsx` |
 | 可测试性 | 渲染层提供 mock API，脱离 Electron 也能跑通界面 | `src/lib/mock.ts` |
 | 类型检查覆盖 | 三套 tsconfig 全量覆盖：`tsconfig.json`（src/shared）、`tsconfig.electron.json`（electron/shared）、`tsconfig.test.json`（test/electron/shared）；`npm run typecheck` 一次跑完，测试脚本不再游离于类型检查之外 | `tsconfig.*.json`、`package.json` |
-| 引擎测试 | `test/engine.test.ts` 覆盖 **35** 个场景：基础备份与同步 6、断点续传与分片回归 2、多线程并发 1、掉盘检测与停止写入 2、容灾用例 12、高风险删除闸门 1，以及 FR-06/09/11/15/16 新增 11 项；另有 `test/auto-sync.test.ts` 10 项（自动备份）与 `test/write-gate.test.ts` 8 项（写入闸门） | `test/*.test.ts` |
+| 引擎测试 | `test/engine.test.ts` 覆盖 **35** 个场景：基础备份与同步 6、断点续传与分片回归 2、多线程并发 1、掉盘检测与停止写入 2、容灾用例 12、高风险删除闸门 1，以及 FR-06/09/11/15/16 新增 11 项；另有 `test/auto-sync.test.ts` 10 项（自动备份）、`test/write-gate.test.ts` 8 项（写入闸门）与 `test/write-permit.test.ts` 7 项（写入许可三态与文案一致性） | `test/*.test.ts` |
 | 逻辑健康检测 | 只读汇聚卷/磁盘分层状态、NTFS 脏位、MBR 条目边界与 GPT 主备头 CRC32、NTFS 引导扇区签名、备份索引与逐文件 SHA-256；权限不足、计数不可用或桥接不透传时明确标注「能力缺失」，**不伪造健康结论** | `electron/engine/health.ts` |
 | 人工修复入口 | 只读预检 → 选择作用卷 → 两次确认 → 免责 → **先镜像关键扇区到本机** → 生成审计记录；**仅演练，不调用 `chkdsk`/`fsck`，不写回分区表**；分区表只提供证据导出与人工向导 | `electron/engine/repair.ts` |
 | 权限与安全 | 管理员/root 判定；外部命令走只读白名单（固定程序与参数，杜绝注入）；原始设备路径白名单；日志脱敏（路径与凭据不落明文） | `electron/engine/security.ts` |
 | 跨平台能力矩阵 | 结构化 72 组合（3 平台 × 3 接口 × 8 文件系统），标注「可检测 / 可自动处理 / 仅告警 / 不支持」，主界面可查 | `electron/engine/capability.ts`、`src/components/MediaDiagnostics.tsx` |
 | **统一写入闸门** | 手动备份与自动同步**共用同一个闸门**（`service.writeGate()`）：介质不可达、隔离中、L2、磁盘只读、卷需修复、卷健康无法判定，一律禁止写入；自动同步另经 `epoch` 识别「介质或授权已变化」并要求重新对账 | `electron/engine/service.ts`、`electron/engine/aut/bridge.ts` |
+| **写入许可（界面唯一裁决）** | 主进程下发 `WritePermit`，只有三态：**阻断**（禁用写入并原样展示理由）、**需显式确认**（卷级健康无法判定，用户勾选确认后才放行）、**放行**；界面只消费结论，**不得自行推导安全规则**；判定与许可共用同一份闸门事实（`writeFacts`/`decideWriteGate`），证据不足时的措辞统一为「当前未发现明确写入阻断」，**不再自称「保持只读」** | `electron/engine/service.ts`、`electron/engine/health.ts`、`src/App.tsx` |
 | 自动备份（实时单向同步） | 带开关的单向同步：配对与开关持久化、本机持久化事件队列、`fs.watch` 递归监听 + 350ms 去抖 + 轮询兜底、差异对账、分片级原子复制、删除走独立回收站（≥7 天、容量上限、逐项授权清理）、错误退避重试、审计事件；**写入许可由容灾闸门裁决** | `electron/engine/aut/**`、`src/components/AutoSync/**` |
 | 打包与 CI | electron-builder：Windows NSIS / Linux AppImage+deb；`ci.yml` push/PR 触发类型检查→构建→引擎/自动同步/写入闸门三套测试；`release.yml` 打 tag `v*.*.*` 触发双平台构建并上传 Release | `package.json`、`.github/workflows/ci.yml`、`.github/workflows/release.yml` |
 | 项目文档 | `README.md` 记录功能矩阵、去重与改名判定链路、断点续传摘要重建原理、拔盘恢复成立条件、选型理由、命令清单、界面规范落地清单、已知限制 | `README.md` |

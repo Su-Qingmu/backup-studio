@@ -136,10 +136,13 @@ export function createMockApi(): BackupAPI {
     confirmReason: '',
     recoverableJob: null,
     assessment: null,
+    writePermits: {},
     quarantine: null,
   });
 
   let current = baseState();
+  // 演示态的许可修订号：确认回执必须与它一致。
+  let permitRevision = 0;
   let timer: number | null = null;
 
   // ---- 自动备份的浏览器演示状态：不触碰真实文件系统 ----
@@ -649,6 +652,25 @@ export function createMockApi(): BackupAPI {
 
     async plan(sourceRoot: string, targetRoot: string, syncMode: SyncMode): Promise<PlanPayload> {
       await new Promise((r) => setTimeout(r, 220));
+      // 演示态也遵守同一条契约：计划就绪时必须有一份绑定目标的许可。
+      current = {
+        ...current,
+        writePermits: {
+          ...current.writePermits,
+          [targetRoot]: {
+            verdict: 'allowed' as const,
+            reason: null,
+            evidence: [],
+            targetRoot,
+            level: 'L0' as const,
+            condition: 'verified' as const,
+            volumeHealth: 'healthy' as const,
+            revision: ++permitRevision,
+            at: Date.now(),
+          },
+        },
+      };
+      state.emit(current);
       const actions = fakeActions(syncMode);
       // 非破坏性模式不产生删除动作，多余文件改为保留。
       const deleteCount = syncMode === 'copy' ? 0 : 37;
@@ -755,8 +777,30 @@ export function createMockApi(): BackupAPI {
       return current;
     },
 
-    async health() {
-      return { assessment: { level: 'L1', confidence: 0.95, writable: false, at: Date.now(), suggestion: '演示卷需人工检查，保持只读。', evidence: [{ kind: '演示卷', detail: 'NTFS / Full Repair Needed / 脏位置位', at: Date.now() }] }, condition: 'filesystem-repair', permission: true, volume: 'X:', smart: '能力缺失', index: '未验证', files: { complete: 0, truncated: 0, missing: 0, mismatch: 0, unchecked: 0 } };
+    async health(root: string) {
+      // 演示卷需人工检查：结论是「阻断」，许可必须与结论一致，
+      // 否则界面会拿着放行许可显示一条「保持只读」的诊断。
+      const assessment = { level: 'L1' as const, confidence: 0.95, writable: false, at: Date.now(), suggestion: '演示卷需人工检查，必须保持只读。', condition: 'filesystem-repair' as const, targetRoot: root, evidence: [{ kind: '演示卷', detail: 'NTFS / Full Repair Needed / 脏位置位', at: Date.now(), status: 'error' as const, scope: 'volume' as const }] };
+      current = {
+        ...current,
+        assessment,
+        writePermits: {
+          ...current.writePermits,
+          [root]: {
+            verdict: 'blocked' as const,
+            reason: '卷需要人工检查，禁止写入；处理完成并重新对账后再继续',
+            evidence: [],
+            targetRoot: root,
+            level: 'L1' as const,
+            condition: 'filesystem-repair' as const,
+            volumeHealth: 'repair-required' as const,
+            revision: ++permitRevision,
+            at: Date.now(),
+          },
+        },
+      };
+      state.emit(current);
+      return { assessment, condition: 'filesystem-repair', permission: true, volume: 'X:', smart: '能力缺失', index: '未验证', files: { complete: 0, truncated: 0, missing: 0, mismatch: 0, unchecked: 0 }, targetWritable: true };
     },
     async reenumerate(root) { return this.health(root); },
     async repairDryRun(_root, request) {
@@ -766,18 +810,31 @@ export function createMockApi(): BackupAPI {
     async exportPartitionEvidence() { return { auditId: 'demo', guidance: '浏览器演示：未写入文件。' }; },
     async capabilities() { return (await import('../../electron/engine/capability')).capabilityMatrix; },
 
-    async assess(_targetRoot: string) {
-      return {
-        assessment: {
-          level: 'L0' as const,
-          confidence: 0.8,
-          evidence: [],
-          suggestion: '介质读取稳定',
-          at: Date.now(),
-          writable: true,
-        },
-        state: current,
+    async assess(targetRoot: string) {
+      const assessment = {
+        level: 'L0' as const,
+        confidence: 0.8,
+        evidence: [],
+        suggestion: '介质读取稳定',
+        at: Date.now(),
+        writable: true,
+        targetRoot,
+        condition: 'verified' as const,
       };
+      // 演示态也遵守同一条契约：界面拿到的必须是主进程给的许可。
+      const writePermit = {
+        verdict: 'allowed' as const,
+        reason: null,
+        evidence: [],
+        targetRoot,
+        level: 'L0' as const,
+        condition: 'verified' as const,
+        volumeHealth: 'healthy' as const,
+        revision: ++permitRevision,
+        at: Date.now(),
+      };
+      current = { ...current, assessment, writePermits: { ...current.writePermits, [targetRoot]: writePermit } };
+      return { assessment, state: current };
     },
 
     async recover() {

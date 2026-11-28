@@ -215,7 +215,7 @@ export function ProgressPanel({
           </p>
           {assessment && assessment.evidence.length ? (
             <ul className="confirm-evidence">
-              {assessment.evidence.slice(0, 4).map((item, index) => (
+              {assessment.evidence.filter((item) => item.status !== 'not-applicable').slice(0, 4).map((item, index) => (
                 <li key={index}>
                   {item.kind}：{item.detail}
                 </li>

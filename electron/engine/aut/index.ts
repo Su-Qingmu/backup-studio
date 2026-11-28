@@ -24,7 +24,7 @@ import { copyAtomic, fault, stamp, type Gate } from './copy';
 import { Blocked, denial, type WritePermit } from './permit';
 import { MAX_ATTEMPTS, queueState, retryDelay, type QueueState } from './queue';
 import { recycleBytes, recyclePath } from './recycle';
-import { PairLedger, findLedgerPair, pruneHistory, recycleView, writeCommit, writeVersion, type LedgerIndexEntry } from './history';
+import { PairLedger, findLedgerPair, pruneHistory, recycleView, writeCommit, writeVersion, type LedgerCorruption, type LedgerIndexEntry, type LedgerSnapshot } from './history';
 import { captureVersion, keyFor, reconcile, type IndexEntry } from './sync';
 import { watchPair } from './watcher';
 
@@ -66,9 +66,23 @@ interface PairRuntime {
   /** 会话基线：本次软件运行期间观察到的源端文件集合。 */
   baseline: Set<string>;
   session: { deletes: number; unmanaged: number; counted: Set<string> };
+  /** 本轮读到的账本损坏指纹（由 hydrate 写入）。 */
+  corruptionFingerprint?: string;
+  /** 已经向用户报过的损坏指纹：同一份损坏不得每轮重复上报。 */
+  reportedCorruption?: string;
+  /** 已经报过的那份损坏的具体记录：判定「账本是否真的回来了」要用。 */
+  reportedCorruptionDetail?: LedgerCorruption[];
+  /** 「无法确认」是否已经通知过：证据留着，但不必每轮重复刷屏。 */
+  unverifiedNotified?: boolean;
+  /** 已排定的下一次请求的到期时刻：防止「更晚的定时器」顶掉「更早的请求」。 */
+  timerDue?: number;
 }
 
 const blank = (): Local => ({ version: 2, pairs: [] });
+
+/** 账本损坏的指纹：同一份损坏只该报一次，否则事件流会被重复条目淹没。 */
+const corruptionFingerprint = (list: readonly LedgerCorruption[]) =>
+  list.map(c => `${c.file}:${c.lines}:${c.tornTail}:${c.digest}:${c.slices.map(s => `${s.start}-${s.end}`).join(',')}`).join('|');
 
 const reasonFor = (err: unknown) => {
   const labels: Record<string, string> = { ENOENT: '目录或文件不可用', EACCES: '权限不足', EPERM: '操作被拒绝或文件被占用', EBUSY: '文件被占用', ENOSPC: '磁盘空间不足', ENAMETOOLONG: '路径过长', EIO: '读写设备失败' };
@@ -135,6 +149,26 @@ function aggregate(states: AutoRunState[]): AutoRunState {
   return 'off';
 }
 
+export interface AutoSyncOptions {
+  /**
+   * 测试接缝：账本实例的创建方式。
+   *
+   * 损坏恢复里有几处状态只有在「账本修不掉」时才会走到（例如提示用户人工
+   * 核对、以及旧上报状态何时作废）。这种状态在真实文件系统里几乎造不出来
+   * ——自动修复总能把账本修干净——但它恰恰是最需要被测的那条路径。
+   * 生产不传这个选项，行为与从前完全一致。
+   */
+  ledgerFor?: (pair: AutoPair) => PairLedger;
+  /** 测试接缝：通知一个请求已进入串行队列。 */
+  onRequestQueued?: () => void;
+  /** 测试接缝：通知一个串行请求已执行完毕。 */
+  onRequestFinished?: () => void | Promise<void>;
+  /** 测试接缝：通知一个配对已从注册列表移除。 */
+  onPairRemoved?: () => void | Promise<void>;
+  /** 测试接缝：通知一个配对将要被排程。 */
+  onSchedule?: (ms: number) => void;
+}
+
 export class AutoSync implements AutoSyncApi {
   private data = blank();
   private readonly runtimes = new Map<string, PairRuntime>();
@@ -143,9 +177,18 @@ export class AutoSync implements AutoSyncApi {
   private active = false;
   private readonly loaded: Promise<void>;
 
-  constructor(private readonly localDirectory: string, private readonly permit: WritePermit) {
+  constructor(
+    private readonly localDirectory: string,
+    private readonly permit: WritePermit,
+    private readonly options: AutoSyncOptions = {},
+  ) {
     this.file = path.join(localDirectory, 'auto-sync.json');
     this.loaded = this.load();
+  }
+
+  /** 账本实例：生产走 PairLedger，测试可换成别的实现。 */
+  private makeLedger(pair: AutoPair): PairLedger {
+    return this.options.ledgerFor ? this.options.ledgerFor(pair) : new PairLedger(pair);
   }
 
   private async load(): Promise<void> {
@@ -226,6 +269,7 @@ export class AutoSync implements AutoSyncApi {
     rt.closeWatcher = undefined;
     clearTimeout(rt.timer);
     rt.timer = undefined;
+    rt.timerDue = undefined;
   }
 
   private arm(st: PairState) {
@@ -237,10 +281,27 @@ export class AutoSync implements AutoSyncApi {
     this.schedule(st, st.queue.retryAt ? Math.max(0, st.queue.retryAt - Date.now()) : 0);
   }
 
+  /**
+   * 排定下一次请求。
+   *
+   * **不许用「更晚」的定时器顶掉「更早」的**：被顶掉的那次请求就没人接了，
+   * 这一轮同步会被推迟到下一个轮询周期（默认 30 秒）——
+   * 用户看到的却是「按了重新对账，界面一直显示待同步，什么也没发生」。
+   */
   private schedule(st: PairState, ms: number) {
+    // 旧代际回调可能在 removePair 后才出队；不得重建已解除配对的 runtime。
+    if (!this.isRegistered(st)) return;
+    this.notifyScheduleHook(ms);
     const rt = this.runtime(st.pair.id);
+    const due = Date.now() + ms;
+    if (rt.timerDue !== undefined && rt.timerDue <= due) return;
     clearTimeout(rt.timer);
-    rt.timer = setTimeout(() => this.request(st), ms);
+    rt.timerDue = due;
+    rt.timer = setTimeout(() => {
+      rt.timer = undefined;
+      rt.timerDue = undefined;
+      if (this.isRegistered(st)) this.request(st);
+    }, ms);
   }
 
   /**
@@ -248,6 +309,22 @@ export class AutoSync implements AutoSyncApi {
    * 只有基线中存在、之后消失的条目才算受管删除；
    * 软件未运行期间发生的删除不在基线里，按未受管处理（备份端保留）。
    */
+  /** 调用测试 hook 时同步/异步异常均不得影响生产调度路径。 */
+  private notifyTestHook(hook: (() => void | Promise<void>) | undefined): void {
+    try {
+      const result = hook?.();
+      if (result) void Promise.resolve(result).catch(() => undefined);
+    } catch { /* 测试接缝不得改变生产行为 */ }
+  }
+
+  /** 调用排程 hook；拒绝结果被消费，不泄漏未处理 rejection。 */
+  private notifyScheduleHook(ms: number): void {
+    try {
+      const result = this.options.onSchedule?.(ms);
+      if (result) void Promise.resolve(result).catch(() => undefined);
+    } catch { /* 测试接缝不得改变生产行为 */ }
+  }
+
   private async captureBaseline(st: PairState, rt: PairRuntime, replace = true): Promise<void> {
     try {
       const exclude = exclusion(st.pair);
@@ -264,7 +341,64 @@ export class AutoSync implements AutoSyncApi {
   private async hydrate(st: PairState, ledger: PairLedger): Promise<void> {
     let remote;
     try { remote = await ledger.read(); }
-    catch { return; }
+    catch (err) {
+      // 读不出来就必须让用户知道：账本读不出来时本机视图不会从介质重建，
+      // 用户看到的会是一份「少了很多记录」的假象。静默返回等于骗人。
+      const reason = err instanceof Error ? err.message : String(err);
+      this.event(st, '历史账本读取失败', `账本读不出来：${reason}；本机视图未从介质重建`);
+      return;
+    }
+    // 账本读不出来时不能装作没事：那份记录可能仍指向对象库里的历史对象。
+    // 损坏情况会在同步流程里被修复并上报；这里先把事实记下来。
+    // 损坏的事实先记下来，**不在这里发事件**：只有修完之后才知道到底修好没修好，
+    // 由 repairLedger 如实报告（修好了说已留证、修不好说要人工核对）。
+    // 在这里发事件等于每轮承诺一次「马上会修」，而同一份损坏每轮都会被读出来，
+    // 重复的同一条只会淹没真正的新变化。
+    const rt = this.runtime(st.pair.id);
+    if (remote.corruption.length) {
+      rt.corruptionFingerprint = corruptionFingerprint(remote.corruption);
+    } else {
+      rt.corruptionFingerprint = undefined;
+      // 账本已经干净了，上一次上报过的损坏随之作废。不清的话，等同样的
+      // 损坏再次出现时，它会被当成「已经报过」而静默吞掉——用户刚修好的账本
+      // 又坏了，却什么提示都收不到。
+      if (rt.reportedCorruption) {
+        // 判定「先前那份坏掉的账本是不是真的回来了」必须有**正面证据**：
+        // 光看「根目录下有没有目录」是不够的 —— 目录在但里面是另一份
+        // （甚至是空的）账本时，读出来照样是干净的；而探测本身失败时，
+        // 更是什么都没验证成。两种情况下都宣布「已恢复」都是没有依据的。
+        // 证据不足时只说「无法确认」，把话说到能说到的那一步为止。
+        const verdict = await ledger.verifyRecovered(rt.reportedCorruptionDetail ?? []);
+        if (verdict === 'recovered') {
+          rt.reportedCorruption = undefined;
+          rt.reportedCorruptionDetail = undefined;
+          rt.unverifiedNotified = false;
+          // 作废这件事要让用户看得见：否则「账本已经好了」和「程序还在记着
+          // 一份旧账」在界面上完全一样。
+          //
+          // 这里**只说已经确定发生的事**：先前损坏的那份账本已经回来了。
+          // 容量清理能不能恢复取决于留证文件还在不在——它可能这一刻才被写下、
+          // 也可能下一刻被人工删掉——提前替它表态，说的就是假的。清理是否停手
+          // 由另一条事件（历史账本曾损坏）如实交代。
+          this.event(st, '历史账本已恢复', '账本已能完整读出，先前报告的损坏已不存在');
+        } else if (verdict === 'vanished') {
+          rt.reportedCorruption = undefined;
+          rt.reportedCorruptionDetail = undefined;
+          rt.unverifiedNotified = false;
+          this.event(st, '历史账本已消失', '账本目录已不存在，先前报告的损坏已无处核对；介质上的历史请自行确认');
+        } else {
+          // 验证没成功就如实说没成功：不能替用户下「已经好了」的结论。
+          //
+          // 证据**必须留着**：清掉它等于把「下一轮再核对」变成空话——
+          // 下一轮就再也无从核对了。这里只把重复的提示压下去，
+          // 核对本身每一轮都在继续；证据一变，提示就重新出。
+          if (!rt.unverifiedNotified) {
+            rt.unverifiedNotified = true;
+            this.event(st, '历史账本无法确认', '无法确认先前损坏的账本是否已经回来（账本读不出来或内容对不上）；先前的损坏记录仍然有效，程序会保留证据并在下一轮再核对');
+          }
+        }
+      }
+    }
     if (!remote.commits.length && !remote.versions.length && !Object.keys(remote.index).length) return;
     st.history = { commits: remote.commits, versions: remote.versions };
     if (!Object.keys(st.index).length && Object.keys(remote.index).length) {
@@ -276,6 +410,56 @@ export class AutoSync implements AutoSyncApi {
     await this.save();
   }
 
+  /**
+   * 修复介质侧账本里读不出来的内容，并把损坏情况如实报给用户。
+   *
+   * 必须在**追加任何记录之前**调用：账本尾部若留着崩溃留下的半行，
+   * 直接追加会把新记录拼接到半行后面，两条粘成一条坏行，
+   * 随后的修复会把这条坏行整条丢弃——用户这一轮的恢复点就此从账本上消失。
+   */
+  private async repairLedger(st: PairState, ledger: PairLedger, gate: Gate): Promise<void> {
+    const found = await ledger.repairLedger(gate);
+    const rt = this.runtime(st.pair.id);
+    // 正常路径不做多余的读取：只有「本轮修过」或「hydrate 报了损坏」才复查。
+    if (!found.length && !rt.corruptionFingerprint) return;
+    // 修完必须复查：修完还坏，说明根本没修好，此时报「已修复、已留证」是假的。
+    let after: LedgerSnapshot | undefined;
+    try { after = await ledger.read(); } catch { after = undefined; }
+    if (!after) {
+      // 复查读不出来：不能据此断言「已经干净」，也不能断言「还坏着」。
+      // 本轮若确实修过，就如实说留证了；指纹留着，下一轮再核对。
+      if (found.length) this.event(st, '历史账本损坏', `${found.map(c => `${c.file}${c.tornTail ? '（尾部半行，已截回）' : '（中段损坏，坏行已隔离留证）'}`).join('、')}；损坏内容已留证在账本目录的 .corrupt-* 文件中；修后复查读不出来，账本是否干净未知，下一轮再核对`);
+      return;
+    }
+    const remaining = after.corruption;
+    if (!remaining.length) {
+      if (found.length) {
+        const detail = found
+          .map(c => `${c.file}${c.tornTail ? '（尾部半行，已截回）' : '（中段损坏，坏行已隔离留证）'}`)
+          .join('、');
+        this.event(st, '历史账本损坏', `${detail}；损坏内容已留证在账本目录的 .corrupt-* 文件中`);
+      }
+      rt.corruptionFingerprint = undefined;
+      rt.reportedCorruption = undefined;
+      // 修好了就没有「先前那份损坏」可言了，别留着过期证据。
+      rt.reportedCorruptionDetail = undefined;
+      rt.unverifiedNotified = false;
+      return;
+    }
+    // 还坏着：如告诉用户需要人工核对。同一份损坏不重复上报——
+    // 反复刷同一条只会让人以为程序在反复失败。
+    const fingerprint = corruptionFingerprint(remaining);
+    rt.corruptionFingerprint = fingerprint;
+    if (rt.reportedCorruption === fingerprint) return;
+    rt.reportedCorruption = fingerprint;
+    // 把明细也留一份：下一轮判定「这份账本是不是真的回来了」需要拿它做比对。
+    rt.reportedCorruptionDetail = [...remaining];
+    // 换了一份损坏：上一轮的「无法确认」提示随之作废。
+    rt.unverifiedNotified = false;
+    const detail = remaining.map(c => `${c.file}(${c.lines} 行)`).join('、');
+    this.event(st, '历史账本需要人工核对', `读不出来的内容：${detail}；自动修复未能处理，请人工核对介质上的账本文件`);
+  }
+
   /** 把索引与历史写回介质，并按容量上限清理（不删唯一完整恢复点）。 */
   private async writeLedger(st: PairState, ledger: PairLedger, gate: Gate): Promise<void> {
     const index: Record<string, LedgerIndexEntry> = {};
@@ -284,6 +468,17 @@ export class AutoSync implements AutoSyncApi {
     }
     await ledger.writeIndex(index, gate);
     await ledger.writeMeta(gate);
+    // 账本曾经坏过：容量清理必须停手，而且要一直停到留证被人工处理掉为止。
+    //
+    // 被读不出来的那几行可能仍然指向对象库里的历史对象——那些版本记录
+    // 已经不在账本里了，清理会把它们当成「无人引用的对象」删掉。
+    // 用户的恢复点就此消失，而且再也找不回来。
+    // 只在「本轮刚修过」时停手是不够的：下一轮账本已经干净，
+    // 清理会恢复，而丢失记录独占的对象仍可能被当成孤儿删掉。
+    if (await ledger.hasQuarantine()) {
+      this.event(st, '历史账本曾损坏', '损坏内容仍留有隔离件，本轮及后续轮次不做历史容量清理');
+      return;
+    }
     const liveHashes = new Set(Object.values(st.index).map(entry => entry.hash));
     const window = st.pair.retentionDays * 86_400_000;
     const pruned = await pruneHistory({
@@ -321,13 +516,28 @@ export class AutoSync implements AutoSyncApi {
   }
 
   private request(st: PairState) {
+    // watcher / timer 回调持有旧 PairState 闭包。解除配对后它可能仍已排进
+    // 串行队列；不得为了这条陈旧请求重新创建 runtime 或写入旧目标。
+    if (!this.isRegistered(st)) return;
     const rt = this.runtime(st.pair.id);
     if (rt.requested) return;
     rt.requested = true;
     const generation = rt.generation;
-    void this.run(async () => {
+    const queued = this.run(async () => {
       rt.requested = false;
-      if (!st.pair.enabled || !this.active || st.hold || generation !== rt.generation) return;
+      // 请求被入队之后，前面的 removePair 可能已经把它从注册表摘掉。
+      // 必须在任何代际重排 / IO 前再次验证对象仍注册。
+      if (!this.isRegistered(st) || !st.pair.enabled || !this.active || st.hold) return;
+      if (generation !== rt.generation) {
+        // 代际变了（期间重新武装过）：本轮作废。
+        //
+        // 但「这一轮该做的活」不能跟着作废：立即重排一轮。
+        // 不重排的话，这一轮的请求就此消失——队列里的脏标记永远挂着，
+        // 同步再也不发起，界面一直显示「待同步」，
+        // 直到下一个轮询周期（默认 30 秒）才重新动。
+        this.schedule(st, 0);
+        return;
+      }
       const q = st.queue;
       if (q.retryAt > Date.now()) { this.schedule(st, q.retryAt - Date.now()); return; }
       q.dirty = true;
@@ -338,9 +548,14 @@ export class AutoSync implements AutoSyncApi {
         st.epoch = epoch;
         await this.save();
         rt.state = 'scanning';
-        const ledger = new PairLedger(st.pair);
+        const ledger = this.makeLedger(st.pair);
         const gate = this.gateFor(st, rt, epoch);
         await this.hydrate(st, ledger);
+        // 账本有损坏时**先修复再对账**：否则本轮新增的 commit/version 会
+        // 直接追加到崩溃留下的半行后面，两条记录粘成一条坏行，
+        // 随后的修复会把这条粘在一起的坏行整条丢弃——用户这一轮的
+        // 恢复点就此从账本上消失。
+        await this.repairLedger(st, ledger, gate);
         await reconcile({
           pair: st.pair,
           permit: this.permit,
@@ -385,6 +600,8 @@ export class AutoSync implements AutoSyncApi {
       st.hold = { reason: '本机状态无法持久化，已停止写入', error: true };
       this.stopIO(st);
     });
+    this.notifyTestHook(this.options.onRequestQueued);
+    void queued.finally(() => this.notifyTestHook(this.options.onRequestFinished));
   }
 
   private async pairStatus(st: PairState): Promise<AutoPairStatus> {
@@ -478,7 +695,7 @@ export class AutoSync implements AutoSyncApi {
     if (!this.data.activePairId) this.data.activePairId = pair.id;
     const rt = this.runtime(pair.id);
     await this.captureBaseline(st, rt);
-    await this.hydrate(st, new PairLedger(pair));
+    await this.hydrate(st, this.makeLedger(pair));
     this.event(st, '配对已添加');
     await this.save();
     this.arm(st);
@@ -500,6 +717,13 @@ export class AutoSync implements AutoSyncApi {
       st.epoch = undefined;
       delete st.publish;
       rt.session.counted.clear();
+      // 旧介质的损坏证据不得沿用到新介质上：
+      // 先前报过的损坏说的是**那一份**账本，拿它去核对新介质，
+      // 得到的「已消失」「无法确认」都是拿旧证据说新介质的谎话。
+      rt.corruptionFingerprint = undefined;
+      rt.reportedCorruption = undefined;
+      rt.reportedCorruptionDetail = undefined;
+      rt.unverifiedNotified = false;
       await this.captureBaseline(st, rt);
     }
     this.event(st, '配对设置已更新');
@@ -513,6 +737,7 @@ export class AutoSync implements AutoSyncApi {
     this.stopIO(st);
     this.runtimes.delete(st.pair.id);
     this.data.pairs = this.data.pairs.filter(p => p.pair.id !== st.pair.id);
+    this.notifyTestHook(this.options.onPairRemoved);
     if (this.data.activePairId === st.pair.id) delete this.data.activePairId;
     // 介质上的历史记录保留：解除配对不删除备份介质里的任何东西。
     await this.save();
@@ -545,6 +770,11 @@ export class AutoSync implements AutoSyncApi {
     return this.data.pairs.find(p => p.pair.id === pairId);
   }
 
+  /** 按对象身份判断配对仍注册；同一 ID 的新配对不是旧配对的延续。 */
+  private isRegistered(st: PairState): boolean {
+    return this.data.pairs.some(pair => pair === st);
+  }
+
   resume = (pairId: string) => this.run(async () => {
     const st = this.mustFind(pairId);
     if (!st.pair.enabled || !this.active) throw new Error('请打开窗口并开启自动备份');
@@ -568,13 +798,26 @@ export class AutoSync implements AutoSyncApi {
     if (st.epoch !== epoch || st.hold?.block) throw new Error('请先确认介质并重新对账');
     const gate = this.gateFor(st, rt, epoch);
     await checkRoot(st.pair.targetRoot);
-    const ledger = new PairLedger(st.pair);
+    const ledger = this.makeLedger(st.pair);
     const source = entry.hash ? ledger.objectPath(entry.hash) : await recyclePath(st.pair, entry.id);
     const stat = await statMaybe(source);
     if (!stat?.isFile() || stat.size !== entry.size) throw new Error('回收项内容已不可用');
     const dest = await safePath(st.pair.targetRoot, entry.relPath);
-    const verifyDest = async () => { if (await statMaybe(dest)) throw new Error('备份端已有同名项，未覆盖'); };
+    // 发布前核对：复制所得字节必须与所选版本的登记哈希一致。
+    // 临时件回读只能证明「复制忠实于当前对象」——对象本身损坏时它照样通过，
+    // 损坏内容会被当成正常还原写回目标。
+    const verifyDest = async (computed?: string) => {
+      if (computed !== undefined && entry.hash && computed !== entry.hash) {
+        throw fault('CONFLICT', '回收项内容与登记哈希不符，已保留现有目标与历史证据');
+      }
+      if (await statMaybe(dest)) throw new Error('备份端已有同名项，未覆盖');
+    };
     await verifyDest();
+    // 来源内容核对放在目标占用检查之后：目标已被占用时这次还原根本发不出去，
+    // 不必先把整个对象读一遍。发布前的校验仍是权威判据。
+    if (entry.hash && await hashFile(source) !== entry.hash) {
+      throw fault('CONFLICT', '回收项内容与登记哈希不符，已保留现有目标与历史证据');
+    }
     await gate(); await fs.mkdir(path.dirname(dest), { recursive: true });
     const part = await safePath(st.pair.targetRoot, path.posix.join(path.posix.dirname(entry.relPath), `.aut-part-restore-${entry.id}`));
     const hash = await copyAtomic(source, dest, part, 0, gate, verifyDest, true);
@@ -594,13 +837,25 @@ export class AutoSync implements AutoSyncApi {
     if (st.epoch !== epoch || st.hold?.block) throw new Error('请先确认介质并重新对账');
     const gate = this.gateFor(st, rt, epoch);
     await checkRoot(st.pair.targetRoot);
-    const ledger = new PairLedger(st.pair);
+    const ledger = this.makeLedger(st.pair);
     const dest = await safePath(st.pair.targetRoot, version.relPath);
     const live = await statMaybe(dest);
     // 内容来源：优先介质对象库；现存文件内容一致时也可用。
     let source: string | undefined;
     const object = version.hash ? ledger.objectPath(version.hash) : undefined;
-    if (object && await statMaybe(object)) source = object;
+    const objectStat = object ? await statMaybe(object) : undefined;
+    if (object && objectStat) {
+      // 对象必须是普通文件：FIFO 之类的特殊文件不能直接开读流
+      // （没有写端会把整条操作队列卡住），符号链接也不跟随。
+      if (!objectStat.isFile()) throw fault('CONFLICT', '历史对象条目类型异常');
+      // 对象可能事后损坏。必须在归档当前内容**之前**核对：
+      // 先归档再发现不符，会留下一条没有对应提交的版本记录，
+      // 回收站视图会把它当成可撤回项，重试一次就多一条。
+      if (await hashFile(object) !== version.hash) {
+        throw fault('CONFLICT', '历史版本内容与登记哈希不符，已保留现有目标与历史证据');
+      }
+      source = object;
+    }
     else if (live?.isFile() && await hashFile(dest) === version.hash) source = dest;
     if (!source) throw new Error('该版本内容未保留，无法撤回');
     const commitId = randomUUID();
@@ -610,7 +865,12 @@ export class AutoSync implements AutoSyncApi {
     }
     const parent = path.posix.dirname(version.relPath);
     const part = await safePath(st.pair.targetRoot, `${parent === '.' ? '' : `${parent}/`}.aut-part-restore-${version.id}`);
-    const verifyDest = async () => {
+    const verifyDest = async (computed?: string) => {
+      // 发布前核对：必须与所选版本的登记哈希一致，否则不得覆盖目标。
+      // 对象库里的对象可能事后损坏，仅靠临时件回读挡不住。
+      if (computed !== undefined && computed !== version.hash) {
+        throw fault('CONFLICT', '历史版本内容与登记哈希不符，已保留现有目标与历史证据');
+      }
       const fresh = await statMaybe(dest);
       if ((fresh && stamp(fresh)) !== (live && stamp(live))) throw fault('CONFLICT', '备份文件在对账后被修改');
     };
@@ -624,14 +884,19 @@ export class AutoSync implements AutoSyncApi {
 
   history = (pairId: string) => this.run(async () => {
     const st = this.mustFind(pairId);
-    const ledger = new PairLedger(st.pair);
+    const ledger = this.makeLedger(st.pair);
     try {
       const remote = await ledger.read();
       if (remote.commits.length || remote.versions.length) {
         st.history = { commits: remote.commits, versions: remote.versions };
         await this.save();
       }
-    } catch { /* 介质不可达：使用本机缓存视图 */ }
+    } catch (err) {
+      // 读不出来不能装作没事：用户看到的是本机缓存视图，介质上的历史其实
+      // 读不到。至少如实说一声，别让「看起来有历史」变成假象。
+      const reason = err instanceof Error ? err.message : String(err);
+      this.event(st, '历史账本读取失败', `账本读不出来：${reason}；当前显示的是本机缓存视图`);
+    }
     return { commits: [...st.history.commits], versions: [...st.history.versions] } satisfies AutoHistory;
   });
 
