@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import type { EvidenceItem, MediaAssessment } from '../../shared/types';
+import type { EvidenceItem, EvidenceScope, EvidenceStatus, MediaAssessment } from '../../shared/types';
 
 /**
  * 介质探测与风险判定。
@@ -130,8 +130,8 @@ export interface AssessInput {
   quarantined: boolean;
 }
 
-function evidence(kind: string, detail: string): EvidenceItem {
-  return { kind, detail, at: Date.now() };
+function evidence(kind: string, detail: string, status: EvidenceStatus, scope: EvidenceScope): EvidenceItem {
+  return { kind, detail, at: Date.now(), status, scope };
 }
 
 /**
@@ -147,30 +147,30 @@ export function assessMedia(input: AssessInput): MediaAssessment {
 
   if (probe.identity) {
     evidenceList.push(
-      evidence('介质身份', `dev=${probe.identity.dev} ino=${probe.identity.ino} birth=${probe.identity.birth}`),
+      evidence('介质身份', `dev=${probe.identity.dev} ino=${probe.identity.ino} birth=${probe.identity.birth}`, 'ok', 'target'),
     );
   }
 
   if (!probe.reachable) {
-    evidenceList.push(evidence('可达性', `目标根不可读：${probe.errorText ?? '未知错误'}`));
+    evidenceList.push(evidence('可达性', `目标根不可读：${probe.errorText ?? '未知错误'}`, 'error', 'target'));
   } else {
-    evidenceList.push(evidence('可达性', '目标根可读'));
-    evidenceList.push(evidence('可写性', probe.writable ? '目标根可写' : `目标根只读：${probe.errorText ?? '未知错误'}`));
+    evidenceList.push(evidence('可达性', '目标根可读', 'ok', 'target'));
+    evidenceList.push(evidence('可写性', probe.writable ? '目标根可写' : `目标根只读：${probe.errorText ?? '未知错误'}`, probe.writable ? 'ok' : 'error', 'target'));
   }
 
   if (expected && probe.identity && !sameMedia(expected, probe.identity)) {
-    evidenceList.push(evidence('介质身份', '身份与计划阶段记录不一致，目标路径可能已被其他设备占用'));
+    evidenceList.push(evidence('介质身份', '身份与计划阶段记录不一致，目标路径可能已被其他设备占用', 'error', 'target'));
   }
 
   evidenceList.push(
-    evidence('备份集', manifestReadable ? '目标端备份索引可读' : '目标端备份索引不可读'),
+    evidence('备份集', manifestReadable ? '目标端备份索引可读' : '目标端备份索引不可读', manifestReadable ? 'ok' : 'warning', 'index'),
   );
-  evidenceList.push(evidence('IO 错误', `累计 ${ioErrors} 次`));
-  evidenceList.push(evidence('校验失败', `累计 ${verifyFailures} 次`));
+  evidenceList.push(evidence('IO 错误', `累计 ${ioErrors} 次`, ioErrors > 0 ? 'warning' : 'ok', 'io'));
+  evidenceList.push(evidence('校验失败', `累计 ${verifyFailures} 次`, verifyFailures > 0 ? 'error' : 'ok', 'io'));
 
   // ---- L2：硬性禁止写盘 ----
   if (quarantined) {
-    evidenceList.push(evidence('隔离', '该介质已被标记为隔离观察，禁止写盘'));
+    evidenceList.push(evidence('隔离', '该介质已被标记为隔离观察，禁止写盘', 'error', 'target'));
     return {
       level: 'L2',
       confidence: 1,
@@ -187,6 +187,8 @@ export function assessMedia(input: AssessInput): MediaAssessment {
       evidence(
         '故障性质',
         hardFailure ? `错误码 ${probe.errorCode} 属于介质不可用类` : '无法读取目标根，性质待定',
+        hardFailure ? 'error' : 'warning',
+        'target',
       ),
     );
     return {

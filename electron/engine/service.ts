@@ -9,6 +9,8 @@ import { driveLetter, redactLog } from './security';
 import { BackupTransaction } from './transaction';
 import { hashFile } from './hash';
 import { scanTree, META_DIR } from './scan';
+import { RESERVED_FILES, RESERVED_TREES, isForeignEngineEntry, reservedConflict } from './reserved';
+import { verifyRegisteredFiles } from './verify';
 import { buildPlan, type PlanResult } from './planner';
 import { CopyPool, type CopyResult } from './pool';
 import { JournalStore, partFileName, sameTargetPath, type DeleteTx, type Journal, type JournalTask } from './journal';
@@ -27,12 +29,14 @@ import {
   metaDir,
   partsDir,
   readManifest,
+  readStrictManifest,
   syncDirectory,
   writeJsonAtomic,
   type Manifest,
   type ManifestEntry,
 } from './manifest';
 import type {
+  HealthReport,
   AppState,
   LogEntry,
   LogLevel,
@@ -47,29 +51,88 @@ import type {
   ScanResult,
   SyncMode,
   WriteGate,
+  WritePermit,
 } from '../../shared/types';
 
 /**
  * 自动写入要求确认卷健康（需求 §3.2）；用户显式指定目录的查重清理落系统回收站，可恢复，
  * 因此仅放宽「卷健康未知」。两种模式仍拦截不可达、隔离、L2、只读和需修复的介质。
  */
-export function decideWriteGate(facts: {
+/**
+ * 卷级健康口径。
+ *
+ * 只拿到盘符**不等于**健康：卷记录读到、且健康状态不是「未报告」才算确认，
+ * 否则一律标成 unknown——宁可要求人工确认，也不伪造健康结论。
+ */
+function volumeHealthOf(
+  report: { volume: string | null; diskReadOnly?: boolean | null; volumeHealthKnown?: boolean },
+  repairNeeded: boolean,
+  reachable: boolean,
+): WriteGate['volumeHealth'] {
+  if (repairNeeded) return 'repair-required';
+  // 目标不可达时，拿不到**这个介质**的卷级事实：所在卷（哪怕是系统盘）健康与否
+  // 都不能拿来替一个够不着的目标背书，否则等于伪造健康结论。
+  if (!reachable) return 'unknown';
+  if (report.volume === null || report.diskReadOnly === true || report.volumeHealthKnown !== true) return 'unknown';
+  return 'healthy';
+}
+
+/**
+ * 写入闸门的事实集合。
+ *
+ * 闸门、许可与界面提示都从同一份事实推导，避免出现第二套安全规则。
+ */
+export interface WriteGateFacts {
   reachable: boolean;
   isolated: boolean;
   level: WriteGate['level'];
   readOnly: boolean;
   repairNeeded: boolean;
   volumeHealth: WriteGate['volumeHealth'];
-}, mode: 'automatic' | 'user-directed'): { allowed: boolean; reason?: string } {
-  const { reachable, isolated, level, readOnly, repairNeeded, volumeHealth } = facts;
+  /** 目标根目录本身是否可写（目录级访问权限，与卷级写保护是两回事） */
+  targetWritable: boolean;
+}
+
+export function decideWriteGate(facts: WriteGateFacts, mode: 'automatic' | 'user-directed'): { allowed: boolean; reason?: string } {
+  const { reachable, isolated, level, readOnly, repairNeeded, volumeHealth, targetWritable } = facts;
   let reason: string | undefined;
   if (!reachable) reason = '目标介质不可达';
   else if (isolated) reason = '介质处于隔离观察，禁止写入';
   else if (level === 'L2') reason = '容灾判定为 L2，禁止写入';
   else if (readOnly) reason = '系统报告磁盘为只读';
+  else if (!targetWritable) reason = '目标根不可写，无法写入目标目录';
   else if (repairNeeded || volumeHealth === 'repair-required') reason = '卷需要人工检查，禁止写入；处理完成并重新对账后再继续';
   else if (mode === 'automatic' && volumeHealth === 'unknown') reason = '未能确认卷健康（权限不足或当前平台不支持卷级检查），按默认只读处理；自动写入已禁止';
   return { allowed: reason === undefined, reason };
+}
+
+/**
+ * 把闸门事实翻译成界面可以直接执行的写入许可。
+ *
+ * 三态契约：
+ * - 阻断（allowed=false）：界面必须禁用写入，并原样展示 reason；
+ * - 需确认（allowed=true 且 requiresConfirmation=true）：允许写入，但卷级健康
+ *   无法判定，须由用户显式确认后继续；
+ * - 放行：允许写入。
+ *
+ * 措辞上必须与结论一致：证据不足时**不得**再自称「保持只读」，
+ * 否则界面会同时表达「不要写入」与「可以开始写入」两个相反结论。
+ */
+export function deriveWritePermit(
+  facts: WriteGateFacts,
+  mode: 'automatic' | 'user-directed',
+): { verdict: WritePermit['verdict']; reason: string | null } {
+  const decision = decideWriteGate(facts, mode);
+  if (!decision.allowed) {
+    return { verdict: 'blocked', reason: decision.reason ?? '写入已被阻断' };
+  }
+  if (facts.volumeHealth === 'unknown') {
+    return {
+      verdict: 'confirm',
+      reason: '未能确认卷级健康状况（权限不足或当前平台不支持卷级检查）；当前未发现明确写入阻断，继续前请自行确认目标介质状态。',
+    };
+  }
+  return { verdict: 'allowed', reason: null };
 }
 
 /** 判定为「介质不可用」的错误码：拔盘、拔出 USB、总线错误 */
@@ -245,12 +308,21 @@ export interface StartOptions {
   allowMassDelete: boolean;
   /** 断点续传：校验并复用未完成任务的 .part 分片 */
   resume: boolean;
+  /**
+   * 「需人工确认」回执：携带用户确认时的许可修订号。
+   *
+   * 卷级健康无法判定时，许可要求用户显式确认；回执必须与当前许可的修订号
+   * 一致，判定更新后旧回执自动失效。主进程强制校验。
+   */
+  acknowledgeRisk?: number;
 }
 
 /** 恢复选项：用户确认后才允许继续写入 */
 export interface RecoverOptions {
   /** 用户已确认在当前介质上继续（隔离解除或 L1 放行） */
   confirmed: boolean;
+  /** 「需人工确认」回执：携带用户确认时的许可修订号 */
+  acknowledgeRisk?: number;
 }
 
 /**
@@ -266,6 +338,19 @@ export interface RecoverOptions {
  *  - 重新插入后不自动续传：必须重新扫描、重新生成计划、由用户确认
  *  - 旧计划在介质变更后立即失效，避免用过期计划执行删除
  */
+/**
+ * 回执校验：许可要求人工确认时，确认回执必须与当前许可的修订号一致。
+ *
+ * 抽成纯函数是为了让这条安全语义在任何平台上都能被直接验证——
+ * 有卷级探测能力的平台上判定多半是「放行」，那条分支不会走到这里。
+ */
+export function checkRiskAcknowledgement(permit: WritePermit | null | undefined, acknowledged?: number): void {
+  if (!permit || permit.verdict !== 'confirm') return;
+  if (acknowledged === undefined || acknowledged !== permit.revision) {
+    throw new Error('目标介质判定为「需人工确认」：请先确认目标介质状态后再开始备份。');
+  }
+}
+
 export class BackupService extends EventEmitter {
   private state: AppState;
   private journal: JournalStore;
@@ -279,6 +364,14 @@ export class BackupService extends EventEmitter {
   private failedRechecks = 0;
   private readonly baseline = new Map<string, { identity?: string; readErrors?: number; writeErrors?: number; temperature?: number; wear?: number }>();
   private blockedTargets = new Set<string>();
+  /** 逐目标缓存写入许可：后台对别的目标的判定不得覆盖当前目标的结论 */
+  private permits = new Map<string, WritePermit>();
+  /** 许可修订号：结论变化时递增，让过期的确认回执自动失效 */
+  private permitRevision = 0;
+  /** 已做过完整分层判定的目标：它们的许可比计划期的廉价探测更权威 */
+  private fullyAssessed = new Set<string>();
+  /** 最近一次完整分层判定结果（按目标缓存）：计划期的廉价许可要沿用其中的分层事实 */
+  private reports = new Map<string, HealthReport>();
   private cancelled = false;
   private mediaLost = false;
   private journalDirty = false;
@@ -338,6 +431,7 @@ export class BackupService extends EventEmitter {
       confirmReason: '',
       recoverableJob: null,
       assessment: null,
+      writePermits: {},
       quarantine: null,
     };
   }
@@ -722,12 +816,49 @@ export class BackupService extends EventEmitter {
       this.state.sourceRoot = sourceRoot;
       this.state.targetRoot = targetRoot;
       this.state.syncMode = syncMode;
+      // 许可必须跟着计划一起出现：界面据此决定能不能开始写入，
+      // 主进程据此强制「需人工确认」回执。这里只用计划本来就要做的只读探测，
+      // 完整的分层判定留给「只读检查/重新检测」与写前现场复核。
+      const probePermit = await this.buildProbePermit(targetRoot, probe);
+      this.permits.set(targetRoot, probePermit);
+      this.publishPermit(targetRoot, probePermit);
+      this.trimCaches();
 
+      // 源目录本身可能就是一份备份（`.backup-studio/manifest.json` 是引擎清单）：
+      // 那时它的引擎状态属于「别的备份的内部数据」，重复备份没有意义，
+      // 还会和本次任务在目标端的保留路径撞车。这种情况下把它们排除在源端扫描之外。
+      // 判定必须严格：形状像但不是引擎清单的用户文件，不能被当成备份而整棵漏备。
+      const sourceIsBackup = (await readStrictManifest(sourceRoot)) !== null;
       const [source, target, manifest] = await Promise.all([
-        scanTree(sourceRoot, { excludeMetaDir: false }),
+        scanTree(sourceRoot, {
+          excludeMetaDir: false,
+          exclude: sourceIsBackup ? isForeignEngineEntry : undefined,
+        }),
         scanTree(targetRoot, { excludeMetaDir: true }),
         readManifest(targetRoot),
       ]);
+
+      if (sourceIsBackup) {
+        this.log('info', `源目录本身是一份备份，其引擎内部状态（${META_DIR}）不重复备份；其中的其它文件仍会照常备份`);
+      }
+
+      // 引擎在目标端要用 `.backup-studio` 存放暂存件、索引与归档。
+      // 源目录里若也有同名路径，复制过去就会被本次任务覆盖或删除——
+      // 这种冲突无法无损处理，必须在写入前阻断，而不是备份完再告诉用户文件没了。
+      const conflicts: string[] = [];
+      for (const relPath of source.files.keys()) {
+        if (reservedConflict(relPath, 'file') !== null) conflicts.push(relPath);
+      }
+      for (const relPath of source.dirs) {
+        if (reservedConflict(relPath, 'dir') !== null) conflicts.push(relPath);
+      }
+      if (conflicts.length > 0) {
+        throw new Error(
+          `源目录包含备份引擎的保留路径（${conflicts.length} 个，如 ${conflicts.slice(0, 3).join('、')}）：` +
+            `这些路径在目标端会被本次任务的暂存、索引或清理动作覆盖或删除，无法无损完成备份。` +
+            `请把源目录里 ${META_DIR} 下与引擎内部状态同名的那几项改名或移出，再重新扫描。`,
+        );
+      }
 
       if (source.files.size === 0) {
         this.log('warn', '源目录中没有可备份的文件');
@@ -876,6 +1007,8 @@ export class BackupService extends EventEmitter {
       throw new Error('检测到上次中断记录，请通过「恢复并重扫」确认后继续。');
     }
     await this.guardTargetWrites(targetRoot);
+    // 许可要求人工确认时，必须带上与当前许可修订号一致的用户确认回执。
+    await this.requireRiskAcknowledgement(targetRoot, options.acknowledgeRisk);
     this.ioErrors = 0;
     this.verifyFailures = 0;
     this.copiedBytes = 0;
@@ -913,11 +1046,17 @@ export class BackupService extends EventEmitter {
     // A crash after publishing the manifest needs only cleanup, never a replay.
     if (recovering?.transaction && (await readManifest(targetRoot))?.generation === journal.jobId) {
       await syncDirectory(metaDir(targetRoot));
-      await this.finishCommitted(targetRoot, journal);
+      await this.cleanupCommittedArtifacts(targetRoot, journal);
+      // 恢复快路同样要过回读：不能只清目录就报完成
+      const published = await readManifest(targetRoot);
+      if (published) await this.verifyCommitted(targetRoot, published);
+      await this.settleCommitted(journal);
       this.running = false;
       this.setPhase('completed');
       return;
     }
+    // 阻断必须发生在任何目标端写入之前：写账本、建暂存目录都在这之后。
+    this.assertPlanHasNoReservedPaths(this.currentPlan);
     await this.assertTargetWritable();
     await this.journal.write(journal);
     if (journal !== recovering) await this.journal.setActive(journal.jobId);
@@ -998,6 +1137,15 @@ export class BackupService extends EventEmitter {
     if (this.blockedTargets.has(await this.targetRiskKey(job.targetRoot))) {
       throw new Error('卷需人工检查，仍须保持只读；中断账本已保留。');
     }
+    // 恢复路径的写入同样受写入许可约束。
+    // 恢复卡片上的「确认并重扫」本来就是「用户已确认在当前介质上继续」的显式授权，
+    // 因此它可以充当需确认时的回执；调用方另外带回执时以回执为准。
+    const recoveryPermit = this.permits.get(job.targetRoot) ?? null;
+    checkRiskAcknowledgement(
+      recoveryPermit,
+      options.acknowledgeRisk ?? (options.confirmed ? recoveryPermit?.revision : undefined),
+    );
+
     // 恢复前先按删除账本对账：把「已删除但未登记」的条目补进回收索引，
     // 把状态不明的条目标成 uncertain。对账是幂等的，可重复执行。
     //
@@ -1027,7 +1175,11 @@ export class BackupService extends EventEmitter {
         await this.assertTargetWritable();
         await syncDirectory(metaDir(job.targetRoot));
         await this.assertDeletesReconciled(job, reconcileError);
-        await this.finishCommitted(job.targetRoot, job);
+        await this.cleanupCommittedArtifacts(job.targetRoot, job);
+        // 同代快路同样要过回读：不能只清目录就报完成
+        const published = await readManifest(job.targetRoot);
+        if (published) await this.verifyCommitted(job.targetRoot, published);
+        await this.settleCommitted(job);
         this.setPhase('completed');
       } finally {
         this.running = false;
@@ -1060,6 +1212,8 @@ export class BackupService extends EventEmitter {
         syncMode: job.syncMode,
         allowMassDelete: false,
         resume: true,
+        // 恢复卡片的「确认并重扫」就是需确认时的回执，必须一路带进实际写入路径。
+        acknowledgeRisk: recoveryPermit?.revision,
       }, job);
     } finally {
       this.recoveryDeleteScope = null;
@@ -1090,8 +1244,218 @@ export class BackupService extends EventEmitter {
     // 判定结论必须带上它针对的目标：换了目标，上一份判定就不再适用。
     report.assessment.targetRoot = targetRoot;
     this.state.assessment = report.assessment;
+    // 许可与判定同源：界面只消费主进程的裁决，不再自行推导安全规则。
+    const permit = await this.buildWritePermit(targetRoot, report);
+    this.permits.set(targetRoot, permit);
+    this.reports.set(targetRoot, report);
+    this.publishPermit(targetRoot, permit);
+    this.fullyAssessed.add(targetRoot);
+    this.trimCaches();
     this.emitState();
     return report;
+  }
+
+  /**
+   * 写入闸门的事实集合：闸门、许可与界面提示共用同一份事实。
+   *
+   * 只有确实取到卷级事实且未发现问题时才敢称「健康」；否则标注能力缺失，
+   * 不伪造健康结论。
+   */
+  private async writeFacts(targetRoot: string, report: HealthReport): Promise<WriteGateFacts> {
+    const riskKey = await this.targetRiskKey(targetRoot);
+    const mark = this.state.quarantine;
+    const isolated = Boolean(mark && !mark.released && (await this.targetRiskKey(mark.targetRoot)) === riskKey);
+    const level = report.assessment.level;
+    const reachable = report.condition !== 'unreachable';
+    const readOnly = report.diskReadOnly === true;
+    const repairNeeded = report.condition === 'filesystem-repair' || this.blockedTargets.has(riskKey);
+    const volumeHealth = volumeHealthOf(report, repairNeeded, reachable);
+    // 目录级可写性：卷可写不等于该目录可写。null 表示能力缺失，按不阻断处理，
+    // 真正开写前引擎还会再做一次现场探测。
+    const targetWritable = report.targetWritable !== false;
+    return { reachable, isolated, level, readOnly, repairNeeded, volumeHealth, targetWritable };
+  }
+
+  /**
+   * 生成写入许可：主进程给界面的**唯一**裁决。
+   *
+   * 手动备份的目标由用户显式指定，按 user-directed 模式裁决：
+   * 卷级健康无法判定不等于禁止写入，但必须先由用户显式确认。
+   */
+  private async buildWritePermit(targetRoot: string, report: HealthReport): Promise<WritePermit> {
+    const facts = await this.writeFacts(targetRoot, report);
+    const { verdict, reason } = deriveWritePermit(facts, 'user-directed');
+    const evidence = report.assessment.evidence.map((item) => `${item.kind}：${item.detail}`);
+    if (facts.volumeHealth === 'unknown') evidence.push('卷健康未知：未能确认卷级健康状况');
+    if (report.assessment.suggestion) evidence.push(`建议：${report.assessment.suggestion}`);
+    return this.makePermit(targetRoot, verdict, reason, {
+      level: report.assessment.level,
+      condition: report.condition,
+      volumeHealth: facts.volumeHealth,
+      evidence,
+      mediaIdentity: report.mediaIdentity ?? null,
+    });
+  }
+
+  /**
+   * 计划期的廉价许可：只用计划本来就要做的只读探测（可达性 + 目录可写性）。
+   *
+   * 完整的分层判定要读卷级信息，单次耗时数秒，不能塞进每次计划——
+   * 否则一次重扫就要等好几秒。探测只敢说「未发现明确写入阻断」，
+   * 因此结论落在「需人工确认」，由用户确认放行；
+   * 真正开写前引擎还会再做一次现场判定。
+   */
+  private async buildProbePermit(targetRoot: string, probe: MediaProbe): Promise<WritePermit> {
+    const riskKey = await this.targetRiskKey(targetRoot);
+    const mark = this.state.quarantine;
+    const isolated = Boolean(mark && !mark.released && (await this.targetRiskKey(mark.targetRoot)) === riskKey);
+    // 分层事实沿用最近一次完整判定（若做过），可达性与目录可写性用**本次**探测：
+    // 目录可能刚刚变成只读，旧判定不会知道。
+    const report = this.reports.get(targetRoot);
+    const repairNeeded = report?.condition === 'filesystem-repair' || this.blockedTargets.has(riskKey);
+    const facts: WriteGateFacts = {
+      reachable: probe.reachable,
+      isolated,
+      level: report?.assessment.level ?? 'L1',
+      readOnly: report?.diskReadOnly === true,
+      repairNeeded,
+      volumeHealth: report ? volumeHealthOf(report, repairNeeded, probe.reachable) : 'unknown',
+      targetWritable: probe.writable,
+    };
+    const { verdict, reason } = deriveWritePermit(facts, 'user-directed');
+    const evidence = [
+      `可达性：${probe.reachable ? '目标根可读' : `目标根不可读：${probe.errorText ?? '未知错误'}`}`,
+      `可写性：${probe.writable ? '目标根可写' : '目标根只读'}`,
+    ];
+    return this.makePermit(targetRoot, verdict, reason, {
+      level: report?.assessment.level ?? 'L1',
+      condition: report?.condition ?? 'uncertain',
+      volumeHealth: facts.volumeHealth,
+      evidence,
+      mediaIdentity: probe.identity ? `${probe.identity.dev}:${probe.identity.ino}:${probe.identity.birth}` : null,
+    });
+  }
+
+  /**
+   * 构造许可。
+   *
+   * 修订号只在**结论变化**时递增：否则引擎自己的复检会把用户刚做出的
+   * 确认回执作废（同一份结论不该让用户重新确认）。
+   */
+  private makePermit(
+    targetRoot: string,
+    verdict: WritePermit['verdict'],
+    reason: string | null,
+    extra: { level: WritePermit['level']; condition: WritePermit['condition']; volumeHealth: WritePermit['volumeHealth']; evidence: string[]; mediaIdentity?: string | null },
+  ): WritePermit {
+    const previous = this.permits.get(targetRoot);
+    // 结论、理由与介质身份三者都没变时，才沿用旧修订号：
+    // 同一路径换了介质也算换了对象，旧的确认回执必须失效。
+    const sameObject = previous?.mediaIdentity === (extra.mediaIdentity ?? null);
+    const revision = previous && previous.verdict === verdict && previous.reason === reason && sameObject
+      ? previous.revision
+      : ++this.permitRevision;
+    const base = {
+      evidence: extra.evidence,
+      targetRoot,
+      level: extra.level,
+      condition: extra.condition,
+      volumeHealth: extra.volumeHealth,
+      mediaIdentity: extra.mediaIdentity ?? null,
+      revision,
+      at: now(),
+    };
+    if (verdict === 'blocked') return { ...base, verdict: 'blocked', reason: reason ?? '写入已被阻断' };
+    if (verdict === 'confirm') return { ...base, verdict: 'confirm', reason: reason ?? '需要人工确认目标介质状态' };
+    return { ...base, verdict: 'allowed', reason: null };
+  }
+
+  /**
+   * 发布许可：按目标根写入许可表。
+   *
+   * 后台对别的目标做的判定不得覆盖当前目标的结论——
+   * 否则界面会拿着别的目标的许可去放行当前目标。
+   */
+  private publishPermit(targetRoot: string, permit: WritePermit): void {
+    // 重新插入到末尾 = 最近使用；被挤出去的应该是最久没用的那条，
+    // 而不是当前选中的目标。
+    const next = { ...this.state.writePermits };
+    delete next[targetRoot];
+    next[targetRoot] = permit;
+    const keys = Object.keys(next);
+    for (const key of keys.slice(0, Math.max(0, keys.length - 8))) delete next[key];
+    this.state.writePermits = next;
+  }
+
+  /** 内部缓存有界：许可与判定报告按目标缓存，但不必无限增长。 */
+  private trimCaches(): void {
+    const limit = 16;
+    for (const cache of [this.permits, this.reports]) {
+      const keys = [...cache.keys()];
+      for (const key of keys.slice(0, Math.max(0, keys.length - limit))) cache.delete(key);
+    }
+    if (this.fullyAssessed.size > limit) {
+      for (const key of [...this.fullyAssessed].slice(0, this.fullyAssessed.size - limit)) this.fullyAssessed.delete(key);
+    }
+  }
+
+  /**
+   * 刷新目标的有效许可：判定一次并发布。
+   *
+   * 判定失败时不阻断计划，但许可不会缺席——界面据此要求人工确认，
+   * 而不是把「没有许可」当成「可以写」。
+   */
+  private async refreshPermit(targetRoot: string): Promise<WritePermit> {
+    try {
+      await this.inspectTarget(targetRoot, true);
+    } catch (err) {
+      // 判定失败时的兜底：隔离中一律阻断，其余情况要求人工确认——
+      // 绝不能把「没判定出来」当成「可以写」。
+      const quarantined = Boolean(this.state.quarantine && !this.state.quarantine.released
+        && this.state.quarantine.targetRoot === targetRoot);
+      const permit: WritePermit = {
+        verdict: quarantined ? 'blocked' : 'confirm',
+        reason: quarantined
+          ? '介质处于隔离观察，禁止写入'
+          : `未能完成目标介质判定（${errorText(err)}）：当前未发现明确写入阻断，继续前请自行确认目标介质状态。`,
+        evidence: [],
+        targetRoot,
+        level: 'L1',
+        condition: 'uncertain',
+        volumeHealth: 'unknown',
+        revision: ++this.permitRevision,
+        at: now(),
+      };
+      this.permits.set(targetRoot, permit);
+      this.publishPermit(targetRoot, permit);
+      this.fullyAssessed.add(targetRoot);
+      this.emitState();
+      return permit;
+    }
+    return this.permits.get(targetRoot) as WritePermit;
+  }
+
+  /** 当前目标的有效许可：缺失时现场判定一次，避免「没有许可＝放行」。 */
+  private async currentPermit(targetRoot: string): Promise<WritePermit | null> {
+    const cached = this.permits.get(targetRoot);
+    if (cached) return cached;
+    try {
+      await this.inspectTarget(targetRoot, true);
+    } catch {
+      return null;
+    }
+    return this.permits.get(targetRoot) ?? null;
+  }
+
+  /**
+   * 强制「需人工确认」回执。
+   *
+   * 卷级健康无法判定时许可要求用户显式确认；回执必须带上当前许可的修订号，
+   * 判定一旦更新旧回执自动失效。主进程强制校验，界面绕不过去。
+   */
+  private async requireRiskAcknowledgement(targetRoot: string, acknowledged?: number): Promise<void> {
+    const permit = await this.currentPermit(targetRoot);
+    checkRiskAcknowledgement(permit, acknowledged);
   }
 
   private async targetRiskKey(targetRoot: string): Promise<string> {
@@ -1106,27 +1470,27 @@ export class BackupService extends EventEmitter {
     // L2 是已确认的介质层故障，必须拒绝。
     // L1 只表示「分层证据不足」，不等于禁止写入：证据不足往往源于平台不支持
     // 卷级探测或权限不足，若一律拒绝会让无卷级权限的环境完全无法备份。
-    // 是否放行由 writeGate/decideWriteGate 按 volumeHealth 与模式裁决。
-    if (report?.assessment.level === 'L2' || report?.diskReadOnly === true || this.blockedTargets.has(riskKey) || (mark && !mark.released && await this.targetRiskKey(mark.targetRoot) === riskKey)) {
-      throw new Error('当前目标存在只读风险，禁止写入；请查看介质证据。');
-    }
+    // 判定事实与界面许可同源（writeFacts / decideWriteGate），不再维护第二套规则。
+    const facts: WriteGateFacts = {
+      reachable: report ? report.condition !== 'unreachable' : true,
+      isolated: Boolean(mark && !mark.released && (await this.targetRiskKey(mark.targetRoot)) === riskKey),
+      level: (report?.assessment.level ?? 'L1') as WriteGate['level'],
+      readOnly: report?.diskReadOnly === true,
+      repairNeeded: this.blockedTargets.has(riskKey) || report?.condition === 'filesystem-repair',
+      volumeHealth: 'unknown',
+      targetWritable: report ? report.targetWritable !== false : true,
+    };
+    const { allowed, reason } = decideWriteGate(facts, 'user-directed');
+    if (!allowed) throw new Error(reason ?? '当前目标存在只读风险，禁止写入；请查看介质证据。');
   }
 
   /** 默认按自动写入策略裁决；可恢复的用户清理须显式选择模式。 */
   async writeGate(targetRoot: string, options?: { mode?: 'automatic' | 'user-directed' }): Promise<WriteGate> {
     const report = await this.inspectTarget(targetRoot, true);
-    const riskKey = await this.targetRiskKey(targetRoot);
-    const mark = this.state.quarantine;
-    const isolated = Boolean(mark && !mark.released && (await this.targetRiskKey(mark.targetRoot)) === riskKey);
-    const level = report.assessment.level;
-    const reachable = report.condition !== 'unreachable';
-    const readOnly = report.diskReadOnly === true;
-    const repairNeeded = report.condition === 'filesystem-repair' || this.blockedTargets.has(riskKey);
-    // 只有确实取到卷级事实且未发现问题时才敢称「健康」；否则标注能力缺失，不伪造健康结论。
-    const volumeChecked = reachable && report.volume !== null && !readOnly && !repairNeeded;
-    const volumeHealth: WriteGate['volumeHealth'] = repairNeeded ? 'repair-required' : volumeChecked ? 'healthy' : 'unknown';
+    const facts = await this.writeFacts(targetRoot, report);
+    const { reachable, isolated, level, volumeHealth } = facts;
     const mode = options?.mode ?? 'automatic';
-    const { allowed, reason } = decideWriteGate({ reachable, isolated, level, readOnly, repairNeeded, volumeHealth }, mode);
+    const { allowed, reason } = decideWriteGate(facts, mode);
 
     const evidence = report.assessment.evidence.map((item) => `${item.kind}：${item.detail}`);
     if (mode === 'user-directed' && volumeHealth === 'unknown') evidence.push('卷健康未知：未能确认卷级健康状况');
@@ -1147,7 +1511,7 @@ export class BackupService extends EventEmitter {
     if (typeof targetRoot !== 'string' || !path.isAbsolute(targetRoot)) throw new Error('请选择本机目标目录');
     return this.diagnostic(async () => {
       const report = await this.inspectTarget(targetRoot);
-      const extra = { kind: '重新枚举', detail: '刷新应用检测；不重置控制器。若异常持续，请更换 USB 端口、线缆或主机后重试。', at: now() };
+      const extra = { kind: '重新枚举', detail: '刷新应用检测；不重置控制器。若异常持续，请更换 USB 端口、线缆或主机后重试。', at: now(), status: 'ok' as const, scope: 'target' as const };
       report.assessment.evidence.push(extra);
       if (this.state.targetRoot === targetRoot) {
         if (report.condition === 'verified' && report.assessment.level === 'L0') {
@@ -1211,6 +1575,8 @@ export class BackupService extends EventEmitter {
     };
     this.state.quarantine = mark;
     this.setMedia('quarantined');
+    // 隔离改变了写入结论：立刻重算许可，避免界面继续拿着放行结论。
+    await this.refreshPermit(targetRoot);
     this.log('warn', `目标介质已标记为隔离观察：${reason}（非物理坏盘结论，可人工撤销）`);
     if (this.currentJob) {
       this.currentJob.quarantine = mark;
@@ -1228,6 +1594,8 @@ export class BackupService extends EventEmitter {
     mark.releasedAt = now();
     this.state.quarantine = mark;
     this.setMedia('online');
+    // 撤销隔离同样改变写入结论：重算许可，把旧的阻断结论换掉。
+    await this.refreshPermit(mark.targetRoot);
     this.log('info', '已撤销隔离观察标记，允许重新扫描与备份');
     if (this.currentJob) {
       this.currentJob.quarantine = mark;
@@ -1236,9 +1604,36 @@ export class BackupService extends EventEmitter {
     this.emitState();
   }
 
+  /**
+   * 计划里不得出现引擎的目标端保留路径。
+   *
+   * 计划动作、改名的来源路径、新建目录都会写到目标端：任何一项落在保留
+   * 命名空间里，都会和引擎自己的暂存件、索引或归档撞车。
+   */
+  private assertPlanHasNoReservedPaths(plan: PlanResult | null): void {
+    if (!plan) return;
+    for (const action of plan.actions) {
+      if (reservedConflict(action.relPath, 'file') !== null) {
+        throw new Error(`计划包含备份引擎的保留路径，已阻止执行：${action.relPath}`);
+      }
+      if (action.type === 'rename' && action.fromRelPath && reservedConflict(action.fromRelPath, 'file') !== null) {
+        throw new Error(`计划包含备份引擎的保留路径，已阻止执行：${action.fromRelPath}`);
+      }
+    }
+    for (const relDir of plan.missingDirs) {
+      if (reservedConflict(relDir, 'dir') !== null) {
+        throw new Error(`计划包含备份引擎的保留路径，已阻止执行：${relDir}`);
+      }
+    }
+  }
+
   private async executePlan(options: StartOptions): Promise<void> {
     const plan = this.currentPlan;
     if (!plan) throw new Error('尚未生成计划');
+
+    // 执行期再确认一次：计划里的任何动作都不得落在引擎的目标端保留路径上。
+    // 计划期已经阻断过，这里防的是「计划生成后状态被改写」的窗口。
+    this.assertPlanHasNoReservedPaths(plan);
 
     this.running = true;
     const actions = plan.actions.filter((a) => a.type !== 'skip');
@@ -2510,7 +2905,8 @@ export class BackupService extends EventEmitter {
     });
   }
 
-  private async finishCommitted(targetRoot: string, job: Journal): Promise<void> {
+  /** 提交后的数据清理：事务归档与暂存件。 */
+  private async cleanupCommittedArtifacts(targetRoot: string, job: Journal): Promise<void> {
     await this.assertTargetWritable();
     if (job.syncMode !== 'mirror-archive') {
       // 只清理没有被回收站索引引用的归档：可还原的内容不能被顺手抹掉。
@@ -2523,20 +2919,88 @@ export class BackupService extends EventEmitter {
       await this.transaction!.cleanup(protectedPaths);
     }
     await this.assertTargetWritable();
-    await fs.rm(partsDir(targetRoot), { recursive: true, force: true });
+    await this.cleanupPartFiles(targetRoot);
     await syncDirectory(metaDir(targetRoot));
+  }
+
+  /**
+   * 结案：清除活动指针。
+   *
+   * 必须排在回读校验之后：校验没过时活动指针还在，恢复入口才有意义。
+   */
+  private async settleCommitted(job: Journal): Promise<void> {
     await this.journal.clearActive(job.jobId);
     this.state.recoverableJob = null;
+  }
+
+  /**
+   * 提交收尾。
+   *
+   * 顺序是「清理 → 回读校验 → 发布清单」：
+   * 清单是「这次备份已完成」的凭证，必须在清理之后、内容可回读之后才写。
+   * 旧顺序（先写清单再清理）会让清单记录的是清理前的状态——
+   * 清理阶段一旦删掉或覆盖了已登记文件，磁盘上的清单就成了假凭证。
+   */
+  /**
+   * 只清理引擎自己的暂存件。
+   *
+   * 整个暂存目录连带删除会把「历史版本复制进来的同名用户文件」一起抹掉——
+   * 暂存目录归引擎所有，但目录里未必只有引擎写的东西。
+   */
+  private async cleanupPartFiles(targetRoot: string): Promise<void> {
+    const dir = partsDir(targetRoot);
+    const entries = await fs.readdir(dir).catch(() => [] as string[]);
+    for (const name of entries) {
+      if (!name.endsWith('.part')) continue;
+      const abs = path.join(dir, name);
+      // 只删普通文件：同名目录不是引擎的暂存件，不得连带删掉里面的东西
+      const stat = await fs.lstat(abs).catch(() => null);
+      if (!stat?.isFile()) continue;
+      await fs.rm(abs, { force: true }).catch(() => undefined);
+    }
+    await fs.rmdir(dir).catch(() => undefined);
   }
 
   private async finalize(options: StartOptions, manifest: Manifest): Promise<void> {
     const job = this.currentJob!;
     await this.assertTargetWritable();
+    // 提交期的破坏性动作只发生在引擎保留命名空间内：
+    // 清单里若登记了保留路径，说明计划期守卫被绕过，必须先停下，不能带着「完成」离开。
+    for (const relPath of Object.keys(manifest.files)) {
+      if (reservedConflict(relPath, 'file') !== null) {
+        throw new Error(`已登记文件落在备份引擎的保留路径上，拒绝提交：${relPath}`);
+      }
+    }
+    // 顺序：先发布清单，再清理，最后回读。
+    // 清单必须先于「旧版本淘汰」落地：否则清理之后、清单落盘之前崩溃，
+    // 旧内容与恢复指针都已经没了，任务却没留下可续传的记录。
     await writeJsonAtomic(manifestPath(options.targetRoot), manifest, {
       createDirs: false,
       beforeRename: () => this.assertTargetWritable(),
     });
-    await this.finishCommitted(options.targetRoot, job);
+    await this.cleanupCommittedArtifacts(options.targetRoot, job);
+    // 报「完成」之前必须回读：清理阶段一旦删掉或覆盖了已登记文件，
+    // 磁盘上的清单就成了一张假凭证。
+    await this.verifyCommitted(options.targetRoot, manifest);
+    // 回读通过才结案：校验没过时活动指针还在，用户还能「恢复并重扫」。
+    await this.settleCommitted(job);
+  }
+
+  /**
+   * 提交期回读：清理之后，已登记的每个数据文件都必须还能从目标读回。
+   *
+   * 哈希回读的范围是「本次任务真正写入的文件」：复制进程已用源端字节校验过暂存件，
+   * 清单登记的哈希就是源端哈希，直接对照即可证明「从目标读回来的内容与源一致」。
+   * 未改动的文件只做存在性与大小复核：它们在写入时同样校验过哈希，
+   * 而提交期的清理只触及引擎保留命名空间——计划期已阻断该命名空间里的用户数据。
+   */
+  private async verifyCommitted(targetRoot: string, manifest: Manifest): Promise<void> {
+    const files = Object.entries(manifest.files).map(([relPath, entry]) => ({
+      relPath,
+      size: entry.size,
+      sha256: entry.sha256,
+    }));
+    await verifyRegisteredFiles(targetRoot, files);
   }
 
   private async buildManifest(targetRoot: string, plan: PlanResult, generation: string): Promise<Manifest> {
@@ -2663,6 +3127,32 @@ export class BackupService extends EventEmitter {
     this.log('warn', '正在取消备份任务');
   }
 
+  /**
+   * 清除目标端的引擎状态。
+   *
+   * 只删引擎自己那几项：源目录里同名目录被复制过来的用户文件不是引擎状态，
+   * 整目录删掉会把用户的文件一起带走。
+   */
+  private async clearEngineMeta(targetRoot: string): Promise<void> {
+    const dir = metaDir(targetRoot);
+    for (const name of RESERVED_FILES) {
+      // 只删普通文件：同名目录不是引擎状态，不得连带删掉里面的东西
+      await fs.unlink(path.join(dir, name)).catch(() => undefined);
+    }
+    // 暂存目录与正常收尾同口径：只删引擎自己的 .part 暂存件
+    await this.cleanupPartFiles(targetRoot);
+    for (const name of RESERVED_TREES) {
+      if (name === 'parts') continue;
+      await fs.rm(path.join(dir, name), { force: true, recursive: true });
+    }
+    const remaining = await fs.readdir(dir).catch(() => [] as string[]);
+    if (remaining.length > 0) {
+      this.log('warn', `目标端 ${META_DIR} 中仍有 ${remaining.length} 个非引擎文件，已原样保留：${remaining.join('、')}`);
+      return;
+    }
+    await fs.rmdir(dir).catch(() => undefined);
+  }
+
   /** 清理目标端的元数据目录（恢复为普通文件夹） */
   async cleanupMeta(): Promise<void> {
     const targetRoot = this.state.targetRoot;
@@ -2676,7 +3166,7 @@ export class BackupService extends EventEmitter {
         }
       }
       await this.guardTargetWrites(targetRoot);
-      await fs.rm(path.join(targetRoot, META_DIR), { recursive: true, force: true });
+      await this.clearEngineMeta(targetRoot);
     });
     this.log('info', '已清除目标端的备份元数据');
   }
