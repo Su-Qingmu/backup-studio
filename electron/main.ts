@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { resolveWindowIconPath } from './window-icon';
 import { BackupService, type StartOptions } from './engine/service';
 import { AutoSync } from './engine/aut';
 import { createWritePermit } from './engine/aut/bridge';
@@ -108,10 +109,9 @@ function createWindow(): void {
     minHeight: 680,
     // Linux 任务栏图标：设置窗口图标以写入 _NET_WM_ICON；AppImage 未做桌面集成时，
     // KDE 拿不到已注册的 desktop entry 与 WM_CLASS 匹配，会回落到窗口自身图标（issue #17）。
-    // 该路径对开发态（<仓库>/dist-electron/electron）与打包态（<resources>/app.asar/dist-electron/electron）
-    // 都正好上溯两级到「仓库根 / asar 根」，而 build/icon 由 package.json 的 files
-    // 原样打进 asar 根，因此两种形态下指向的是同一份资源文件。
-    icon: path.join(__dirname, '../../build/icon/512x512.png'),
+    // 路径算术放在 window-icon 模块里，那里可以被测试真正断言（少一级 .. 或
+    // 指向不存在的尺寸都会当场失败）。
+    icon: resolveWindowIconPath(__dirname),
     show: false,
     backgroundColor: palette.background,
     autoHideMenuBar: true,

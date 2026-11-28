@@ -1322,7 +1322,7 @@ async function main(): Promise<void> {
 
     const firstService = new BackupService(userData);
     await firstService.plan(source, first, 'mirror');
-    await firstService.start({
+    await startWithPermit(firstService, {
       sourceRoot: source,
       targetRoot: first,
       syncMode: 'mirror',
@@ -1334,7 +1334,7 @@ async function main(): Promise<void> {
     // 第二级：把「一份备份」再备份到另一个位置
     const secondService = new BackupService(await makeTemp('bs-two-ud2-'));
     await secondService.plan(first, second, 'mirror');
-    await secondService.start({
+    await startWithPermit(secondService, {
       sourceRoot: first,
       targetRoot: second,
       syncMode: 'mirror',
