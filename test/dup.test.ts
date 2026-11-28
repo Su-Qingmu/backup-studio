@@ -2216,18 +2216,26 @@ async function main(): Promise<void> {
       assert.equal(healed.quarantineError, undefined, '索引恢复正常后必须清空 quarantineError');
     }));
 
-  await test('T26 存放路径是 UNC 网络路径：还原被拒', () =>
+  await test('T26 存放路径是 //server/share/... 形态的绝对路径：还原被拒（命中纯字符串网络盘规则）', () =>
     withTempDir('dup-q-index-', async (dir) => {
-      // 不按平台跳过：下面用的正斜杠 UNC 写法在 POSIX 上同样是绝对路径，
-      // 而网络盘判定是纯字符串规则且排在布局校验之前，所以这条用例在任何
-      // 平台上都能走到「网络盘拒绝」那条分支。原先按平台跳过等于让 Linux CI
-      // 永远不覆盖这条路径。
+      // 这条用例钉的是**实现采用的纯字符串规则**，不是 POSIX 的 UNC 语义：
+      //
+      // POSIX 平台没有 Windows UNC 的文件系统语义——Linux/macOS 上的网络存储
+      // （SMB / NFS / SSHFS / rclone）通常挂载成普通 POSIX 路径（/mnt/share、
+      // /Volumes/share 等），应用看到的是普通绝对路径，而不是 \\server\share。
+      // `//server/share/...` 在 POSIX 上只是一个恰好以两个斜杠开头的绝对路径。
+      //
+      // 实现侧的 isNetworkPath() 是**跨平台纯字符串规则**（把 / 统一换成 \ 之后
+      // 看是否以 \\ 开头），且判定排在布局校验之前，所以这个形态在任何平台上
+      // 都会被拒——这是有意保守：宁可多拒一次，也不去猜某种平台专属语义。
+      //
+      // 因此这条用例在所有平台上都成立（不必按平台跳过），但它证明的是
+      // 「我们的规则如此」，不是「POSIX 具备 UNC 越界通道」。
       const quarantineDirectory = path.join(dir, 'quarantine');
       await fs.mkdir(quarantineDirectory, { recursive: true });
 
       const entry = fakeQuarantineEntry(quarantineDirectory, path.join(dir, 'outside', 'restore-me.txt'), {
         id: 'q-unc',
-        // UNC 在 Windows 上是一条越界通道。
         // 这里用正斜杠拼法：它在 POSIX 上同样是绝对路径，能进到同一条网络盘拒绝分支，
         // 于是这条用例在任何平台上都成立，不必按平台跳过。
         storedPath: '//server/share/payload.txt',
@@ -2269,12 +2277,43 @@ async function main(): Promise<void> {
       assert.match(outcome.reason ?? '', /网络盘|UNC/, '必须命中 UNC 专属的拒绝原因');
     }));
 
-  await test('T26a UNC 判定是纯字符串规则：任何平台都必须认出网络盘路径', async () => {
+  await test('T26a 网络盘判定是纯字符串规则：任何平台都按同一套字符串规则认出网络盘形态', async () => {
+    // 这条只钉**字符串规则本身**：跨平台统一，不依赖任何平台专属语义。
+    // POSIX 上这些路径并没有 UNC 的文件系统语义（见 T26 与 T26c 的说明）。
     assert.equal(isNetworkPath('\\\\server\\share\\payload.txt'), true);
     assert.equal(isNetworkPath('//server/share/payload.txt'), true);
     assert.equal(isNetworkPath('/local/payload.txt'), false);
     assert.equal(isNetworkPath('C:\\local\\payload.txt'), false);
   });
+
+  await test('T26c 存放路径是隔离区外的普通绝对路径：还原被拒，且不得算到网络盘规则头上', () =>
+    withTempDir('dup-q-index-', async (dir) => {
+      // 与 T26 配套：POSIX 上「隔离区外的绝对路径」应当由**隔离区布局校验**拒绝，
+      // 而不是被网络盘规则顺带拒掉——否则就测不出两条规则的真实分工。
+      // 路径按平台取：Windows 上必须是盘符绝对路径，POSIX 上是 / 开头。
+      const outsideAbsolute =
+        process.platform === 'win32' ? 'C:\\outside\\restore-me.txt' : '/outside/restore-me.txt';
+      const quarantineDirectory = path.join(dir, 'quarantine');
+      await fs.mkdir(quarantineDirectory, { recursive: true });
+      const entry = fakeQuarantineEntry(quarantineDirectory, path.join(dir, 'outside', 'restore-me.txt'), {
+        id: 'q-outside-absolute',
+        storedPath: outsideAbsolute,
+      });
+      await writeQuarantineIndex(quarantineDirectory, { version: 1, updatedAt: 1, items: [entry] });
+      const store = new QuarantineStore(quarantineDirectory);
+      const outcome = await store.restore('q-outside-absolute');
+      assert.equal(outcome.restored, false, '隔离区外的绝对路径不得被还原');
+      assert.doesNotMatch(
+        outcome.reason ?? '',
+        /网络盘|UNC/,
+        '普通绝对路径必须由隔离区布局校验拒绝，不得算到网络盘规则头上',
+      );
+      assert.match(
+        outcome.reason ?? '',
+        /存放路径非法|与登记值不一致|越出隔离区/,
+        '必须给出隔离区布局类的原因',
+      );
+    }));
 
   // ------------------------------------------------ 阶段覆盖汇总
 

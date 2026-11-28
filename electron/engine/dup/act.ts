@@ -106,7 +106,13 @@ export type QuarantineErrorCode = DupQuarantineErrorCode;
 const ILLEGAL_RESTORE_PATH = '隔离区条目路径非法（越出隔离区目录），已拒绝还原';
 /** 存放路径与登记值不一致（大小写变体、被换成别的目录等） */
 const ILLEGAL_RESTORE_LAYOUT = '隔离区条目存放路径非法（与登记值不一致：大小写或所在目录不符），已拒绝还原';
-/** UNC / 网络盘：Windows 上它本身就是一条越界通道 */
+/**
+ * 网络盘 / UNC 形态：跨平台统一按**纯字符串规则**拒绝。
+ *
+ * Windows 上它本身就是一条越界通道；POSIX 上并没有 UNC 的文件系统语义
+ * （网络存储通常是挂载后的普通 POSIX 路径），这里仍按同一规则保守拒绝：
+ * 判定排在布局校验之前，宁可多拒一次，也不去猜平台专属语义。
+ */
 const ILLEGAL_RESTORE_NETWORK = '隔离区实体路径不得是网络盘 / UNC 路径，已拒绝还原';
 /** 自指条目：原路径与存放路径相同，还原等于把文件"还原"到它自己 */
 const ILLEGAL_RESTORE_SELF = '隔离区条目的原路径与存放路径相同（自指条目），已拒绝还原';
