@@ -5,6 +5,7 @@
 .app {
   height: 100%;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: var(--titlebar-height) 1fr;
   background: var(--bg-app);
 }
