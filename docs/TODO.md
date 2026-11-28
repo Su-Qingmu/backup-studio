@@ -1,11 +1,11 @@
 # Backup Studio 后续开发计划
 
-## 当前状态（2026-11-25 issue 修复轮收尾中）
+## 当前状态（2026-11-28 issue 修复轮收尾中）
 
 | 项 | 状态 |
 | --- | --- |
-| 基线提交 | `d92d19c`：`fix(gui): 修复禁用态区分、分栏消失、启动黑屏、主题持久化与 AppImage 图标`（本轮 issue 修复成果，**已本地提交、尚未推送远程**；远程 `origin/main` 仍在 `fbd2188`）。再上一基线 `5d2f521`：`feat(hardening): make recovery reliable, delete transactions crash-safe, release gated`（四轮独立复审的加固成果，已推送到 `main`） |
-| 工作区 | 本轮 issue 修复（#3 / #4 / #10 / #11 / #17）的全部代码改动已提交到本地 `main`（提交 `d92d19c`，20 个文件修改/新增，+666 / −22），**按用户要求只本地提交、未推送远程**；除打包试验残留的未跟踪目录 `pack-out/` 外工作区干净。**未打 tag、未建 Release、未合 PR** |
+| 基线提交 | 远程 `origin/main` = `b203274`：`fix(engine): 预览之后出现的同名文件不得被覆盖 (#21) (#24)`，其上一提交 `89930ac` 为 #19 的跨平台测试诚实化。本轮在分支 `fix/issue-30-electron-fontconfig` 上以同一基线 `b203274` 把 `electron` 升到 `^44.11.6`（#30），**未推送 `main`** |
+| 工作区 | 用户主力仓库 `D:\My file\桌面\backup-studio` 全程只读（内有未推送分支 `fix/m7-cross-platform-contract`、未跟踪的 `GPT-NEXT-BRIEF.md` 与 `pack-out/`，均未触碰）。自动化全部作业在隔离克隆 `backup-studio-automation` 内完成。本轮**未合并任何 PR、未关闭任何 issue、未改写历史、未 force push**；#25 / #26 / #27 / #28 / #29 / #31 / #32 七个 PR 均为 MERGEABLE + CI 绿，等待人工授权合并 |
 | M1 · 备份正确性与恢复回归 | **已完成并推送**，验收 76 项通过 / 0 失败 / 0 跳过 |
 | REQ-AUT-003 多配对同步与持久化 | **已实现并通过自动化验证**（引擎 + 界面 + 文档），验收合计 85 项通过 / 0 失败 / 0 跳过；真机拔插重插与换机待 M2 阶段 3 |
 | D-01 默认静默删除 | **已按用户拍板修复并推送**（REQ-MAN-001）：默认改为非破坏性、删除数 > 0 即确认、补手动备份回收站；引擎 + 界面 + 测试 + 文档全部落地 |
@@ -13,7 +13,8 @@
 | 界面可用性审计 | 已出报告，见 [UX-AUDIT.md](./UX-AUDIT.md)；D-02～D-18 已在界面侧落实，D-01 已修复（见该报告 §6） |
 | 本轮专项加固 | 四条工作流（隔离区 / 回收站事务 / Release 门禁 / IPC 路径授权）已实施并各自经过独立只读复审；复审提出的 Critical / High 已全部修复并有回归用例固定。详见下节「本轮专项加固」 |
 | 本轮 issue 修复 | 仓库中仍未关闭的 #3 / #4 / #10 / #11 / #17 五个 issue 已完成代码层修复并本地提交；#3 / #4 / #11 经独立只读复审（VERDICT: PASS，另附 3 条非阻断建议）；#10 / #17 的真实行为需 Linux/KDE 真机验收。issue 状态**未改动**（仍为 open），关闭需人工验收后手动操作。详见下节 |
-| 最近一次全量验证 | 本地（提交 `d92d19c` 所在树）：`typecheck`（三套 tsconfig）零错误 + `build` 通过；`npm test` = 引擎 54 + 自动同步 19 + 写入闸门 8 + 回收站 26 + 事务恢复 17（其中 1 项按环境跳过）+ 查重 71 + 定位授权 26 + 回收站崩溃注入 44 = **264 通过 / 0 失败 / 1 跳过**（共 265 项）。GitHub CI 尚未为本次工作区运行 |
+| 本轮 Packaging 修复 | #30（Electron 33 / Fontconfig 2.18 警告）：`electron` `^33.0.0` → `^44.11.6`，`electron-builder` 保持 `^25.0.5` 不动。独立复审（GPT 档）判定 PASS_WITH_NOTES，**不得据此关闭 #30**，须 Arch/KDE 真机验收 |
+| 最近一次全量验证 | 本轮（Electron 44.11.6 树，Windows x64）：`typecheck` exit 0 + `build` exit 0；`npm test` = 引擎 60 + 自动同步 19 + 写入闸门 8 + 回收站 26 + 事务恢复 16 + 查重 73 + 定位授权 26 + 回收站崩溃注入 44 = **272 通过 / 0 失败**；`electron-builder --win --x64` exit 0，产物实测启动 14 秒无崩溃、stderr 为空 |
 
 
 > 压缩会话后请以本节为准重建上下文；详细依据见本文件、需求总纲与 UX 审计报告。
@@ -33,6 +34,37 @@
 - [x] **#17 AppImage 在 KDE 任务栏显示为 Xorg 通用图标。** 补 `build/icon/` 多尺寸图标（16→512）与 `icon.ico`，`package.json` 配置 `linux`/`win` 图标并把 `build/icon/**` 纳入 `files`；`BrowserWindow` 设置窗口图标写入 `_NET_WM_ICON`。已用 electron-builder 的 `icon` 命令实测：`build/icon` 被解析成 16→512 完整图标集，`isFallback=false`（不再回落默认 Electron 图标）。
 
 复审与验收边界：#3 / #4 / #11 经独立只读复审（VERDICT: PASS，另附 3 条非阻断建议：收起前比例在 (0.82, 0.94] 时展开恢复到该比例、非原生 `:disabled` 控件的禁用态需真机抽查、`restoreRatioRef` 卸载边界）。本仓库无渲染层测试框架（8 套测试均测引擎侧），上述 GUI 修复未能产出单元回归用例；本机为 win32，AppImage 打包、KDE 任务栏表现与界面交互均需在 Linux/KDE 真机人工验收。
+
+## 本轮：Packaging 修复（#30 Electron 33 / Fontconfig 2.18 警告，2026-11-28）
+
+> #30 保持 open。本节只记录依赖升级、验证证据与真机验收边界；关闭需人工验收后手动操作。
+
+- [x] **#30 Linux 产物启动时输出大量 Fontconfig 配置解析警告。** 根因不在宿主机配置，而在 **Electron/Chromium 捆绑的 Fontconfig 实现**：系统 `libfontconfig.so.1` 是 2.18.3（能解析 `xsi:nil` 与 `system-ui` / `ui-sans-serif` / `emoji` 等新通用族），而 Electron 33 捆绑的旧版解析器读不懂 Fontconfig 2.18 的配置语法，于是每次启动刷出数十行 `invalid attribute 'xsi:nil'` 与 `invalid constant used : …`。报告者已用 `LD_DEBUG=libs` 确认 AppImage 内没有混入旧版 `libfontconfig.so`，且「系统 Electron 44 运行同一份项目资源」不复现，指向捆绑版本而非打包路径。修复：把 `electron` 从 `^33.0.0` 升到 `^44.11.6`（报告者实测不复现的主版本线，取该线最新补丁），`electron-builder` 保持 `^25.0.5` 不动。**未采用**修改或删除宿主机 `/etc/fonts/conf.d/48-guessfamily.conf` 的规避做法——那是系统 Fontconfig 的有效配置。
+
+### 这次升级带来的行为变化（须在真机确认）
+
+| 变化 | 触发版本 | 对本仓库的影响 | 处置 |
+| --- | --- | --- | --- |
+| `dialog.showOpenDialog` 未传 `defaultPath` 时不再沿用系统记忆的目录，改为从 Downloads / home 打开 | Electron 43+ | 选目录对话框的初始位置会变（`dialog:pick-directory` 未传 `defaultPath`） | 不影响正确性；若要沿用上次目录需显式传 `defaultPath` |
+| Linux 窗控（titleBarOverlay）跟随桌面环境的按钮布局 | Electron 43+ | 本仓库只在**右侧**预留 148px 给系统窗口按钮（`--window-controls-width`）。KDE 默认把按钮放在**左侧**时，窗控会覆盖标题栏左侧内容，右侧留白变空 | 需 KDE 真机确认；若确实左置，需改为左右对称预留或按桌面布局动态预留 |
+| Wayland 会话默认使用原生 Wayland | Electron 38+ | KDE Wayland 下任务栏图标（`_NET_WM_ICON` 是 X11 属性）与窗口行为需单独验收 | 与 #17 的任务栏图标验收合并做 |
+| `npm ci` 不再下载 Electron 二进制，改为首次运行 `electron` 时按需下载 | Electron 42+ | CI 与 Release 打包不受影响（`electron-builder` 自带下载），本地首次 `npm start` 会多一次下载 | 无需改脚本：`node_modules/electron/index.js` 在二进制缺失时会自动下载 |
+| `asar` 运行时完整性 fuse | Electron 42+ | `asar: true` 不等于开启 fuse；electron-builder 25.1.8 仍会写 Windows ASAR 哈希资源 | 已实测打包产物启动无崩溃、stderr 为空 |
+
+### 本地验证（Windows x64，Electron 44.11.6）
+
+- `npm run typecheck` exit 0；`npm run build` exit 0；
+- `npm test` exit 0：引擎 60 + 自动同步 19 + 写入闸门 8 + 回收站 26 + 事务恢复 16 + 查重 73 + 定位授权 26 + 回收站崩溃注入 44 = **272 通过 / 0 失败**；
+- `electron-builder --win --x64` exit 0，产出 `Backup Studio Setup 0.1.0.exe`（114.6 MB）；
+- 打包产物 `release/win-unpacked/Backup Studio.exe` 实测启动并稳定运行 14 秒，stderr / stdout 均为空；
+- 独立只读复审（GPT 档，VERDICT: PASS_WITH_NOTES）：未发现本仓库用到的 Electron API 在 33 → 44 之间发生破坏性变更；复审同时指出上表前四行行为变化，以及「CI 不启动产物」因此不能作为 #30 的验收依据。
+
+### 仍需 Arch/KDE 真机验收（关闭 #30 的前置条件）
+
+1. 记录 `fc-match -V` 与 `XDG_SESSION_TYPE`；保持 `/etc/fonts` 不变，先用旧包确认 Fontconfig 2.18.3 能复现原警告；
+2. 分别启动 `./release/linux-unpacked/backup-studio` 与 AppImage，分别捕获 stderr，冷启动与打开目录对话框后都不得再出现 `xsi:nil` / `invalid constant used` 警告；
+3. 用 Chromium 的 Rendered Fonts 逐项核对 `sans-serif` / `serif` / `monospace` / `system-ui` 与中日韩字形、彩色 Emoji、数学符号的回退（不能只看 `fc-match`）；
+4. 在 KDE 原生 Wayland 与 X11/XWayland 分别验收标题栏窗控位置、任务栏图标、首帧、目录选择、IPC、定位与回收站；另在 Debian 系环境确认 `.deb` 可安装并启动。
 
 ## 备份主线安全待办
 
