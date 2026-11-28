@@ -11,6 +11,7 @@ import { ProgressPanel } from './components/ProgressPanel';
 import { RecoverCard } from './components/RecoverCard';
 import { EventFeed } from './components/EventFeed';
 import { Splitter } from './components/Splitter';
+import { DEFAULT_RATIO } from './lib/splitter-layout';
 import { IconAlert, IconCheck, IconLayers, IconMoon, IconRefresh, IconSun } from './components/Icons';
 import { useSpringValue } from './hooks/useSpringValue';
 import { POP_SPRING } from './lib/spring';
@@ -68,6 +69,9 @@ export default function App() {
   const [syncMode, setSyncMode] = useState<SyncMode>('copy');
   const [state, setState] = useState<BackupRevealState | null>(null);
   const [collapsed, setCollapsed] = useState(false);
+  // 分栏比例由这里持有：工作区切换会重新挂载 Splitter，
+  // 比例与「收起前的比例」必须跨挂载保留。
+  const [splitRatio, setSplitRatio] = useState(DEFAULT_RATIO);
   const [busyStage, setBusyStage] = useState<'scanning' | 'planning' | 'starting' | null>(null);
   const [confirming, setConfirming] = useState(false);
   // 卷级健康无法判定时的显式风险确认：记录用户确认时的许可修订号。
@@ -740,7 +744,13 @@ export default function App() {
           ) : null}
         </section>
 
-        <Splitter containerRef={workspaceRef} collapsed={collapsed} onCollapsedChange={setCollapsed} />
+        <Splitter
+          containerRef={workspaceRef}
+          collapsed={collapsed}
+          onCollapsedChange={setCollapsed}
+          ratio={splitRatio}
+          onRatioChange={setSplitRatio}
+        />
 
         <section className="pane pane-right">
           <div className="pane-body pane-body-scroll" tabIndex={0} role="region" aria-label="备份详情">

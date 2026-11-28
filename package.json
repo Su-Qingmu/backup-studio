@@ -17,6 +17,7 @@
     "test:engine": "tsx test/engine.test.ts",
     "test:aut": "tsx test/auto-sync.test.ts",
     "test:gate": "tsx test/write-gate.test.ts",
+    "test:layout": "tsx test/renderer-layout.test.ts",
     "test:permit": "tsx test/write-permit.test.ts",
     "test:applicability": "tsx test/health-applicability.test.ts",
     "test:recycle": "tsx test/recycle.test.ts",
@@ -24,7 +25,7 @@
     "test:dup": "tsx test/dup.test.ts",
     "test:reveal": "tsx test/reveal-authority.test.ts",
     "test:recycle-crash": "tsx test/recycle-crash.test.ts",
-    "test": "npm run test:engine && npm run test:aut && npm run test:gate && npm run test:permit && npm run test:applicability && npm run test:recycle && npm run test:transaction && npm run test:dup && npm run test:reveal && npm run test:recycle-crash",
+    "test": "npm run test:engine && npm run test:aut && npm run test:gate && npm run test:permit && npm run test:applicability && npm run test:layout && npm run test:recycle && npm run test:transaction && npm run test:dup && npm run test:reveal && npm run test:recycle-crash",
     "pack:win": "npm run build && electron-builder --win --x64",
     "pack:linux": "npm run build && electron-builder --linux --x64"
   },
