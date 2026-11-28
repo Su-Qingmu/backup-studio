@@ -12,6 +12,7 @@ import { assessMedia, identifyMedia, probeMedia, sameMedia } from '../electron/e
 import { JournalStore, crc32, partFileName } from '../electron/engine/journal';
 import { CASE_INSENSITIVE_PATHS } from '../electron/engine/path-identity';
 import { createRunner, registerTempCleanup, trackTempDir } from './harness';
+import { startWithPermit } from './permit-helper';
 import { capabilityMismatch, probeTempFsCapability } from './fs-capability';
 import type { MediaIdentity, SyncMode } from '../shared/types';
 
@@ -107,7 +108,7 @@ async function planFor(source: string, target: string, syncMode: SyncMode = 'mir
 async function runService(source: string, target: string, syncMode: SyncMode = 'mirror'): Promise<void> {
   const service = new BackupService(await makeTemp('backup-studio-journal-'));
   await service.plan(source, target, syncMode);
-  await service.start({
+  await startWithPermit(service, {
     sourceRoot: source,
     targetRoot: target,
     syncMode,
@@ -624,7 +625,7 @@ async function main(): Promise<void> {
 
     const service = new BackupService(await makeTemp('bs-journal-'));
     await service.plan(source, target, 'mirror');
-    const running = service.start({
+    const running = startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',
@@ -659,7 +660,7 @@ async function main(): Promise<void> {
 
     const service = new BackupService(await makeTemp('bs-journal-'));
     await service.plan(source, target, 'mirror');
-    const running = service.start({
+    const running = startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',
@@ -893,7 +894,7 @@ async function main(): Promise<void> {
     // 隔离未撤销时禁止写入
     await assert.rejects(
       () =>
-        service.start({
+        startWithPermit(service, {
           sourceRoot: source,
           targetRoot: target,
           syncMode: 'mirror',
@@ -942,7 +943,7 @@ async function main(): Promise<void> {
     // 中断记录存在时，start 应拒绝沿用旧计划
     await assert.rejects(
       () =>
-        service.start({
+        startWithPermit(service, {
           sourceRoot: source,
           targetRoot: target,
           syncMode: 'mirror',
@@ -1170,7 +1171,7 @@ async function main(): Promise<void> {
     // 在开始前删掉其中一个源文件，触发单文件失败
     await fs.unlink(path.join(source, 'missing.txt'));
 
-    await service.start({
+    await startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',
@@ -1233,7 +1234,7 @@ async function main(): Promise<void> {
 
     const service = new BackupService(userData);
     await service.plan(source, target, 'mirror');
-    await service.start({
+    await startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',
@@ -1295,7 +1296,7 @@ async function main(): Promise<void> {
     // 预览之后、开始之前，用户把另一份同名文件放进目标目录，且仅此一份。
     await writeFile(target, 'report.txt', 'only-copy');
 
-    await service.start({
+    await startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'copy',
@@ -1322,7 +1323,7 @@ async function main(): Promise<void> {
 
     const service = new BackupService(userData);
     await service.plan(source, target, 'copy');
-    await service.start({
+    await startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'copy',
@@ -1443,7 +1444,7 @@ function patchDegradedReplacement(destPath: string, foreignContent: string): () 
     const restore = patchDegradedInterrupt(destPath, path.join(source, 'payload.bin'));
 
     try {
-      await service.start({
+      await startWithPermit(service, {
         sourceRoot: source,
         targetRoot: target,
         syncMode: 'copy',
@@ -1480,7 +1481,7 @@ function patchDegradedReplacement(destPath: string, foreignContent: string): () 
     const restore = patchDegradedReplacement(destPath, 'FOREIGN-CONTENT');
 
     try {
-      await service.start({
+      await startWithPermit(service, {
         sourceRoot: source,
         targetRoot: target,
         syncMode: 'copy',
@@ -1528,7 +1529,7 @@ function patchDegradedReplacement(destPath: string, foreignContent: string): () 
     }) as typeof fs.open;
 
     try {
-      await service.start({
+      await startWithPermit(service, {
         sourceRoot: source,
         targetRoot: target,
         syncMode: 'copy',
@@ -1562,7 +1563,7 @@ function patchDegradedReplacement(destPath: string, foreignContent: string): () 
       throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
     }) as typeof fs.link;
     try {
-      await service.start({
+      await startWithPermit(service, {
         sourceRoot: source,
         targetRoot: target,
         syncMode: 'copy',
@@ -1603,7 +1604,7 @@ function patchDegradedReplacement(destPath: string, foreignContent: string): () 
 
     const service = new BackupService(userData);
     await service.plan(source, target, 'mirror');
-    await service.start({
+    await startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',

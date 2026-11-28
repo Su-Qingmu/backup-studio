@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { BackupService } from '../electron/engine/service';
+import { startWithPermit } from './permit-helper';
 import { archivePath, initializeRecycle, listRecycle, recycleIndexPath } from '../electron/engine/recycle';
 import { JournalStore } from '../electron/engine/journal';
 import type { DeleteTx } from '../electron/engine/journal';
@@ -66,7 +67,7 @@ function swapCase(name: string): string {
 
 async function runBackup(service: BackupService, source: string, target: string, syncMode: SyncMode): Promise<void> {
   await service.plan(source, target, syncMode);
-  await service.start({
+  await startWithPermit(service, {
     sourceRoot: source,
     targetRoot: target,
     syncMode,
@@ -305,7 +306,7 @@ async function main(): Promise<void> {
 
     const limited = new BackupService(await makeTemp('bs-recycle-limit-'), { recycleMaxBytes: 8 });
     await limited.plan(source, target, 'mirror-archive');
-    await limited.start({
+    await startWithPermit(limited, {
       sourceRoot: source, targetRoot: target, syncMode: 'mirror-archive', allowMassDelete: true, resume: true,
     });
     assert.notEqual(limited.getState().phase, 'completed', '超限时任务不得报完成');
@@ -330,7 +331,7 @@ async function main(): Promise<void> {
 
     const limited = new BackupService(await makeTemp('bs-recycle-orphan-'), { recycleMaxBytes: 10 });
     await limited.plan(source, target, 'mirror-archive');
-    await limited.start({
+    await startWithPermit(limited, {
       sourceRoot: source, targetRoot: target, syncMode: 'mirror-archive', allowMassDelete: true, resume: true,
     });
     // 孤儿 6 字节 + 本次 8 字节 = 14 字节，超过 10 字节上限：必须阻断。

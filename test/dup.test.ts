@@ -481,7 +481,7 @@ async function main(): Promise<void> {
   await test('§11-10a 未知卷健康只放行用户主动操作，硬阻断对两种模式均有效', async () => {
     const healthy = {
       reachable: true, isolated: false, level: 'L0', readOnly: false,
-      repairNeeded: false, volumeHealth: 'healthy',
+      repairNeeded: false, volumeHealth: 'healthy', targetWritable: true,
     } as const;
     const unknown = { ...healthy, volumeHealth: 'unknown' } as const;
     assert.equal(decideWriteGate(unknown, 'automatic').allowed, false);
@@ -495,6 +495,7 @@ async function main(): Promise<void> {
       assert.equal(decideWriteGate({ ...healthy, readOnly: true }, mode).allowed, false, `${mode}: readOnly`);
       assert.equal(decideWriteGate({ ...healthy, repairNeeded: true }, mode).allowed, false, `${mode}: repairNeeded`);
       assert.equal(decideWriteGate({ ...healthy, volumeHealth: 'repair-required' }, mode).allowed, false, `${mode}: repair-required`);
+      assert.equal(decideWriteGate({ ...healthy, targetWritable: false }, mode).allowed, false, `${mode}: targetWritable`);
     }
   });
   // ------------------------------------------------ §11-1 进度五阶段与取消
