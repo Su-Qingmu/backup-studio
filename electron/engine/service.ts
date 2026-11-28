@@ -9,6 +9,8 @@ import { driveLetter, redactLog } from './security';
 import { BackupTransaction } from './transaction';
 import { hashFile } from './hash';
 import { scanTree, META_DIR } from './scan';
+import { RESERVED_FILES, RESERVED_TREES, isForeignEngineEntry, reservedConflict } from './reserved';
+import { verifyRegisteredFiles } from './verify';
 import { buildPlan, type PlanResult } from './planner';
 import { CopyPool, type CopyResult } from './pool';
 import { JournalStore, partFileName, sameTargetPath, type DeleteTx, type Journal, type JournalTask } from './journal';
@@ -27,6 +29,7 @@ import {
   metaDir,
   partsDir,
   readManifest,
+  readStrictManifest,
   syncDirectory,
   writeJsonAtomic,
   type Manifest,
@@ -821,11 +824,41 @@ export class BackupService extends EventEmitter {
       this.publishPermit(targetRoot, probePermit);
       this.trimCaches();
 
+      // 源目录本身可能就是一份备份（`.backup-studio/manifest.json` 是引擎清单）：
+      // 那时它的引擎状态属于「别的备份的内部数据」，重复备份没有意义，
+      // 还会和本次任务在目标端的保留路径撞车。这种情况下把它们排除在源端扫描之外。
+      // 判定必须严格：形状像但不是引擎清单的用户文件，不能被当成备份而整棵漏备。
+      const sourceIsBackup = (await readStrictManifest(sourceRoot)) !== null;
       const [source, target, manifest] = await Promise.all([
-        scanTree(sourceRoot, { excludeMetaDir: false }),
+        scanTree(sourceRoot, {
+          excludeMetaDir: false,
+          exclude: sourceIsBackup ? isForeignEngineEntry : undefined,
+        }),
         scanTree(targetRoot, { excludeMetaDir: true }),
         readManifest(targetRoot),
       ]);
+
+      if (sourceIsBackup) {
+        this.log('info', `源目录本身是一份备份，其引擎内部状态（${META_DIR}）不重复备份；其中的其它文件仍会照常备份`);
+      }
+
+      // 引擎在目标端要用 `.backup-studio` 存放暂存件、索引与归档。
+      // 源目录里若也有同名路径，复制过去就会被本次任务覆盖或删除——
+      // 这种冲突无法无损处理，必须在写入前阻断，而不是备份完再告诉用户文件没了。
+      const conflicts: string[] = [];
+      for (const relPath of source.files.keys()) {
+        if (reservedConflict(relPath, 'file') !== null) conflicts.push(relPath);
+      }
+      for (const relPath of source.dirs) {
+        if (reservedConflict(relPath, 'dir') !== null) conflicts.push(relPath);
+      }
+      if (conflicts.length > 0) {
+        throw new Error(
+          `源目录包含备份引擎的保留路径（${conflicts.length} 个，如 ${conflicts.slice(0, 3).join('、')}）：` +
+            `这些路径在目标端会被本次任务的暂存、索引或清理动作覆盖或删除，无法无损完成备份。` +
+            `请把源目录里 ${META_DIR} 下与引擎内部状态同名的那几项改名或移出，再重新扫描。`,
+        );
+      }
 
       if (source.files.size === 0) {
         this.log('warn', '源目录中没有可备份的文件');
@@ -1013,11 +1046,17 @@ export class BackupService extends EventEmitter {
     // A crash after publishing the manifest needs only cleanup, never a replay.
     if (recovering?.transaction && (await readManifest(targetRoot))?.generation === journal.jobId) {
       await syncDirectory(metaDir(targetRoot));
-      await this.finishCommitted(targetRoot, journal);
+      await this.cleanupCommittedArtifacts(targetRoot, journal);
+      // 恢复快路同样要过回读：不能只清目录就报完成
+      const published = await readManifest(targetRoot);
+      if (published) await this.verifyCommitted(targetRoot, published);
+      await this.settleCommitted(journal);
       this.running = false;
       this.setPhase('completed');
       return;
     }
+    // 阻断必须发生在任何目标端写入之前：写账本、建暂存目录都在这之后。
+    this.assertPlanHasNoReservedPaths(this.currentPlan);
     await this.assertTargetWritable();
     await this.journal.write(journal);
     if (journal !== recovering) await this.journal.setActive(journal.jobId);
@@ -1136,7 +1175,11 @@ export class BackupService extends EventEmitter {
         await this.assertTargetWritable();
         await syncDirectory(metaDir(job.targetRoot));
         await this.assertDeletesReconciled(job, reconcileError);
-        await this.finishCommitted(job.targetRoot, job);
+        await this.cleanupCommittedArtifacts(job.targetRoot, job);
+        // 同代快路同样要过回读：不能只清目录就报完成
+        const published = await readManifest(job.targetRoot);
+        if (published) await this.verifyCommitted(job.targetRoot, published);
+        await this.settleCommitted(job);
         this.setPhase('completed');
       } finally {
         this.running = false;
@@ -1561,9 +1604,36 @@ export class BackupService extends EventEmitter {
     this.emitState();
   }
 
+  /**
+   * 计划里不得出现引擎的目标端保留路径。
+   *
+   * 计划动作、改名的来源路径、新建目录都会写到目标端：任何一项落在保留
+   * 命名空间里，都会和引擎自己的暂存件、索引或归档撞车。
+   */
+  private assertPlanHasNoReservedPaths(plan: PlanResult | null): void {
+    if (!plan) return;
+    for (const action of plan.actions) {
+      if (reservedConflict(action.relPath, 'file') !== null) {
+        throw new Error(`计划包含备份引擎的保留路径，已阻止执行：${action.relPath}`);
+      }
+      if (action.type === 'rename' && action.fromRelPath && reservedConflict(action.fromRelPath, 'file') !== null) {
+        throw new Error(`计划包含备份引擎的保留路径，已阻止执行：${action.fromRelPath}`);
+      }
+    }
+    for (const relDir of plan.missingDirs) {
+      if (reservedConflict(relDir, 'dir') !== null) {
+        throw new Error(`计划包含备份引擎的保留路径，已阻止执行：${relDir}`);
+      }
+    }
+  }
+
   private async executePlan(options: StartOptions): Promise<void> {
     const plan = this.currentPlan;
     if (!plan) throw new Error('尚未生成计划');
+
+    // 执行期再确认一次：计划里的任何动作都不得落在引擎的目标端保留路径上。
+    // 计划期已经阻断过，这里防的是「计划生成后状态被改写」的窗口。
+    this.assertPlanHasNoReservedPaths(plan);
 
     this.running = true;
     const actions = plan.actions.filter((a) => a.type !== 'skip');
@@ -2835,7 +2905,8 @@ export class BackupService extends EventEmitter {
     });
   }
 
-  private async finishCommitted(targetRoot: string, job: Journal): Promise<void> {
+  /** 提交后的数据清理：事务归档与暂存件。 */
+  private async cleanupCommittedArtifacts(targetRoot: string, job: Journal): Promise<void> {
     await this.assertTargetWritable();
     if (job.syncMode !== 'mirror-archive') {
       // 只清理没有被回收站索引引用的归档：可还原的内容不能被顺手抹掉。
@@ -2848,20 +2919,88 @@ export class BackupService extends EventEmitter {
       await this.transaction!.cleanup(protectedPaths);
     }
     await this.assertTargetWritable();
-    await fs.rm(partsDir(targetRoot), { recursive: true, force: true });
+    await this.cleanupPartFiles(targetRoot);
     await syncDirectory(metaDir(targetRoot));
+  }
+
+  /**
+   * 结案：清除活动指针。
+   *
+   * 必须排在回读校验之后：校验没过时活动指针还在，恢复入口才有意义。
+   */
+  private async settleCommitted(job: Journal): Promise<void> {
     await this.journal.clearActive(job.jobId);
     this.state.recoverableJob = null;
+  }
+
+  /**
+   * 提交收尾。
+   *
+   * 顺序是「清理 → 回读校验 → 发布清单」：
+   * 清单是「这次备份已完成」的凭证，必须在清理之后、内容可回读之后才写。
+   * 旧顺序（先写清单再清理）会让清单记录的是清理前的状态——
+   * 清理阶段一旦删掉或覆盖了已登记文件，磁盘上的清单就成了假凭证。
+   */
+  /**
+   * 只清理引擎自己的暂存件。
+   *
+   * 整个暂存目录连带删除会把「历史版本复制进来的同名用户文件」一起抹掉——
+   * 暂存目录归引擎所有，但目录里未必只有引擎写的东西。
+   */
+  private async cleanupPartFiles(targetRoot: string): Promise<void> {
+    const dir = partsDir(targetRoot);
+    const entries = await fs.readdir(dir).catch(() => [] as string[]);
+    for (const name of entries) {
+      if (!name.endsWith('.part')) continue;
+      const abs = path.join(dir, name);
+      // 只删普通文件：同名目录不是引擎的暂存件，不得连带删掉里面的东西
+      const stat = await fs.lstat(abs).catch(() => null);
+      if (!stat?.isFile()) continue;
+      await fs.rm(abs, { force: true }).catch(() => undefined);
+    }
+    await fs.rmdir(dir).catch(() => undefined);
   }
 
   private async finalize(options: StartOptions, manifest: Manifest): Promise<void> {
     const job = this.currentJob!;
     await this.assertTargetWritable();
+    // 提交期的破坏性动作只发生在引擎保留命名空间内：
+    // 清单里若登记了保留路径，说明计划期守卫被绕过，必须先停下，不能带着「完成」离开。
+    for (const relPath of Object.keys(manifest.files)) {
+      if (reservedConflict(relPath, 'file') !== null) {
+        throw new Error(`已登记文件落在备份引擎的保留路径上，拒绝提交：${relPath}`);
+      }
+    }
+    // 顺序：先发布清单，再清理，最后回读。
+    // 清单必须先于「旧版本淘汰」落地：否则清理之后、清单落盘之前崩溃，
+    // 旧内容与恢复指针都已经没了，任务却没留下可续传的记录。
     await writeJsonAtomic(manifestPath(options.targetRoot), manifest, {
       createDirs: false,
       beforeRename: () => this.assertTargetWritable(),
     });
-    await this.finishCommitted(options.targetRoot, job);
+    await this.cleanupCommittedArtifacts(options.targetRoot, job);
+    // 报「完成」之前必须回读：清理阶段一旦删掉或覆盖了已登记文件，
+    // 磁盘上的清单就成了一张假凭证。
+    await this.verifyCommitted(options.targetRoot, manifest);
+    // 回读通过才结案：校验没过时活动指针还在，用户还能「恢复并重扫」。
+    await this.settleCommitted(job);
+  }
+
+  /**
+   * 提交期回读：清理之后，已登记的每个数据文件都必须还能从目标读回。
+   *
+   * 哈希回读的范围是「本次任务真正写入的文件」：复制进程已用源端字节校验过暂存件，
+   * 清单登记的哈希就是源端哈希，直接对照即可证明「从目标读回来的内容与源一致」。
+   * 未改动的文件只做存在性与大小复核：它们在写入时同样校验过哈希，
+   * 而提交期的清理只触及引擎保留命名空间——计划期已阻断该命名空间里的用户数据。
+   */
+  private async verifyCommitted(targetRoot: string, manifest: Manifest): Promise<void> {
+    const files = Object.entries(manifest.files).map(([relPath, entry]) => ({
+      relPath,
+      size: entry.size,
+      sha256: entry.sha256,
+    }));
+    await verifyRegisteredFiles(targetRoot, files);
   }
 
   private async buildManifest(targetRoot: string, plan: PlanResult, generation: string): Promise<Manifest> {
@@ -2988,6 +3127,32 @@ export class BackupService extends EventEmitter {
     this.log('warn', '正在取消备份任务');
   }
 
+  /**
+   * 清除目标端的引擎状态。
+   *
+   * 只删引擎自己那几项：源目录里同名目录被复制过来的用户文件不是引擎状态，
+   * 整目录删掉会把用户的文件一起带走。
+   */
+  private async clearEngineMeta(targetRoot: string): Promise<void> {
+    const dir = metaDir(targetRoot);
+    for (const name of RESERVED_FILES) {
+      // 只删普通文件：同名目录不是引擎状态，不得连带删掉里面的东西
+      await fs.unlink(path.join(dir, name)).catch(() => undefined);
+    }
+    // 暂存目录与正常收尾同口径：只删引擎自己的 .part 暂存件
+    await this.cleanupPartFiles(targetRoot);
+    for (const name of RESERVED_TREES) {
+      if (name === 'parts') continue;
+      await fs.rm(path.join(dir, name), { force: true, recursive: true });
+    }
+    const remaining = await fs.readdir(dir).catch(() => [] as string[]);
+    if (remaining.length > 0) {
+      this.log('warn', `目标端 ${META_DIR} 中仍有 ${remaining.length} 个非引擎文件，已原样保留：${remaining.join('、')}`);
+      return;
+    }
+    await fs.rmdir(dir).catch(() => undefined);
+  }
+
   /** 清理目标端的元数据目录（恢复为普通文件夹） */
   async cleanupMeta(): Promise<void> {
     const targetRoot = this.state.targetRoot;
@@ -3001,7 +3166,7 @@ export class BackupService extends EventEmitter {
         }
       }
       await this.guardTargetWrites(targetRoot);
-      await fs.rm(path.join(targetRoot, META_DIR), { recursive: true, force: true });
+      await this.clearEngineMeta(targetRoot);
     });
     this.log('info', '已清除目标端的备份元数据');
   }
