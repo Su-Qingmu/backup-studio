@@ -24,7 +24,8 @@
     "test:dup": "tsx test/dup.test.ts",
     "test:reveal": "tsx test/reveal-authority.test.ts",
     "test:recycle-crash": "tsx test/recycle-crash.test.ts",
-    "test": "npm run test:engine && npm run test:aut && npm run test:gate && npm run test:permit && npm run test:applicability && npm run test:recycle && npm run test:transaction && npm run test:dup && npm run test:reveal && npm run test:recycle-crash",
+    "test:theme": "tsx test/theme-store.test.ts",
+    "test": "npm run test:engine && npm run test:aut && npm run test:gate && npm run test:permit && npm run test:applicability && npm run test:recycle && npm run test:transaction && npm run test:dup && npm run test:reveal && npm run test:recycle-crash && npm run test:theme",
     "pack:win": "npm run build && electron-builder --win --x64",
     "pack:linux": "npm run build && electron-builder --linux --x64"
   },
