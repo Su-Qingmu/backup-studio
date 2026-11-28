@@ -13,3 +13,11 @@
 .media-capability-table { max-inline-size: 100%; max-block-size: 18rem; overflow: auto; }
 .media-capability-table :where(th,td) { padding: var(--sp-1) var(--sp-2); white-space: nowrap; text-align: start; }
 .media-capability-table thead { position: sticky; inset-block-start: 0; background: var(--bg-panel); }
+
+.media-diagnostics .media-diagnostics-summary { color: var(--text-primary); }
+.media-diagnostics .media-diagnostics-target { color: var(--text-secondary); font-size: .9em; }
+.media-evidence-group h4 { margin: 0; font-size: .9em; }
+.media-evidence-status { margin-inline-start: var(--sp-1); color: var(--text-secondary); font-size: .85em; }
+.media-evidence-status[data-status='error'] { color: var(--danger); }
+.media-evidence-status[data-status='warning'] { color: var(--warn); }
+

@@ -11,6 +11,16 @@ export function code(error: unknown): string | undefined { return (error as Node
 export async function statMaybe(file: string) {
   try { return await fs.lstat(file); } catch (err) { if (code(err) !== 'ENOENT') throw err; }
 }
+/**
+ * 跟随符号链接/目录联接看路径的真实形态。
+ *
+ * statMaybe 用的是 lstat：它看的是链接本身。Windows 的目录联接在它眼里
+ * 是「不是目录」，可它指向的目录完全正常、读得到写得进。拿 lstat 的结论
+ * 去断言「这个目录没了」，是在对用户说一件没发生的事。
+ */
+export async function statFollowing(file: string) {
+  try { return await fs.stat(file); } catch (err) { if (code(err) !== 'ENOENT') throw err; }
+}
 export async function checkRoot(root: string, mode = constants.R_OK): Promise<string> {
   const s = await fs.lstat(root);
   if (!s.isDirectory() || s.isSymbolicLink()) throw new Error('根路径必须是普通目录');

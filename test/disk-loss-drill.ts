@@ -30,6 +30,7 @@ import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { startWithPermit } from './permit-helper';
 
 const ROOT = process.cwd();
 const servicePath = path.join(ROOT, 'dist-electron', 'electron', 'engine', 'service.js');
@@ -262,7 +263,7 @@ async function phase1(): Promise<void> {
   await service.plan(sourceRoot, targetRoot, 'mirror');
   log('info', '计划已生成，开始备份');
 
-  const running = service.start({
+  const running = startWithPermit(service, {
     sourceRoot,
     targetRoot,
     syncMode: 'mirror',
