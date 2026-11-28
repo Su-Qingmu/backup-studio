@@ -4,8 +4,9 @@ import { hashFile } from './hash';
 import { crc32, JournalStore, partFileName, type Journal } from './journal';
 import { manifestPath, partsDir, readManifest } from './manifest';
 import { assessMedia, probeMedia, sameMedia, type AssessInput } from './media';
+import { buildHealthSummary, classifyTarget, volumeDiagnosticsApply } from './applicability';
 import { driveLetter, executeRead, hasDiskPermission, rawWindowsDevice, redactLog, type ReadExecutor } from './security';
-import type { HealthReport } from '../../shared/types';
+import type { EvidenceScope, EvidenceStatus, HealthReport } from '../../shared/types';
 
 interface VolumeInfo {
   fileSystem?: string; volumeHealth?: string; volumeStatus?: string[]; dirty?: boolean;
@@ -34,6 +35,15 @@ export async function readDeviceBytes(device: string, offset: number, size: numb
 }
 
 function crcBytes(bytes: Buffer): number { return Number.parseInt(crc32(bytes.toString('latin1')), 16) >>> 0; }
+
+/**
+ * 「证据不足」条件下的统一措辞。
+ *
+ * 证据不足**不等于**禁止写入：若这里自称「保持只读」，
+ * 界面就会同时表达「不要写入」与「可以开始写入」两个相反结论。
+ * 写入与否由写入许可（WritePermit）裁决，判定只负责陈述事实。
+ */
+export const UNCERTAIN_SUGGESTION = '分层证据不足，无法完成卷级健康检查；当前未发现明确写入阻断。继续前请自行确认目标介质状态。';
 
 /** 仅校验结构，不尝试解释或写回分区。 */
 export async function inspectPartition(read: (offset: number, size: number) => Promise<Buffer>, sector: number, bytes: number) {
@@ -130,8 +140,12 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
   const platform = options.platform ?? process.platform;
   const probe = await probeMedia(target);
   const evidence: HealthReport['assessment']['evidence'] = [];
-  const add = (kind: string, detail: string) => evidence.push({ kind, detail, at: Date.now() });
+  const add = (kind: string, detail: string, status: EvidenceStatus, scope: EvidenceScope) =>
+    evidence.push({ kind, detail, at: Date.now(), status, scope });
   const canonical = await fs.realpath(target).catch(() => null);
+  // 目标介质的基础事实：决定哪些卷级/设备级诊断在当前环境**适用**。
+  const targetFacts = await classifyTarget(canonical ?? target, platform);
+  const volumeScope = volumeDiagnosticsApply({ platform, target: targetFacts });
   const letter = platform === 'win32' ? driveLetter(canonical ?? target) : undefined;
   const volume = letter ? await readJson<VolumeInfo>(run, 'volume', letter) : null;
   const permission = await hasDiskPermission(platform, run);
@@ -143,10 +157,22 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
     if (/\bis\s+(?:not\s+)?dirty\s*$/i.test(raw)) dirty = !/\bis\s+not\s+dirty\s*$/i.test(raw);
   }
   const repair = dirty === true || [state, ...statuses].some((x) => /(?:full\s*repair\s*needed|spot\s*fix\s*needed|scan\s*needed|需要.*修复)/i.test(x));
-  add('文件系统', volume ? `${known(volume.fileSystem)}，卷健康 ${state}，卷状态 ${statuses.join('、') || '未报告'}` : '能力缺失：未取得卷状态');
-  add('NTFS 脏位', dirty === null ? '能力缺失：未获得可验证的脏位状态' : dirty ? 'Dirty：脏位置位' : '脏位未置位');
-  add('接口', volume ? `${known(volume.bus)}，磁盘 ${known(volume.diskStatus)}，磁盘只读 ${typeof volume.readOnly === 'boolean' ? String(volume.readOnly) : '未知'}` : '能力缺失：未取得接口与磁盘状态');
-  if (!permission) add('权限', '无管理员或 root 权限，降级为只读目录和可取得的卷状态');
+  if (volumeScope.applies) {
+    add('文件系统', volume ? `${known(volume.fileSystem)}，卷健康 ${state}，卷状态 ${statuses.join('、') || '未报告'}` : '未取得卷状态：权限不足或桥接未透传', volume ? 'ok' : 'unavailable', 'volume');
+    const notNtfs = volume ? volume.fileSystem?.toUpperCase() !== 'NTFS' : false;
+    add('NTFS 脏位', notNtfs ? `不适用：目标文件系统为 ${known(volume?.fileSystem)}，NTFS 脏位不适用`
+      : dirty === null ? '未获得可验证的脏位状态'
+      : dirty ? 'Dirty：脏位置位' : '脏位未置位',
+      notNtfs ? 'not-applicable' : dirty === null ? 'unavailable' : dirty ? 'error' : 'ok', 'filesystem');
+    add('接口', volume ? `${known(volume.bus)}，磁盘 ${known(volume.diskStatus)}，磁盘只读 ${typeof volume.readOnly === 'boolean' ? String(volume.readOnly) : '未知'}` : '未取得接口与磁盘状态：权限不足或桥接未透传', volume ? 'ok' : 'unavailable', 'device');
+    if (!permission) add('权限', '无管理员权限，无法读取原始设备证据；降级为目录级检查', 'unavailable', 'device');
+  } else {
+    // 不适用 ≠ 能力缺失：这些证据在当前平台 / 文件系统 / 挂载类型下压根不该出现。
+    add('文件系统', volumeScope.reason, 'not-applicable', 'volume');
+    add('NTFS 脏位', volumeScope.reason, 'not-applicable', 'filesystem');
+    add('接口', volumeScope.reason, 'not-applicable', 'device');
+    add('权限', '不适用：目录级备份不要求管理员或 root 权限；卷级与原始设备证据不参与本次判定', 'not-applicable', 'device');
+  }
   let partition = `能力缺失：未取得原始分区表${volume?.partition ? `，系统报告 ${known(volume.partition)}` : ''}`;
   let bootReadable = false;
   if (letter && permission && volume && typeof volume.diskNumber === 'number' && !options.quick && !options.quarantined && volume.offline !== true) {
@@ -158,11 +184,14 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
         const boot = await readDeviceBytes(rawWindowsDevice('volume', letter), 0, sector);
         const ntfs = boot.toString('ascii', 3, 11) === 'NTFS    ' && boot.readUInt16LE(510) === 0xaa55;
         bootReadable = volume.fileSystem?.toUpperCase() === 'NTFS' && ntfs;
-        add('文件系统元数据', bootReadable ? 'NTFS 引导扇区签名有效' : '未验证此文件系统的引导扇区');
+        add('文件系统元数据', bootReadable ? 'NTFS 引导扇区签名有效' : '未验证此文件系统的引导扇区', bootReadable ? 'ok' : 'unavailable', 'filesystem');
       }
-    } catch { add('原始设备', '能力缺失：原始扇区读取失败'); }
+    } catch { add('原始设备', '能力缺失：原始扇区读取失败', 'unavailable', 'device'); }
   }
-  add('分区', partition);
+  add('分区', volumeScope.applies ? partition : volumeScope.reason,
+    volumeScope.applies
+      ? (partition.startsWith('异常') ? 'error' : partition.startsWith('能力缺失') ? 'unavailable' : 'ok')
+      : 'not-applicable', 'device');
   let smart: HealthReport['smart'] = '能力缺失';
   let mediaError = false;
   if (letter && permission && volume?.identity && !options.quick && !options.quarantined && volume.offline !== true) {
@@ -173,13 +202,13 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
       mediaError = Boolean(before && keys.some((key) => typeof counters[key] === 'number' && typeof before[key] === 'number' && counters[key]! - before[key]! >= 3));
       options.baseline?.set(volume.identity, counters);
       smart = '有基线';
-      add('SMART/可靠性', `系统可靠性计数：不可纠正读 ${counters.readErrors ?? '未知'}，写 ${counters.writeErrors ?? '未知'}${mediaError ? '，计数明显增加' : ''}；不等于完整 SMART 结论`);
+      add('SMART/可靠性', `系统可靠性计数：不可纠正读 ${counters.readErrors ?? '未知'}，写 ${counters.writeErrors ?? '未知'}${mediaError ? '，计数明显增加' : ''}；不等于完整 SMART 结论`, mediaError ? 'error' : 'ok', 'device');
     }
   }
-  if (smart === '能力缺失') add('SMART/可靠性', '能力缺失：权限不足、桥接不透传，或系统未提供可靠性计数；不能据此判断物理健康');
+  if (smart === '能力缺失') add('SMART/可靠性', volumeScope.applies ? '能力缺失：权限不足、桥接不透传，或系统未提供可靠性计数；不能据此判断物理健康' : volumeScope.reason, volumeScope.applies ? 'unavailable' : 'not-applicable', 'device');
   const defaultIndex = { index: '未验证' as const, files: { complete: 0, truncated: 0, missing: 0, mismatch: 0, unchecked: 0 } };
   const { index, files } = !canonical || options.quick || !probe.reachable || options.quarantined || volume?.offline === true || mediaError ? defaultIndex : await indexEvidence(canonical, options);
-  add('索引与分片', `索引${index}；完整 ${files.complete}，截断 ${files.truncated}，缺失 ${files.missing}，不一致 ${files.mismatch}，未能验证 ${files.unchecked}`);
+  add('索引与分片', `索引${index}；完整 ${files.complete}，截断 ${files.truncated}，缺失 ${files.missing}，不一致 ${files.mismatch}，未能验证 ${files.unchecked}`, index === '完整' && !files.missing && !files.truncated && !files.mismatch ? 'ok' : index === '未验证' ? 'unavailable' : 'warning', 'index');
   const verifyFailures = options.verifyFailures ?? 0;
   const assessment = assessMedia({ probe, expected: options.expected ?? null, manifestReadable: index === '完整', ioErrors: options.ioErrors ?? 0, verifyFailures, quarantined: options.quarantined ?? false });
   assessment.evidence = [...assessment.evidence, ...evidence].map((item) => ({ ...item, detail: redactLog(item.detail, true, [target]) }));
@@ -190,7 +219,7 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
   else if (repair) { condition = 'filesystem-repair'; assessment.level = 'L1'; assessment.confidence = 0.95; assessment.suggestion = '卷状态或脏位提示文件系统需人工检查；保持只读，先保护其他副本。'; }
   else if (!probe.reachable) condition = 'unreachable';
   else if (verified) condition = 'verified';
-  else if (assessment.level === 'L0') { assessment.level = 'L1'; assessment.confidence = 0.5; assessment.suggestion = '分层证据不足，保持只读；尝试换口、换线、换主机后重查。'; }
+  else if (assessment.level === 'L0') { assessment.level = 'L1'; assessment.confidence = 0.5; }
   if (!strong && !repair && probe.reachable && probe.writable && volume?.readOnly === false && dirty === false && bootReadable && /^(MBR|GPT)/.test(partition) && index !== '未验证' && !files.unchecked && !verifyFailures) {
     assessment.level = 'L0'; assessment.confidence = 0.8; assessment.suggestion = verified ? '分层校验通过；如需恢复备份，须显式确认并重建计划。' : '仅备份集层需要处理；优先用本机账本和完好分片，显式确认后重扫。';
   }
@@ -203,8 +232,42 @@ export async function inspectHealth(target: string, options: HealthOptions): Pro
   assessment.writable = assessment.level === 'L0';
   // 判定条件随结论一起下发：同为 L1，「文件系统需人工检查」与「仅是证据不足」
   // 对写入的含义完全不同，界面据此区分「必须保持只读」与「证据不足待复查」。
+  // 「证据不足」的措辞在这里收口：无论结论来自哪条判定路径都不再自称「保持只读」，
+  // 避免界面同时表达「不要写入」与「可以开始写入」两个相反结论。
+  if (condition === 'uncertain' && assessment.level === 'L1') assessment.suggestion = UNCERTAIN_SUGGESTION;
+  // L2 绝不能被标成「证据不足」：等级与条件必须一致，否则界面会同时
+  // 显示「L2」和「证据不足」两个互相矛盾的结论。
+  if (condition === 'uncertain' && assessment.level === 'L2') condition = 'media-unavailable';
+  // 条件归一之后再下发，保证 assessment.condition 与 report.condition 永不打架。
   assessment.condition = condition;
-  return { assessment, condition, volume: volume && letter ? `${letter}:` : null, permission, smart, index, files, diskReadOnly: typeof volume?.readOnly === 'boolean' ? volume.readOnly : null };
+  const summary = buildHealthSummary({
+    reachable: probe.reachable,
+    writable: probe.writable,
+    ioErrors: options.ioErrors ?? 0,
+    verifyFailures: options.verifyFailures ?? 0,
+    volumeApplies: volumeScope.applies,
+    volumeKnown: Boolean(volume) && state !== '未报告',
+  });
+  return {
+    assessment,
+    condition,
+    // 目标介质事实与平台无关摘要：界面据此说明哪些证据不适用。
+    target: targetFacts,
+    summary,
+    volume: volume && letter ? `${letter}:` : null,
+    permission,
+    smart,
+    index,
+    files,
+    diskReadOnly: typeof volume?.readOnly === 'boolean' ? volume.readOnly : null,
+    // 目录级可写性：卷可写不等于该目录可写，写入闸门两者都要看。
+    targetWritable: probe.writable,
+    // 卷级健康是否真的取到了：卷记录读到、且健康状态不是「未报告」才算确认。
+    // 只拿到盘符不算健康结论。
+    volumeHealthKnown: Boolean(volume) && state !== '未报告',
+    // 介质身份：写入许可的回执要绑定它——同一路径换了介质就得重新确认。
+    mediaIdentity: probe.identity ? `${probe.identity.dev}:${probe.identity.ino}:${probe.identity.birth}` : null,
+  };
 }
 
 export async function preflightImage(volume: string, run = executeRead): Promise<Buffer> {

@@ -6,12 +6,14 @@ import { createHash } from 'node:crypto';
 import { scanTree } from '../electron/engine/scan';
 import { buildPlan } from '../electron/engine/planner';
 import { readManifest, writeManifest } from '../electron/engine/manifest';
+import { verifyRegisteredFiles } from '../electron/engine/verify';
 import { CopyPool } from '../electron/engine/pool';
 import { BackupService } from '../electron/engine/service';
 import { assessMedia, identifyMedia, probeMedia, sameMedia } from '../electron/engine/media';
 import { JournalStore, crc32, partFileName } from '../electron/engine/journal';
 import { CASE_INSENSITIVE_PATHS } from '../electron/engine/path-identity';
 import { createRunner, registerTempCleanup, trackTempDir } from './harness';
+import { startWithPermit } from './permit-helper';
 import { capabilityMismatch, probeTempFsCapability } from './fs-capability';
 import type { MediaIdentity, SyncMode } from '../shared/types';
 
@@ -107,7 +109,7 @@ async function planFor(source: string, target: string, syncMode: SyncMode = 'mir
 async function runService(source: string, target: string, syncMode: SyncMode = 'mirror'): Promise<void> {
   const service = new BackupService(await makeTemp('backup-studio-journal-'));
   await service.plan(source, target, syncMode);
-  await service.start({
+  await startWithPermit(service, {
     sourceRoot: source,
     targetRoot: target,
     syncMode,
@@ -624,7 +626,7 @@ async function main(): Promise<void> {
 
     const service = new BackupService(await makeTemp('bs-journal-'));
     await service.plan(source, target, 'mirror');
-    const running = service.start({
+    const running = startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',
@@ -659,7 +661,7 @@ async function main(): Promise<void> {
 
     const service = new BackupService(await makeTemp('bs-journal-'));
     await service.plan(source, target, 'mirror');
-    const running = service.start({
+    const running = startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',
@@ -893,7 +895,7 @@ async function main(): Promise<void> {
     // 隔离未撤销时禁止写入
     await assert.rejects(
       () =>
-        service.start({
+        startWithPermit(service, {
           sourceRoot: source,
           targetRoot: target,
           syncMode: 'mirror',
@@ -942,7 +944,7 @@ async function main(): Promise<void> {
     // 中断记录存在时，start 应拒绝沿用旧计划
     await assert.rejects(
       () =>
-        service.start({
+        startWithPermit(service, {
           sourceRoot: source,
           targetRoot: target,
           syncMode: 'mirror',
@@ -1170,7 +1172,7 @@ async function main(): Promise<void> {
     // 在开始前删掉其中一个源文件，触发单文件失败
     await fs.unlink(path.join(source, 'missing.txt'));
 
-    await service.start({
+    await startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',
@@ -1233,7 +1235,7 @@ async function main(): Promise<void> {
 
     const service = new BackupService(userData);
     await service.plan(source, target, 'mirror');
-    await service.start({
+    await startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',
@@ -1250,6 +1252,154 @@ async function main(): Promise<void> {
     await fs.mkdir(nestedTarget, { recursive: true });
     await assert.rejects(() => service.plan(source, nestedTarget, 'mirror'), /不能位于源目录内部/);
     await assert.rejects(() => service.plan(source, source, 'mirror'), /同一路径/);
+  });
+
+  await test('可靠性：源端含引擎保留路径时在写入前阻断，目标端不被写入', async () => {
+    // 逐条独立验证：任何一条规则单独失效，这条用例都必须失败
+    const conflicts: { label: string; files: string[] }[] = [
+      { label: '暂存目录', files: ['.backup-studio/parts/notes.txt'] },
+      { label: '完成清单', files: ['.backup-studio/manifest.json'] },
+      { label: '历史归档', files: ['.backup-studio/history/2026/job/old.txt'] },
+      { label: '回收站索引', files: ['.backup-studio/recycle/index.json'] },
+      { label: '本机账本镜像', files: ['.backup-studio/journal-mirror.json'] },
+    ];
+    for (const item of conflicts) {
+      const source = await makeTemp('bs-reserved-src-');
+      const target = await makeTemp('bs-reserved-dst-');
+      const userData = await makeTemp('bs-reserved-ud-');
+      await writeFile(source, 'control.txt', 'control');
+      for (const rel of item.files) await writeFile(source, rel, 'x');
+
+      const service = new BackupService(userData);
+      await assert.rejects(
+        () => service.plan(source, target, 'mirror'),
+        /保留路径/,
+        `源端含${item.label}时必须在计划期就阻断`,
+      );
+      // 阻断发生在任何写入之前：目标端必须还是空的
+      assert.deepEqual(await fs.readdir(target), [], `${item.label} 被阻断时目标端不应被写入任何内容`);
+      // 源端内容保持原样
+      assert.equal(await fs.readFile(path.join(source, item.files[0]), 'utf8'), 'x');
+    }
+  });
+
+  await test('可靠性：源端保留命名空间里的目录与同名普通文件同样被阻断', async () => {
+    // 空目录也会撞车：目标端的暂存目录会被清理阶段整段删掉
+    const dirSource = await makeTemp('bs-reserved-dir-src-');
+    const dirTarget = await makeTemp('bs-reserved-dir-dst-');
+    await writeFile(dirSource, 'control.txt', 'control');
+    await fs.mkdir(path.join(dirSource, '.backup-studio/parts'), { recursive: true });
+    const dirService = new BackupService(await makeTemp('bs-reserved-dir-ud-'));
+    await assert.rejects(
+      () => dirService.plan(dirSource, dirTarget, 'mirror'),
+      /保留路径/,
+      '源端的保留目录（即使是空的）必须被阻断',
+    );
+    assert.deepEqual(await fs.readdir(dirTarget), [], '被阻断时目标端不应被写入任何内容');
+
+    // 源根下与引擎状态目录同名的普通文件：目标端同名位置必须是目录
+    const fileSource = await makeTemp('bs-reserved-file-src-');
+    const fileTarget = await makeTemp('bs-reserved-file-dst-');
+    await writeFile(fileSource, 'control.txt', 'control');
+    await writeFile(fileSource, '.backup-studio', 'not-a-directory');
+    const fileService = new BackupService(await makeTemp('bs-reserved-file-ud-'));
+    await assert.rejects(
+      () => fileService.plan(fileSource, fileTarget, 'mirror'),
+      /保留路径/,
+      '源端与引擎状态目录同名的普通文件必须被阻断',
+    );
+    assert.deepEqual(await fs.readdir(fileTarget), [], '被阻断时目标端不应被写入任何内容');
+  });
+
+  await test('可靠性：把已有备份再备份到第二个位置时，源端引擎状态不被复制，登记内容可回读', async () => {
+    const source = await makeTemp('bs-two-src-');
+    const first = await makeTemp('bs-two-a-');
+    const second = await makeTemp('bs-two-b-');
+    const userData = await makeTemp('bs-two-ud-');
+    await writeFile(source, 'data.txt', 'level-one-content');
+    // 同名目录里的普通文件不是引擎状态：两级备份必须照常带上它
+    await writeFile(source, '.backup-studio/user-file.txt', 'user-data');
+
+    const firstService = new BackupService(userData);
+    await firstService.plan(source, first, 'mirror');
+    await firstService.start({
+      sourceRoot: source,
+      targetRoot: first,
+      syncMode: 'mirror',
+      allowMassDelete: true,
+      resume: true,
+    });
+    assert.equal(firstService.getState().phase, 'completed');
+
+    // 第二级：把「一份备份」再备份到另一个位置
+    const secondService = new BackupService(await makeTemp('bs-two-ud2-'));
+    await secondService.plan(first, second, 'mirror');
+    await secondService.start({
+      sourceRoot: first,
+      targetRoot: second,
+      syncMode: 'mirror',
+      allowMassDelete: true,
+      resume: true,
+    });
+    assert.equal(secondService.getState().phase, 'completed', '两级备份必须能正常完成');
+
+    const manifest = await readManifest(second);
+    assert.ok(manifest, '第二级备份必须发布清单');
+    assert.ok(manifest.files['data.txt'], '第二级备份必须登记源端的用户文件');
+    assert.ok(
+      manifest.files['.backup-studio/user-file.txt'],
+      '源端同名目录里的非引擎文件必须照常备份',
+    );
+    assert.equal(
+      await fs.readFile(path.join(second, '.backup-studio/user-file.txt'), 'utf8'),
+      'user-data',
+      '非引擎文件的内容必须逐字一致',
+    );
+    assert.deepEqual(
+      Object.keys(manifest.files).filter((key) => key.startsWith('.backup-studio/')),
+      ['.backup-studio/user-file.txt'],
+      '第二级备份只登记同名目录里的非引擎文件，不得登记引擎内部状态',
+    );
+    // 已登记的数据文件必须能从目标读回，且与源端 SHA-256 一致
+    const readback = await fs.readFile(path.join(second, 'data.txt'));
+    const sourceBytes = await fs.readFile(path.join(first, 'data.txt'));
+    const digest = createHash('sha256').update(sourceBytes).digest('hex');
+    assert.equal(createHash('sha256').update(readback).digest('hex'), digest, '目标端读回内容必须与源端一致');
+    assert.equal(manifest.files['data.txt'].sha256, digest, '清单登记的哈希必须与源端一致');
+    // 第二级目标的清单是本次任务自己生成的，不是源端清单的副本
+    const secondRaw = await fs.readFile(path.join(second, '.backup-studio/manifest.json'), 'utf8');
+    const firstRaw = await fs.readFile(path.join(first, '.backup-studio/manifest.json'), 'utf8');
+    assert.notEqual(secondRaw, firstRaw, '第二级目标的清单必须是本次任务自己生成的');
+  });
+
+  await test('可靠性：提交期回读校验能发现被删除或被改写的已登记文件', async () => {
+    const dir = await makeTemp('bs-verify-');
+    await writeFile(dir, 'a.txt', 'hello');
+    const digest = createHash('sha256').update(Buffer.from('hello')).digest('hex');
+    await assert.rejects(
+      () => verifyRegisteredFiles(dir, [{ relPath: 'a.txt', size: 4, sha256: digest }]),
+      /大小/,
+      '大小与登记值不符必须被拒绝',
+    );
+    await assert.rejects(
+      () => verifyRegisteredFiles(dir, [{ relPath: 'missing.txt', size: 5, sha256: digest }]),
+      /缺失/,
+      '已登记文件缺失必须被拒绝',
+    );
+    // 与登记的源端哈希逐字比对，内容被改写必须被拒绝
+    await assert.rejects(
+      () => verifyRegisteredFiles(dir, [{ relPath: 'a.txt', size: 5, sha256: 'f'.repeat(64) }]),
+      /内容校验不通过/,
+      '已登记文件内容被改写必须被拒绝',
+    );
+    // 保留命名空间下的登记项：即使不是本次写入，也必须做完整哈希回读
+    await writeFile(dir, '.backup-studio/manifest.json', 'hello');
+    await assert.rejects(
+      () => verifyRegisteredFiles(dir, [{ relPath: '.backup-studio/manifest.json', size: 5, sha256: 'f'.repeat(64) }]),
+      /内容校验不通过/,
+      '保留命名空间下的登记项必须做完整哈希回读',
+    );
+    await verifyRegisteredFiles(dir, [{ relPath: 'a.txt', size: 5, sha256: digest }]);
   });
 
   await test('可靠性：孤儿文件哈希读取失败时不进入删除列表', async () => {
@@ -1295,7 +1445,7 @@ async function main(): Promise<void> {
     // 预览之后、开始之前，用户把另一份同名文件放进目标目录，且仅此一份。
     await writeFile(target, 'report.txt', 'only-copy');
 
-    await service.start({
+    await startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'copy',
@@ -1322,7 +1472,7 @@ async function main(): Promise<void> {
 
     const service = new BackupService(userData);
     await service.plan(source, target, 'copy');
-    await service.start({
+    await startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'copy',
@@ -1443,7 +1593,7 @@ function patchDegradedReplacement(destPath: string, foreignContent: string): () 
     const restore = patchDegradedInterrupt(destPath, path.join(source, 'payload.bin'));
 
     try {
-      await service.start({
+      await startWithPermit(service, {
         sourceRoot: source,
         targetRoot: target,
         syncMode: 'copy',
@@ -1480,7 +1630,7 @@ function patchDegradedReplacement(destPath: string, foreignContent: string): () 
     const restore = patchDegradedReplacement(destPath, 'FOREIGN-CONTENT');
 
     try {
-      await service.start({
+      await startWithPermit(service, {
         sourceRoot: source,
         targetRoot: target,
         syncMode: 'copy',
@@ -1528,7 +1678,7 @@ function patchDegradedReplacement(destPath: string, foreignContent: string): () 
     }) as typeof fs.open;
 
     try {
-      await service.start({
+      await startWithPermit(service, {
         sourceRoot: source,
         targetRoot: target,
         syncMode: 'copy',
@@ -1562,7 +1712,7 @@ function patchDegradedReplacement(destPath: string, foreignContent: string): () 
       throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
     }) as typeof fs.link;
     try {
-      await service.start({
+      await startWithPermit(service, {
         sourceRoot: source,
         targetRoot: target,
         syncMode: 'copy',
@@ -1603,7 +1753,7 @@ function patchDegradedReplacement(destPath: string, foreignContent: string): () 
 
     const service = new BackupService(userData);
     await service.plan(source, target, 'mirror');
-    await service.start({
+    await startWithPermit(service, {
       sourceRoot: source,
       targetRoot: target,
       syncMode: 'mirror',

@@ -909,6 +909,20 @@
   color: var(--danger);
 }
 
+/* 需确认态：不是阻断，但也不能默认放行。 */
+.banner[data-tone='warn'] {
+  color: var(--warn);
+}
+
+.permit-confirm {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
 .banner-dismissible {
   align-items: flex-start;
 }
